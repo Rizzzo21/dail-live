@@ -5,11 +5,19 @@ class LedgerError(Exception):
     pass
 
 class Ledger:
-    def __init__(self, audit):
+    def __init__(self, audit, persist=None):
         self.balances = defaultdict(int)
         self.transactions = {}
         self.idempotency = {}
         self.audit = audit
+        # persist(tx): write-through hook (WorldStore.record_tx). Called
+        # synchronously after the in-memory commit; may raise -> fail closed.
+        self.persist = persist
+
+    def _committed(self, tx):
+        if self.persist:
+            self.persist(tx)
+        return tx
 
     def credit(self, account, amount, kind="credit", idem=None):
         if amount <= 0:
@@ -24,7 +32,7 @@ class Ledger:
         self.transactions[txid] = tx
         self.idempotency[tx.idempotency_key] = txid
         self.audit.append("ledger.credit", tx.model_dump())
-        return tx
+        return self._committed(tx)
 
     def transfer(self, source, destination, amount, kind="payment", idem=None):
         if amount <= 0:
@@ -42,7 +50,7 @@ class Ledger:
         self.transactions[txid] = tx
         self.idempotency[tx.idempotency_key] = txid
         self.audit.append("ledger.transfer", tx.model_dump())
-        return tx
+        return self._committed(tx)
 
     def refund(self, txid):
         original = self.transactions[txid]

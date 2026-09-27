@@ -1,0 +1,147 @@
+import sys
+import os
+from pathlib import Path
+
+os.environ.pop("DAIL_REAL_PAYMENTS", None)
+os.environ.pop("DATABASE_URL", None)
+os.environ["DAIL_TRADE_FEE_BPS"] = "300"
+os.environ["DAIL_ADMIN_KEY"] = "test-admin-key"
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from fastapi.testclient import TestClient
+from dail.api import app
+
+client = TestClient(app)
+_seq = [0]
+
+
+def _uid(prefix):
+    _seq[0] += 1
+    return f"{prefix}_pe{_seq[0]}"
+
+
+def _make(aid, balance=100, referred_by=""):
+    r = client.post("/agents", json={"id": aid, "name": aid, "balance": balance, "referred_by": referred_by})
+    assert r.status_code == 200, r.text
+
+
+def _bal(aid):
+    return client.get(f"/ledger/{aid}").json()["balance"]
+
+
+def _treasury():
+    return client.get("/treasury").json()
+
+
+def test_trade_fee_flows_to_treasury():
+    s, b = _uid("s"), _uid("b")
+    _make(s); _make(b)
+    t0 = _treasury()["balance"]
+    r = client.post("/world/trades", json={
+        "seller_id": s, "buyer_id": b, "amount": 100,
+        "item": "widget", "idempotency_key": f"k-{s}"})
+    assert r.status_code == 200, r.text
+    t = r.json()
+    assert t["fee"] == 3 and t["seller_net"] == 97
+    assert _bal(b) == 0           # buyer paid 100
+    assert _bal(s) == 197         # seller: 100 + 97
+    assert _treasury()["balance"] == t0 + 3
+
+
+def test_trade_replay_still_idempotent_with_fee():
+    s, b = _uid("s"), _uid("b")
+    _make(s); _make(b)
+    body = {"seller_id": s, "buyer_id": b, "amount": 100,
+            "item": "w", "idempotency_key": f"rk-{s}"}
+    assert client.post("/world/trades", json=body).status_code == 200
+    assert client.post("/world/trades", json=body).status_code == 200
+    assert _bal(b) == 0 and _bal(s) == 197  # charged exactly once
+
+
+def test_escrow_order_lifecycle_with_fee():
+    s, b = _uid("s"), _uid("b")
+    _make(s); _make(b)
+    svc = client.post("/world/services", json={
+        "provider_id": s, "name": "Brief", "description": "d", "price": 100}).json()
+    t0 = _treasury()["balance"]
+    # purchase -> escrow hold
+    r = client.post("/world/services/purchase", json={"buyer_id": b, "service_id": svc["id"]})
+    assert r.status_code == 200, r.text
+    o = r.json()
+    assert o["status"] == "awaiting_delivery"
+    oid = o["order_id"]
+    assert _bal(b) == 0 and _bal(s) == 100  # held, not yet paid
+    # deliver
+    r = client.post(f"/world/orders/{oid}/deliver", json={"agent_id": s, "delivery": "done"})
+    assert r.status_code == 200 and r.json()["status"] == "delivered"
+    assert _bal(s) == 100  # still held
+    # confirm -> release with fee
+    r = client.post(f"/world/orders/{oid}/confirm", json={"agent_id": b})
+    assert r.status_code == 200, r.text
+    assert r.json()["status"] == "completed"
+    assert r.json()["fee"] == 3
+    assert _bal(s) == 197 and _bal(b) == 0
+    assert _treasury()["balance"] == t0 + 3
+
+
+def test_order_dispute_and_buyer_refund():
+    s, b = _uid("s"), _uid("b")
+    _make(s); _make(b)
+    svc = client.post("/world/services", json={
+        "provider_id": s, "name": "X", "description": "d", "price": 40}).json()
+    o = client.post("/world/services/purchase",
+                    json={"buyer_id": b, "service_id": svc["id"]}).json()
+    oid = o["order_id"]
+    r = client.post(f"/world/orders/{oid}/dispute",
+                    json={"agent_id": b, "reason": "never delivered"})
+    assert r.status_code == 200 and r.json()["status"] == "disputed"
+    # confirm while disputed is blocked
+    r = client.post(f"/world/orders/{oid}/confirm", json={"agent_id": b})
+    assert r.status_code == 400
+    # resolve needs the admin key
+    r = client.post(f"/world/orders/{oid}/resolve",
+                    json={"admin_key": "wrong", "winner": "buyer"})
+    assert r.status_code == 403
+    r = client.post(f"/world/orders/{oid}/resolve",
+                    json={"admin_key": "test-admin-key", "winner": "buyer"})
+    assert r.status_code == 200, r.text
+    assert r.json()["status"] == "resolved"
+    assert _bal(b) == 100 and _bal(s) == 100  # full refund, no fee on refunds
+
+
+def test_referral_reward_on_first_trade():
+    inviter, new = _uid("inv"), _uid("new")
+    _make(inviter)                       # 100
+    _make(new, referred_by=inviter)      # 100
+    # trade 1: new sells 20 to inviter. fee = 20*300//10000 = 0.
+    # inviter: 100 - 20 = 80, then +10 referral reward. new: 100 + 20 = 120.
+    r = client.post("/world/trades", json={
+        "seller_id": new, "buyer_id": inviter, "amount": 20,
+        "item": "y", "idempotency_key": f"ref-{new}"})
+    assert r.status_code == 200, r.text
+    assert _bal(inviter) == 90, _bal(inviter)
+    assert _bal(new) == 120, _bal(new)
+    # trade 2: reward must not pay twice. inviter: 90 - 20 = 70.
+    r = client.post("/world/trades", json={
+        "seller_id": new, "buyer_id": inviter, "amount": 20,
+        "item": "y2", "idempotency_key": f"ref2-{new}"})
+    assert r.status_code == 200, r.text
+    assert _bal(inviter) == 70, _bal(inviter)
+    # reward recorded: inviter got a referral_reward notification, exactly once
+    notifs = client.get(f"/world/notifications/{inviter}").json()["notifications"]
+    rewards = [n for n in notifs if n.get("type") == "referral_reward"]
+    assert len(rewards) == 1 and rewards[0]["amount"] == 10
+
+
+def test_treasury_report_shape():
+    t = _treasury()
+    assert t["treasury"] == "dail:treasury"
+    assert t["currency"] == "DAIL"
+    assert t["fee_bps"] == 300
+    assert isinstance(t["events"], list)
+
+
+def test_quickstart_served():
+    r = client.get("/quickstart")
+    assert r.status_code == 200
+    assert "escrow" in r.text.lower()

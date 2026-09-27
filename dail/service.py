@@ -1,11 +1,13 @@
 from .audit import AuditLog
 from .ledger import Ledger
-from .models import Agent
+from .models import Agent, Transaction
 from .payment import MockPaymentGateway
 from .policy import PolicyEngine
 from .world import World
 from .wallet import SafeWallet
+from .persistence import WorldStore
 import os
+import json
 from datetime import datetime, timezone, timedelta
 
 # Agent-to-agent marketing: posting a bulletin costs DAIL (paywalled
@@ -13,27 +15,85 @@ from datetime import datetime, timezone, timedelta
 BULLETIN_FEE = 5
 BULLETIN_TTL = timedelta(days=7)
 
+# House cut: basis points of every trade and released order that flow to
+# dail:treasury. Tunable without a code change via DAIL_TRADE_FEE_BPS.
+TRADE_FEE_BPS = int(os.getenv("DAIL_TRADE_FEE_BPS", "300"))  # 3%
+# Referral reward: paid to the referrer (in DAIL) when a referred agent
+# completes its first real economic activity (a trade or a confirmed order).
+REFERRAL_REWARD = int(os.getenv("DAIL_REFERRAL_REWARD", "10"))
+# Escrow auto-release: delivered-but-unconfirmed orders release to the
+# provider after this long, so sellers can't be stonewalled forever.
+ORDER_AUTO_RELEASE = timedelta(days=7)
+
 class Dail:
     def __init__(self):
         self.audit = AuditLog()
-        self.ledger = Ledger(self.audit)
+        self.store = WorldStore()
+        self.ledger = Ledger(self.audit, persist=self.store.record_tx if self.store.enabled else None)
         self.policy = PolicyEngine()
         self.payment = MockPaymentGateway(self.ledger, self.audit)
         self.world = World()
         self.agents = {}
         self.social = SocialWorld(self.ledger, self.audit)
-        self.world_agents = AgentWorld(self.ledger, self.audit, self.social, self.agents)
+        self.world_agents = AgentWorld(self.ledger, self.audit, self.social, self.agents, self.store)
         self.safe = SafeWallet(self.ledger, self.audit, os.getenv("DAIL_ADMIN_KEY"))
         self.advanced = AdvancedWorld(self)
+        self._restore_world()
+
+    def _restore_world(self):
+        """Rebuild money-critical state from Postgres after a restart.
+        Balances are derived by replaying the persisted transaction log."""
+        if not self.store.enabled:
+            return
+        agent_rows, tx_rows, order_rows, kv = self.store.load_all()
+        for r in agent_rows:
+            agent = Agent(id=r[0], name=r[1], goal=r[2], balance=0,
+                          spending_limit=r[3], approval_limit=r[4], status=r[5])
+            self.agents[agent.id] = agent
+            self.social.register(agent)
+            self.world_agents.ensure_agent(agent)
+        for t in tx_rows:
+            tx = Transaction(id=t[0], kind=t[1], from_account=t[2],
+                             to_account=t[3], amount=t[4],
+                             idempotency_key=t[5], status=t[6])
+            self.ledger.transactions[tx.id] = tx
+            self.ledger.idempotency[tx.idempotency_key] = tx.id
+            if tx.from_account == "SYSTEM":
+                self.ledger.balances[tx.to_account] += tx.amount
+            else:
+                self.ledger.balances[tx.from_account] -= tx.amount
+                self.ledger.balances[tx.to_account] += tx.amount
+        for agent in self.agents.values():
+            agent.balance = self.ledger.balances[agent.id]
+        for oid, data in order_rows:
+            self.world_agents.orders[oid] = json.loads(data)
+        self.world_agents.order_seq = kv.get("order_seq", 0)
+        self.world_agents.bulletin_seq = kv.get("bulletin_seq", 0)
+        self.world_agents.referrals = kv.get("referrals", {})
+        # seqs must at least cover restored orders
+        for oid in self.world_agents.orders:
+            try:
+                self.world_agents.order_seq = max(self.world_agents.order_seq, int(oid.split("_")[1]))
+            except Exception:
+                pass
+        self.audit.append("world.restored", {
+            "agents": len(agent_rows), "transactions": len(tx_rows),
+            "orders": len(order_rows)})
 
     def create_agent(self, agent):
         if agent.id in self.agents:
             raise ValueError("agent already exists")
         self.agents[agent.id] = agent
-        self.ledger.balances[agent.id] = agent.balance
+        # The starter grant goes through the ledger (not a direct dict write)
+        # so it is part of the persisted transaction log and survives restarts.
+        if agent.balance > 0:
+            self.ledger.credit(agent.id, agent.balance, kind="grant",
+                               idem=f"grant:{agent.id}")
+        agent.balance = self.ledger.balances[agent.id]
         self.audit.append("agent.created", agent.model_dump())
         self.social.register(agent)
         self.world_agents.ensure_agent(agent)
+        self.store.save_agent(agent)
         return agent
 
     def deposit(self, agent_id, amount, provider, idem):
@@ -131,15 +191,19 @@ class SocialWorld:
 
 class AgentWorld:
     """DAiL autonomous-agent world primitives: profiles, services, discovery and trades."""
-    def __init__(self, ledger, audit, social, agents=None):
+    def __init__(self, ledger, audit, social, agents=None, store=None):
         self.ledger=ledger; self.audit=audit; self.social=social
         self.agents=agents if agents is not None else {}
+        self.store=store
         self.profiles={}
         self.services={}
         self.trades={}
         self.notifications={}
         self.bulletins={}
         self.bulletin_seq=0
+        self.orders={}
+        self.order_seq=0
+        self.referrals={}
 
     def _sync_balance(self, *agent_ids):
         """Keep the Agent model's cached balance consistent with the ledger."""
@@ -147,6 +211,20 @@ class AgentWorld:
             agent=self.agents.get(aid)
             if agent is not None:
                 agent.balance=self.ledger.balances[aid]
+
+    def _fee(self, amount):
+        """House cut in DAIL on a gross amount (basis points -> treasury)."""
+        return amount * TRADE_FEE_BPS // 10000
+
+    def _save_kv(self):
+        if self.store:
+            self.store.kv_set("order_seq", self.order_seq)
+            self.store.kv_set("bulletin_seq", self.bulletin_seq)
+            self.store.kv_set("referrals", self.referrals)
+
+    def _save_order(self, order):
+        if self.store:
+            self.store.save_order(order)
 
     def ensure_agent(self, agent):
         self.profiles.setdefault(agent.id, {
@@ -179,17 +257,200 @@ class AgentWorld:
         return self.services[sid]
 
     def purchase_service(self, buyer_id, service_id):
+        """Buy a service via escrow: the buyer's DAIL is held, the provider
+        delivers, the buyer confirms (or disputes). The house fee is taken
+        from the provider's proceeds when escrow releases."""
         if buyer_id not in self.social.identities: raise KeyError("agent not found")
         if service_id not in self.services: raise KeyError("service not found")
         svc=self.services[service_id]
         if not svc["active"]: raise PermissionError("service_inactive")
-        self.ledger.transfer(buyer_id, svc["provider_id"], svc["price"],
-                             kind="service_purchase", idem=f"purchase:{service_id}:{buyer_id}")
-        self._sync_balance(buyer_id, svc["provider_id"])
+        price=svc["price"]
+        self.order_seq+=1
+        oid=f"ord_{self.order_seq:04d}"
+        now=datetime.now(timezone.utc).isoformat()
+        self.ledger.transfer(buyer_id, f"escrow:{oid}", price,
+                             kind="escrow_hold", idem=f"escrow-hold:{oid}")
+        self._sync_balance(buyer_id)
+        order={"id":oid,"service_id":service_id,"service_name":svc["name"],
+               "provider_id":svc["provider_id"],"buyer_id":buyer_id,
+               "amount":price,"status":"awaiting_delivery",
+               "created_at":now,"delivery":None,"delivered_at":None,
+               "completed_at":None,"dispute_reason":None,"resolution":None}
+        self.orders[oid]=order
+        self._save_order(order); self._save_kv()
         self.notifications.setdefault(svc["provider_id"],[]).append(
-            {"type":"service_sold","service_id":service_id,"buyer_id":buyer_id})
-        self.audit.append("service.purchased", {"service_id":service_id,"buyer_id":buyer_id})
-        return {"service":svc,"status":"paid","amount":svc["price"]}
+            {"type":"order_received","order_id":oid,"service_id":service_id,
+             "buyer_id":buyer_id,"amount":price,
+             "body":f"New order {oid}: deliver via POST /world/orders/{oid}/deliver, then the buyer confirms release."})
+        self.audit.append("order.created", {"order_id":oid,"service_id":service_id,
+                                            "buyer_id":buyer_id,"amount":price})
+        return self._public_order(order)
+
+    def _public_order(self, order):
+        d=dict(order)
+        d["order_id"]=d.pop("id")
+        return d
+
+    def _get_order(self, order_id):
+        self.sweep_orders()
+        if order_id not in self.orders: raise KeyError("order not found")
+        return self.orders[order_id]
+
+    def list_orders(self, agent_id=None):
+        self.sweep_orders()
+        orders=list(self.orders.values())
+        if agent_id:
+            orders=[o for o in orders if o["buyer_id"]==agent_id or o["provider_id"]==agent_id]
+        orders.sort(key=lambda o: o["created_at"], reverse=True)
+        return {"orders":[self._public_order(o) for o in orders]}
+
+    def deliver_order(self, provider_id, order_id, delivery):
+        order=self._get_order(order_id)
+        if order["provider_id"]!=provider_id: raise PermissionError("not your order")
+        if order["status"]!="awaiting_delivery": raise ValueError("order not awaiting delivery")
+        order["status"]="delivered"
+        order["delivery"]=(delivery or "")[:5000]
+        order["delivered_at"]=datetime.now(timezone.utc).isoformat()
+        self._save_order(order)
+        self.notifications.setdefault(order["buyer_id"],[]).append(
+            {"type":"order_delivered","order_id":order_id,
+             "body":f"Order {order_id} delivered. Confirm via POST /world/orders/{order_id}/confirm to release {order['amount']} DAIL, or dispute if it's wrong."})
+        self.audit.append("order.delivered", {"order_id":order_id})
+        return self._public_order(order)
+
+    def _release_escrow(self, order, winner):
+        """Move escrowed funds: provider wins -> net proceeds to provider and
+        the house fee to dail:treasury; buyer wins -> full refund."""
+        oid=order["id"]; amount=order["amount"]
+        escrow=f"escrow:{oid}"
+        if winner=="provider":
+            fee=self._fee(amount); net=amount-fee
+            self.ledger.transfer(escrow, order["provider_id"], net,
+                                 kind="order_release", idem=f"escrow-release:{oid}")
+            if fee:
+                self.ledger.transfer(escrow, "dail:treasury", fee,
+                                     kind="order_fee", idem=f"escrow-fee:{oid}")
+            order["fee"]=fee
+        elif winner=="buyer":
+            self.ledger.transfer(escrow, order["buyer_id"], amount,
+                                 kind="order_refund", idem=f"escrow-refund:{oid}")
+            order["fee"]=0
+        else:
+            raise ValueError("winner must be 'provider' or 'buyer'")
+        self._sync_balance(order["provider_id"], order["buyer_id"])
+
+    def confirm_order(self, buyer_id, order_id):
+        order=self._get_order(order_id)
+        if order["buyer_id"]!=buyer_id: raise PermissionError("not your order")
+        if order["status"]!="delivered": raise ValueError("order not delivered yet")
+        self._release_escrow(order, "provider")
+        order["status"]="completed"
+        order["completed_at"]=datetime.now(timezone.utc).isoformat()
+        self._save_order(order)
+        self.notifications.setdefault(order["provider_id"],[]).append(
+            {"type":"order_completed","order_id":order_id,"net":order["amount"]-order["fee"],
+             "fee":order["fee"],"body":f"Order {order_id} confirmed: {order['amount']-order['fee']} DAIL released (fee {order['fee']})."})
+        self.audit.append("order.completed", {"order_id":order_id,"fee":order["fee"]})
+        self._maybe_pay_referral(buyer_id)
+        return self._public_order(order)
+
+    def dispute_order(self, agent_id, order_id, reason):
+        order=self._get_order(order_id)
+        if agent_id not in (order["buyer_id"], order["provider_id"]):
+            raise PermissionError("not your order")
+        if order["status"] not in ("awaiting_delivery","delivered"):
+            raise ValueError("order not disputable")
+        order["status"]="disputed"
+        order["dispute_reason"]=(reason or "")[:500]
+        order["disputed_by"]=agent_id
+        self._save_order(order)
+        other=order["provider_id"] if agent_id==order["buyer_id"] else order["buyer_id"]
+        for aid in (order["buyer_id"], order["provider_id"]):
+            self.notifications.setdefault(aid,[]).append(
+                {"type":"order_disputed","order_id":order_id,
+                 "body":f"Order {order_id} disputed by {agent_id}: {order['dispute_reason']}. Funds frozen pending admin resolution."})
+        self.audit.append("order.disputed", {"order_id":order_id,"by":agent_id})
+        return self._public_order(order)
+
+    def resolve_order(self, order_id, winner):
+        """Admin resolution of a disputed order. winner: 'provider'|'buyer'."""
+        order=self._get_order(order_id)
+        if order["status"]!="disputed": raise ValueError("order not disputed")
+        self._release_escrow(order, winner)
+        order["status"]="resolved"
+        order["resolution"]=winner
+        order["resolved_at"]=datetime.now(timezone.utc).isoformat()
+        self._save_order(order)
+        for aid in (order["buyer_id"], order["provider_id"]):
+            self.notifications.setdefault(aid,[]).append(
+                {"type":"order_resolved","order_id":order_id,
+                 "body":f"Dispute on order {order_id} resolved in favor of {winner}."})
+        self.audit.append("order.resolved", {"order_id":order_id,"winner":winner})
+        return self._public_order(order)
+
+    def sweep_orders(self):
+        """Auto-release delivered-but-unconfirmed orders after ORDER_AUTO_RELEASE."""
+        now=datetime.now(timezone.utc)
+        released=0
+        for order in self.orders.values():
+            if order["status"]=="delivered" and order.get("delivered_at"):
+                try:
+                    delivered=datetime.fromisoformat(order["delivered_at"])
+                except Exception:
+                    continue
+                if delivered+ORDER_AUTO_RELEASE<=now:
+                    self._release_escrow(order, "provider")
+                    order["status"]="completed"
+                    order["completed_at"]=now.isoformat()
+                    order["auto_released"]=True
+                    self._save_order(order)
+                    released+=1
+                    self.notifications.setdefault(order["provider_id"],[]).append(
+                        {"type":"order_completed","order_id":order["id"],
+                         "body":f"Order {order['id']} auto-released after 7 days: {order['amount']-order['fee']} DAIL."})
+                    self.audit.append("order.auto_released", {"order_id":order["id"]})
+        return released
+
+    def register_referral(self, new_id, referrer_id):
+        referrer_id=(referrer_id or "").strip()
+        if not referrer_id or referrer_id==new_id: return False
+        if referrer_id not in self.social.identities: return False
+        if new_id in self.referrals: return False
+        self.referrals[new_id]={"referrer":referrer_id,"paid":False}
+        self._save_kv()
+        self.audit.append("referral.registered", {"new":new_id,"referrer":referrer_id})
+        return True
+
+    def _maybe_pay_referral(self, agent_id):
+        """Pay the referrer when a referred agent completes real economic activity."""
+        ref=self.referrals.get(agent_id)
+        if not ref or ref.get("paid"): return False
+        referrer=ref["referrer"]
+        if referrer not in self.social.identities: return False
+        self.ledger.credit(referrer, REFERRAL_REWARD, kind="referral_reward",
+                           idem=f"referral:{agent_id}")
+        ref["paid"]=True
+        self._sync_balance(referrer)
+        self._save_kv()
+        self.notifications.setdefault(referrer,[]).append(
+            {"type":"referral_reward","referred_id":agent_id,"amount":REFERRAL_REWARD,
+             "body":f"Your invitee {agent_id} made their first trade: +{REFERRAL_REWARD} DAIL referral reward."})
+        self.audit.append("referral.rewarded", {"referrer":referrer,"referred":agent_id,
+                                                "amount":REFERRAL_REWARD})
+        return True
+
+    def treasury_report(self):
+        bal=self.ledger.balances.get("dail:treasury", 0)
+        revs=[t for t in self.ledger.transactions.values() if t.to_account=="dail:treasury"]
+        revs.sort(key=lambda t: t.id)
+        by_kind={}
+        for t in revs:
+            by_kind[t.kind]=by_kind.get(t.kind, 0)+t.amount
+        return {"treasury":"dail:treasury","balance":bal,"currency":"DAIL",
+                "lifetime_revenue":sum(by_kind.values()),"by_kind":by_kind,
+                "fee_bps":TRADE_FEE_BPS,"bulletin_fee":BULLETIN_FEE,
+                "events":[{"id":t.id,"kind":t.kind,"from":t.from_account,"amount":t.amount}
+                          for t in revs[-25:]]}
 
     def discover(self, agent_id, query):
         if agent_id not in self.social.identities: raise KeyError("agent not found")
@@ -207,12 +468,22 @@ class AgentWorld:
     def trade(self, seller_id, buyer_id, amount, item, idem):
         if seller_id not in self.social.identities or buyer_id not in self.social.identities:
             raise KeyError("agent not found")
-        tx=self.ledger.transfer(buyer_id, seller_id, amount, kind="trade", idem=idem)
+        # House cut: buyer pays `amount`; the seller nets amount-fee and the
+        # fee flows to dail:treasury. Distinct idempotency keys keep replays safe.
+        fee=self._fee(amount)
+        tx=self.ledger.transfer(buyer_id, seller_id, amount, kind="trade",
+                                idem=f"{idem}:principal" if idem else None)
+        if fee:
+            self.ledger.transfer(seller_id, "dail:treasury", fee, kind="trade_fee",
+                                 idem=f"{idem}:fee" if idem else None)
         self._sync_balance(buyer_id, seller_id)
         tid=f"trade_{len(self.trades)+1:04d}"
         self.trades[tid]={"id":tid,"seller_id":seller_id,"buyer_id":buyer_id,
-                          "amount":amount,"item":item,"status":"settled","transaction_id":tx.id}
+                          "amount":amount,"fee":fee,"seller_net":amount-fee,
+                          "item":item,"status":"settled","transaction_id":tx.id}
         self.audit.append("trade.settled", self.trades[tid])
+        self._maybe_pay_referral(seller_id)
+        self._maybe_pay_referral(buyer_id)
         return self.trades[tid]
 
     def notifications_for(self, agent_id):
@@ -242,6 +513,7 @@ class AgentWorld:
             "agent_name":self.social.identities[agent_id].get("name",agent_id),
             "title":title,"body":body,"service_id":service_id,
             "created_at":now.isoformat(),"expires_at":(now+BULLETIN_TTL).isoformat()}
+        self._save_kv()
         self.audit.append("bulletin.posted", {"bulletin_id":bid,"agent_id":agent_id,"service_id":service_id})
         return self.bulletins[bid]
 

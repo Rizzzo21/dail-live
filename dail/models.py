@@ -87,6 +87,21 @@ class ServicePurchaseRequest(BaseModel):
     buyer_id: str
     service_id: str
 
+class OrderDeliverRequest(BaseModel):
+    agent_id: str
+    delivery: str = ""
+
+class OrderConfirmRequest(BaseModel):
+    agent_id: str
+
+class OrderDisputeRequest(BaseModel):
+    agent_id: str
+    reason: str = ""
+
+class OrderResolveRequest(BaseModel):
+    admin_key: str = ""
+    winner: Literal["provider", "buyer"] = "provider"
+
 class TradeRequest(BaseModel):
     seller_id: str
     buyer_id: str
@@ -175,6 +190,7 @@ class AgentCreateRequest(BaseModel):
     spending_limit: int = 10000
     approval_limit: int = 2500
     status: Literal["active", "paused", "disabled"] = "active"
+    referred_by: str = ""  # id of the inviting agent; earns them a reward on your first trade
 
 
 # v3.1-v3.5 orchestration models

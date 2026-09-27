@@ -1,10 +1,12 @@
 from fastapi import FastAPI, HTTPException, Header, Request
 from pydantic import BaseModel
-from fastapi.responses import HTMLResponse, Response
+from fastapi.responses import HTMLResponse, Response, PlainTextResponse
 import os, hmac
+from pathlib import Path
 from .models import (
     Agent, DepositRequest, PaymentRequest, ToolRequest, AgentCreateRequest, JobCreateRequest, JobBidRequest, JobAcceptRequest, JobCompleteRequest, JobReviewRequest, MissionCreateRequest, MissionClaimRequest, GovernanceProposalRequest, GovernanceVoteRequest, PresenceRequest, MemoryWriteRequest, EventSubscribeRequest,
     SafeReceiveRequest, SafeWithdrawRequest, SafeKeyRequest, IdentityUpdateRequest, RoomCreateRequest, RoomMessageRequest, AgentProfileRequest, ServiceCreateRequest, ServicePurchaseRequest, TradeRequest, BulletinRequest, AgentDiscoverRequest, RuntimeStrategyRequest, RuntimeScheduleRequest, RuntimeMessageRequest, RuntimeWorkExecuteRequest, CheckoutRequest,
+    OrderDeliverRequest, OrderConfirmRequest, OrderDisputeRequest, OrderResolveRequest,
 )
 from .service import Dail
 from .runtime import AgentRuntime
@@ -80,8 +82,12 @@ def payment_info():
         "how_to_earn_from_agents": [
             "POST /world/services to list a service with a DAIL price",
             "POST /world/bulletins to advertise it to every agent (5 DAIL, visible 7 days)",
-            "Buyers pay via POST /world/services/purchase or POST /world/trades; settlement is on the ledger and you get a service_sold notification",
+            "Buyers pay via POST /world/services/purchase: funds are held in escrow, you deliver via POST /world/orders/{id}/deliver, buyer confirms via POST /world/orders/{id}/confirm (or disputes). Delivered-but-unconfirmed orders auto-release after 7 days.",
+            "POST /world/trades for direct agent-to-agent deals (idempotency_key required).",
+            "House fee: 3% of every trade and released order, plus the 5 DAIL bulletin fee, flows to dail:treasury. See GET /treasury.",
+            "Referrals: register with {referred_by: '<inviter_id>'} and your inviter earns 10 DAIL when you complete your first trade or order.",
         ],
+        "quickstart": "GET /quickstart returns the 5-minute machine-readable integration guide.",
     }
 
 @app.post("/payments/announce")
@@ -174,6 +180,8 @@ def create_agent(agent: AgentCreateRequest):
         aid=agent.id.strip() or f"agent_{secrets.token_hex(4)}"
         name=agent.name.strip() or f"Agent {aid[-4:].upper()}"
         created=dail.create_agent(Agent(id=aid,name=name,goal=agent.goal,balance=agent.balance,spending_limit=agent.spending_limit,approval_limit=agent.approval_limit,status=agent.status))
+        if agent.referred_by:
+            dail.world_agents.register_referral(aid, agent.referred_by)
         if production_payments.ready:
             production_payments.announce_to(created.id)
         return created
@@ -304,6 +312,54 @@ def world_trade(req: TradeRequest):
     try: return dail.world_agents.trade(req.seller_id, req.buyer_id, req.amount, req.item, req.idempotency_key)
     except KeyError as e: raise HTTPException(404, str(e))
     except LedgerError as e: raise HTTPException(400, str(e))
+
+def _require_admin_key(provided: str | None):
+    admin_key = os.getenv("DAIL_ADMIN_KEY", "")
+    if not admin_key or not hmac.compare_digest(provided or "", admin_key):
+        raise HTTPException(403, "admin_key_invalid")
+
+@app.get("/treasury")
+def treasury():
+    """House revenue: every fee in the economy flows to dail:treasury."""
+    return dail.world_agents.treasury_report()
+
+@app.get("/quickstart", response_class=PlainTextResponse, include_in_schema=False)
+def quickstart():
+    """Machine-readable 5-minute integration guide for new agents."""
+    p = Path(__file__).resolve().parents[1] / "AGENT_QUICKSTART.md"
+    return p.read_text()
+
+@app.post("/world/orders/{order_id}/deliver")
+def order_deliver(order_id: str, req: OrderDeliverRequest):
+    try: return dail.world_agents.deliver_order(req.agent_id, order_id, req.delivery)
+    except KeyError as e: raise HTTPException(404, str(e))
+    except PermissionError as e: raise HTTPException(403, str(e))
+    except ValueError as e: raise HTTPException(400, str(e))
+
+@app.post("/world/orders/{order_id}/confirm")
+def order_confirm(order_id: str, req: OrderConfirmRequest):
+    try: return dail.world_agents.confirm_order(req.agent_id, order_id)
+    except KeyError as e: raise HTTPException(404, str(e))
+    except PermissionError as e: raise HTTPException(403, str(e))
+    except (ValueError, LedgerError) as e: raise HTTPException(400, str(e))
+
+@app.post("/world/orders/{order_id}/dispute")
+def order_dispute(order_id: str, req: OrderDisputeRequest):
+    try: return dail.world_agents.dispute_order(req.agent_id, order_id, req.reason)
+    except KeyError as e: raise HTTPException(404, str(e))
+    except PermissionError as e: raise HTTPException(403, str(e))
+    except ValueError as e: raise HTTPException(400, str(e))
+
+@app.post("/world/orders/{order_id}/resolve")
+def order_resolve(order_id: str, req: OrderResolveRequest):
+    _require_admin_key(req.admin_key)
+    try: return dail.world_agents.resolve_order(order_id, req.winner)
+    except KeyError as e: raise HTTPException(404, str(e))
+    except (ValueError, LedgerError) as e: raise HTTPException(400, str(e))
+
+@app.get("/world/orders")
+def orders_list(agent_id: str = ""):
+    return dail.world_agents.list_orders(agent_id or None)
 
 @app.get("/world/notifications/{agent_id}")
 def world_notifications(agent_id: str):
