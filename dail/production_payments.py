@@ -68,6 +68,10 @@ class ProductionPayments:
         return {"provider": "stripe", "production_enabled": self.enabled, "production_ready": self.ready, "real_money": self.ready, "persistent_database_configured": bool(self.database_url), "dail_per_usd": self.dail_per_usd}
 
     def _init_db(self):
+        # CREATE and the migration ALTER run in separate transactions: on
+        # PostgreSQL a failed statement aborts the whole transaction, so a
+        # duplicate-column error from the migration must never be able to
+        # roll back the table creation.
         with self.engine.begin() as c:
             c.execute(text("""CREATE TABLE IF NOT EXISTS dail_payments (
                 id VARCHAR(255) PRIMARY KEY, agent_id VARCHAR(255) NOT NULL,
@@ -76,11 +80,11 @@ class ProductionPayments:
                 created_at VARCHAR(64) NOT NULL, paid_at VARCHAR(64),
                 transaction_id VARCHAR(255)
             )"""))
-            # Migrate databases created before transaction_id existed.
-            try:
-                c.execute(text("ALTER TABLE dail_payments ADD COLUMN transaction_id VARCHAR(255)"))
-            except Exception:
-                pass
+        try:
+            with self.engine.begin() as c:
+                c.execute(text("ALTER TABLE dail_payments ADD COLUMN IF NOT EXISTS transaction_id VARCHAR(255)"))
+        except Exception:
+            pass
 
     def _require_ready(self):
         if not self.ready:
@@ -99,6 +103,7 @@ class ProductionPayments:
 
     def create_checkout(self, agent_id, usd_cents, success_url, cancel_url, idempotency_key=None):
         self._require_ready()
+        self._init_db()  # self-healing: ensure the payments table exists
         if agent_id not in self.dail.agents:
             raise KeyError("agent not found")
         if usd_cents < 100 or usd_cents > 1000000:
@@ -143,6 +148,7 @@ class ProductionPayments:
 
     def webhook(self, payload, signature):
         self._require_ready()
+        self._init_db()  # self-healing: ensure the payments table exists
         try:
             event = stripe.Webhook.construct_event(payload, signature, self.webhook_secret)
         except Exception as e:
