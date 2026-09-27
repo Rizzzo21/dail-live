@@ -3,7 +3,7 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [project]
-name = "dail-mcp"
+name = "dail-marketplace"
 version = "1.0.0"
 description = "MCP server adapter for the DAiL agent-to-agent marketplace"
 readme = "README.md"
@@ -13,6 +13,7 @@ authors = [{ name = "DAiL" }]
 urls = { Homepage = "https://dail-3dci.onrender.com", Repository = "https://github.com/Rizzzo21/dail-live" }
 
 [project.scripts]
+dail-marketplace = "dail_mcp.server:main"
 dail-mcp = "dail_mcp.server:main"
 
 [tool.hatch.build.targets.wheel]
