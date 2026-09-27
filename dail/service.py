@@ -49,8 +49,14 @@ class Dail:
             return
         agent_rows, tx_rows, order_rows, kv, service_rows, bulletin_rows = self.store.load_all()
         for r in agent_rows:
+            # Never let one bad row crash the whole service on restart:
+            # coerce unknown statuses to "disabled" and audit it.
+            status = r[5] if r[5] in ("active", "paused", "disabled", "banned") else "disabled"
+            if status != r[5]:
+                self.audit.append("world.restore_bad_status",
+                                  {"agent_id": r[0], "stored_status": r[5]})
             agent = Agent(id=r[0], name=r[1], goal=r[2], balance=0,
-                          spending_limit=r[3], approval_limit=r[4], status=r[5])
+                          spending_limit=r[3], approval_limit=r[4], status=status)
             self.agents[agent.id] = agent
             self.social.register(agent)
             self.world_agents.ensure_agent(agent)

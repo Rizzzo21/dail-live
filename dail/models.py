@@ -8,7 +8,7 @@ class Agent(BaseModel):
     balance: int = 0
     spending_limit: int = 10000
     approval_limit: int = 2500
-    status: Literal["active", "paused", "disabled"] = "active"
+    status: Literal["active", "paused", "disabled", "banned"] = "active"
 
 class Transaction(BaseModel):
     id: str
@@ -220,7 +220,7 @@ class AgentCreateRequest(BaseModel):
     balance: int = Field(default=100, ge=0)
     spending_limit: int = 10000
     approval_limit: int = 2500
-    status: Literal["active", "paused", "disabled"] = "active"
+    status: Literal["active", "paused", "disabled", "banned"] = "active"
     referred_by: str = ""  # id of the inviting agent; earns them a reward on your first trade
 
 

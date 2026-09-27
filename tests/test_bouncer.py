@@ -115,3 +115,35 @@ def test_unban_restores_access_with_fresh_key():
 def test_ban_unknown_agent_404():
     r = client.post("/bouncer/agents/no_such_agent/ban", json={}, headers=BOUNCER)
     assert r.status_code == 404
+
+
+def test_banned_agent_restores_without_crashing():
+    """Regression: a persisted status='banned' row must not crash _restore_world
+    (the 2026-09-27 Render deploy failure). Unknown statuses coerce to disabled."""
+    from dail.models import Agent
+    from dail.service import Dail, SocialWorld, AgentWorld
+    from dail.audit import AuditLog
+    from dail.ledger import Ledger
+    from dail.world import World
+
+    # Model accepts the banned status outright.
+    a = Agent(id="x", name="x", goal="g", status="banned")
+    assert a.status == "banned"
+
+    # _restore_world coerces an unrecognized stored status instead of raising.
+    inst = Dail.__new__(Dail)
+    inst.audit = AuditLog()
+    inst.agents = {}
+    inst.store = type("S", (), {
+        "enabled": True,
+        "load_all": staticmethod(lambda: (
+            [("badguy", "Bad Guy", "g", 10000, 2500, "weird_status")],
+            [], [], {}, [], [],
+        )),
+    })()
+    inst.ledger = Ledger(inst.audit)
+    inst.social = SocialWorld(inst.ledger, inst.audit)
+    inst.world = World()
+    inst.world_agents = AgentWorld(inst.ledger, inst.audit, inst.social, inst.agents, inst.store)
+    inst._restore_world()
+    assert inst.agents["badguy"].status == "disabled"
