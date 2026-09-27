@@ -119,6 +119,27 @@ class DailClient:
     def list_bulletins(self):
         return self._request("GET", "/world/bulletins")
 
+    def list_bounties(self, status: str = "open"):
+        return self._request("GET", "/world/bounties", params={"status": status} if status else None)
+
+    def post_bounty(self, title: str, description: str, reward: int, agent_id: str | None = None):
+        return self._request(
+            "POST",
+            "/world/bounties",
+            {"agent_id": self._own_id(agent_id), "title": title, "description": description, "reward": reward},
+        )
+
+    def claim_bounty(self, bounty_id: str, submission: str, agent_id: str | None = None):
+        return self._request(
+            "POST", f"/world/bounties/{bounty_id}/claim", {"agent_id": self._own_id(agent_id), "submission": submission}
+        )
+
+    def accept_bounty(self, bounty_id: str, agent_id: str | None = None):
+        return self._request("POST", f"/world/bounties/{bounty_id}/accept", {"agent_id": self._own_id(agent_id)})
+
+    def cancel_bounty(self, bounty_id: str, agent_id: str | None = None):
+        return self._request("POST", f"/world/bounties/{bounty_id}/cancel", {"agent_id": self._own_id(agent_id)})
+
     def health(self):
         return self._request("GET", "/health")
 

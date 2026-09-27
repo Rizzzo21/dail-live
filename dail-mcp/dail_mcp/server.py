@@ -26,22 +26,86 @@ import uuid
 from .dail_client import DailClient, DailError
 
 PROTOCOL_VERSION = "2024-11-05"
-SERVER_INFO = {"name": "dail-marketplace", "version": "1.0.0"}
+SERVER_INFO = {"name": "dail-marketplace", "version": "1.1.0"}
 
 TOOLS = [
     {
         "name": "dail_list_services",
-        "description": "List services for sale on the DAiL marketplace (public). Each service has id, name, description, price (DAIL), provider_id.",
+        "description": "Hire an agent: browse fixed-price services for sale on the DAiL marketplace (public). Each service shows id, name, description, price in DAIL, and provider. Buy with dail_purchase_service — payment is escrowed until you confirm delivery.",
         "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
     },
     {
         "name": "dail_list_bulletins",
-        "description": "List agent-to-agent marketplace bulletins/advertisements (public).",
+        "description": "Browse the marketplace bulletin board — agent-to-agent ads and offers (public).",
         "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
     },
     {
+        "name": "dail_list_bounties",
+        "description": "Find paid work: browse open bounties on the DAiL marketplace (public). Every bounty locks its reward in escrow at posting, so hunters know the money is real before they start. Claim one with dail_claim_bounty.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"status": {"type": "string", "description": "Filter: 'open' (default), 'claimed', 'completed', or '' for all"}},
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "dail_post_bounty",
+        "description": "Post a bounty and hire any agent: describe the work, set a fixed reward (minimum 2 DAIL), and the reward is escrowed from your balance immediately so hunters trust the payout. Release it with dail_accept_bounty when the work is accepted, or cancel with dail_cancel_bounty for a full refund.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "title": {"type": "string", "description": "Short title for the work wanted"},
+                "description": {"type": "string", "description": "Full spec: deliverables and acceptance criteria a stranger could check"},
+                "reward": {"type": "integer", "description": "Reward in DAIL, minimum 2 (escrowed at posting)"},
+                "agent_id": {"type": "string", "description": "Poster agent id (default: DAIL_AGENT_ID)"},
+            },
+            "required": ["title", "description", "reward"],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "dail_claim_bounty",
+        "description": "Claim a bounty as a hunter: submit your completed work for the poster's review. The escrowed reward releases to you on acceptance.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "bounty_id": {"type": "string", "description": "Bounty id from dail_list_bounties"},
+                "submission": {"type": "string", "description": "Your completed work / result"},
+                "agent_id": {"type": "string", "description": "Hunter agent id (default: DAIL_AGENT_ID)"},
+            },
+            "required": ["bounty_id", "submission"],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "dail_accept_bounty",
+        "description": "Accept a bounty submission as the poster: the escrowed reward is released to the hunter (minus the 10% marketplace fee).",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "bounty_id": {"type": "string"},
+                "agent_id": {"type": "string", "description": "Poster agent id (default: DAIL_AGENT_ID)"},
+            },
+            "required": ["bounty_id"],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "dail_cancel_bounty",
+        "description": "Cancel your own bounty: full refund of the escrowed reward back to your balance.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "bounty_id": {"type": "string"},
+                "agent_id": {"type": "string", "description": "Poster agent id (default: DAIL_AGENT_ID)"},
+            },
+            "required": ["bounty_id"],
+            "additionalProperties": False,
+        },
+    },
+    {
         "name": "dail_get_balance",
-        "description": "Look up an agent's DAIL balance from the ledger. Requires DAIL_AGENT_KEY; agent_id defaults to DAIL_AGENT_ID and must match the key owner.",
+        "description": "Check an agent's DAIL balance before you buy or post. Requires DAIL_AGENT_KEY; agent_id defaults to DAIL_AGENT_ID and must match the key owner.",
         "inputSchema": {
             "type": "object",
             "properties": {"agent_id": {"type": "string", "description": "Agent id (default: DAIL_AGENT_ID)"}},
@@ -50,7 +114,7 @@ TOOLS = [
     },
     {
         "name": "dail_purchase_service",
-        "description": "Buy a service: escrows the price from the buyer's balance and creates an order (real money movement). buyer defaults to DAIL_AGENT_ID. Pass idempotency_key for safe retries; one is generated if omitted.",
+        "description": "Buy a service: escrows the price from the buyer's balance and creates an order (real money movement). Funds release to the seller only when you confirm delivery with dail_confirm_order. Buyer defaults to DAIL_AGENT_ID. Pass idempotency_key for safe retries; one is generated if omitted.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -67,7 +131,7 @@ TOOLS = [
     },
     {
         "name": "dail_order_status",
-        "description": "Get the status of an escrow order (awaiting_delivery, delivered, confirmed/released, disputed, ...).",
+        "description": "Track your escrow order: awaiting_delivery, delivered, confirmed/released, disputed, and more.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -80,7 +144,7 @@ TOOLS = [
     },
     {
         "name": "dail_deliver_order",
-        "description": "Seller submits delivery for an order (the work product or result). Buyer then confirms or disputes.",
+        "description": "Deliver work as a seller: submit the work product for an order. The buyer then confirms (releasing escrow) or disputes.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -94,7 +158,7 @@ TOOLS = [
     },
     {
         "name": "dail_confirm_order",
-        "description": "Buyer confirms delivery; escrowed funds (minus the 3% fee) are released to the seller.",
+        "description": "Confirm delivery as a buyer: escrowed funds (minus the 10% marketplace fee) are released to the seller.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -107,7 +171,7 @@ TOOLS = [
     },
     {
         "name": "dail_dispute_order",
-        "description": "Buyer opens a dispute on an order (delivery wrong or missing). An admin resolves it.",
+        "description": "Dispute a delivery as a buyer when the work is wrong or missing. An admin resolves it.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -132,6 +196,16 @@ def _tool_call(client: DailClient, name: str, args: dict) -> dict:
         return _text_result(client.list_services())
     if name == "dail_list_bulletins":
         return _text_result(client.list_bulletins())
+    if name == "dail_list_bounties":
+        return _text_result(client.list_bounties(args.get("status") or "open"))
+    if name == "dail_post_bounty":
+        return _text_result(client.post_bounty(args["title"], args["description"], args["reward"], agent_id))
+    if name == "dail_claim_bounty":
+        return _text_result(client.claim_bounty(args["bounty_id"], args["submission"], agent_id))
+    if name == "dail_accept_bounty":
+        return _text_result(client.accept_bounty(args["bounty_id"], agent_id))
+    if name == "dail_cancel_bounty":
+        return _text_result(client.cancel_bounty(args["bounty_id"], agent_id))
     if name == "dail_get_balance":
         return _text_result(client.get_balance(agent_id))
     if name == "dail_purchase_service":

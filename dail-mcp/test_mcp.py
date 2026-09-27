@@ -82,11 +82,19 @@ def main():
     tools = r.get("result", {}).get("tools", [])
     names = {t["name"] for t in tools}
     expected = {
-        "dail_list_services", "dail_list_bulletins", "dail_get_balance",
-        "dail_purchase_service", "dail_order_status", "dail_deliver_order",
+        "dail_list_services", "dail_list_bulletins", "dail_list_bounties",
+        "dail_post_bounty", "dail_claim_bounty", "dail_accept_bounty", "dail_cancel_bounty",
+        "dail_get_balance", "dail_purchase_service", "dail_order_status", "dail_deliver_order",
         "dail_confirm_order", "dail_dispute_order",
     }
-    check("tools/list exposes all 8 tools", names == expected, f"got={sorted(names)}")
+    check("tools/list exposes all 13 tools", names == expected, f"got={sorted(names)}")
+
+    # buyer-verb descriptions: every tool description leads with a verb
+    descs = {t["name"]: t.get("description", "") for t in tools}
+    verb_ok = all(d and d[0].isupper() and d.split()[0] in
+                  {"Hire", "Browse", "Find", "Post", "Claim", "Accept", "Cancel", "Check", "Buy", "Track", "Deliver", "Confirm", "Dispute"}
+                  for d in descs.values())
+    check("tool descriptions use buyer verbs", verb_ok, str({k: v[:24] for k, v in descs.items()})[:200])
 
     # --- live public reads ---
     r = m.call("tools/call", {"name": "dail_list_services", "arguments": {}})
@@ -104,6 +112,14 @@ def main():
     except Exception as e:
         check("dail_list_bulletins parses as JSON", False, f"{e} :: {str(r)[:200]}")
 
+    r = m.call("tools/call", {"name": "dail_list_bounties", "arguments": {"status": "open"}})
+    try:
+        bnts = json.loads(r["result"]["content"][0]["text"])
+        blist = bnts.get("bounties", bnts if isinstance(bnts, list) else [])
+        check("dail_list_bounties returns open bounties", isinstance(blist, list) and len(blist) > 0, str(bnts)[:120])
+    except Exception as e:
+        check("dail_list_bounties returns open bounties", False, f"{e} :: {str(r)[:200]}")
+
     # --- graceful degradation without a key ---
     r = m.call("tools/call", {"name": "dail_get_balance", "arguments": {"agent_id": "nobody"}})
     check(
@@ -118,6 +134,13 @@ def main():
     r = m.call("tools/call", {"name": "dail_purchase_service", "arguments": {"service_id": "svc_nope"}})
     check(
         "dail_purchase_service without agent id/key -> clean error, no purchase attempted",
+        "error" in r and "agent" in r["error"]["message"].lower(),
+        str(r)[:160],
+    )
+
+    r = m.call("tools/call", {"name": "dail_post_bounty", "arguments": {"title": "t", "description": "d", "reward": 5}})
+    check(
+        "dail_post_bounty without agent id/key -> clean error, no escrow moved",
         "error" in r and "agent" in r["error"]["message"].lower(),
         str(r)[:160],
     )
