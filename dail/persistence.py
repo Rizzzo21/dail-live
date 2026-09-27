@@ -65,6 +65,12 @@ class WorldStore:
             """CREATE TABLE IF NOT EXISTS dail_orders (
                 order_id VARCHAR(64) PRIMARY KEY, data TEXT NOT NULL,
                 updated_at VARCHAR(64) NOT NULL)""",
+            """CREATE TABLE IF NOT EXISTS dail_services (
+                service_id VARCHAR(64) PRIMARY KEY, data TEXT NOT NULL,
+                updated_at VARCHAR(64) NOT NULL)""",
+            """CREATE TABLE IF NOT EXISTS dail_bulletins (
+                bulletin_id VARCHAR(64) PRIMARY KEY, data TEXT NOT NULL,
+                updated_at VARCHAR(64) NOT NULL)""",
             """CREATE TABLE IF NOT EXISTS dail_kv (
                 key VARCHAR(128) PRIMARY KEY, value TEXT NOT NULL)""",
         ]
@@ -114,6 +120,35 @@ class WorldStore:
                    ON CONFLICT (order_id) DO UPDATE SET data=EXCLUDED.data, updated_at=EXCLUDED.updated_at"""),
                 {"oid": order["id"], "data": json.dumps(order), "now": _now()})
 
+    def save_service(self, service):
+        """Persist a marketplace service listing (upsert by id)."""
+        if not self.enabled:
+            return
+        with self._lock, self.engine.begin() as c:
+            c.execute(text(
+                """INSERT INTO dail_services (service_id, data, updated_at)
+                   VALUES (:sid, :data, :now)
+                   ON CONFLICT (service_id) DO UPDATE SET data=EXCLUDED.data, updated_at=EXCLUDED.updated_at"""),
+                {"sid": service["id"], "data": json.dumps(service), "now": _now()})
+
+    def save_bulletin(self, bulletin):
+        """Persist a marketing bulletin (upsert by id)."""
+        if not self.enabled:
+            return
+        with self._lock, self.engine.begin() as c:
+            c.execute(text(
+                """INSERT INTO dail_bulletins (bulletin_id, data, updated_at)
+                   VALUES (:bid, :data, :now)
+                   ON CONFLICT (bulletin_id) DO UPDATE SET data=EXCLUDED.data, updated_at=EXCLUDED.updated_at"""),
+                {"bid": bulletin["id"], "data": json.dumps(bulletin), "now": _now()})
+
+    def delete_bulletin(self, bulletin_id):
+        if not self.enabled:
+            return
+        with self._lock, self.engine.begin() as c:
+            c.execute(text("DELETE FROM dail_bulletins WHERE bulletin_id=:bid"),
+                      {"bid": bulletin_id})
+
     def kv_set(self, key, value):
         if not self.enabled:
             return
@@ -125,14 +160,16 @@ class WorldStore:
 
     # ---- reads (startup restore) ----
     def load_all(self):
-        """Returns (agent_rows, tx_rows, order_rows, kv_dict)."""
+        """Returns (agent_rows, tx_rows, order_rows, kv_dict, service_rows, bulletin_rows)."""
         if not self.enabled:
-            return [], [], [], {}
+            return [], [], [], {}, [], []
         with self.engine.begin() as c:
             agents = c.execute(text(
                 "SELECT id, name, goal, spending_limit, approval_limit, status FROM dail_agents")).fetchall()
             txs = c.execute(text(
                 "SELECT txid, kind, from_account, to_account, amount, idempotency_key, status FROM dail_ledger_tx ORDER BY created_at, txid")).fetchall()
             orders = c.execute(text("SELECT order_id, data FROM dail_orders")).fetchall()
+            services = c.execute(text("SELECT service_id, data FROM dail_services")).fetchall()
+            bulletins = c.execute(text("SELECT bulletin_id, data FROM dail_bulletins")).fetchall()
             kv = {r[0]: json.loads(r[1]) for r in c.execute(text("SELECT key, value FROM dail_kv")).fetchall()}
-        return agents, txs, orders, kv
+        return agents, txs, orders, kv, services, bulletins

@@ -45,7 +45,7 @@ class Dail:
         Balances are derived by replaying the persisted transaction log."""
         if not self.store.enabled:
             return
-        agent_rows, tx_rows, order_rows, kv = self.store.load_all()
+        agent_rows, tx_rows, order_rows, kv, service_rows, bulletin_rows = self.store.load_all()
         for r in agent_rows:
             agent = Agent(id=r[0], name=r[1], goal=r[2], balance=0,
                           spending_limit=r[3], approval_limit=r[4], status=r[5])
@@ -69,6 +69,7 @@ class Dail:
             self.world_agents.orders[oid] = json.loads(data)
         self.world_agents.order_seq = kv.get("order_seq", 0)
         self.world_agents.bulletin_seq = kv.get("bulletin_seq", 0)
+        self.world_agents.service_seq = kv.get("service_seq", 0)
         self.world_agents.referrals = kv.get("referrals", {})
         # seqs must at least cover restored orders
         for oid in self.world_agents.orders:
@@ -76,9 +77,26 @@ class Dail:
                 self.world_agents.order_seq = max(self.world_agents.order_seq, int(oid.split("_")[1]))
             except Exception:
                 pass
+        for sid, data in service_rows:
+            self.world_agents.services[sid] = json.loads(data)
+            try:
+                self.world_agents.service_seq = max(self.world_agents.service_seq, int(sid.split("_")[1]))
+            except Exception:
+                pass
+        now = datetime.now(timezone.utc).isoformat()
+        for bid, data in bulletin_rows:
+            b = json.loads(data)
+            if b.get("expires_at", "") > now:  # drop already-expired bulletins
+                self.world_agents.bulletins[bid] = b
+        for bid in self.world_agents.bulletins:
+            try:
+                self.world_agents.bulletin_seq = max(self.world_agents.bulletin_seq, int(bid.split("_")[1]))
+            except Exception:
+                pass
         self.audit.append("world.restored", {
             "agents": len(agent_rows), "transactions": len(tx_rows),
-            "orders": len(order_rows)})
+            "orders": len(order_rows), "services": len(service_rows),
+            "bulletins": len(self.world_agents.bulletins)})
 
     def create_agent(self, agent):
         if agent.id in self.agents:
@@ -201,6 +219,7 @@ class AgentWorld:
         self.notifications={}
         self.bulletins={}
         self.bulletin_seq=0
+        self.service_seq=0
         self.orders={}
         self.order_seq=0
         self.referrals={}
@@ -220,6 +239,7 @@ class AgentWorld:
         if self.store:
             self.store.kv_set("order_seq", self.order_seq)
             self.store.kv_set("bulletin_seq", self.bulletin_seq)
+            self.store.kv_set("service_seq", self.service_seq)
             self.store.kv_set("referrals", self.referrals)
 
     def _save_order(self, order):
@@ -250,9 +270,13 @@ class AgentWorld:
 
     def create_service(self, provider_id, name, description, price):
         if provider_id not in self.social.identities: raise KeyError("agent not found")
-        sid=f"svc_{len(self.services)+1:04d}"
+        self.service_seq+=1
+        sid=f"svc_{self.service_seq:04d}"
         self.services[sid]={"id":sid,"provider_id":provider_id,"name":name,
                             "description":description,"price":price,"active":True}
+        if self.store:
+            self.store.save_service(self.services[sid])
+            self._save_kv()
         self.audit.append("service.created", {"service_id":sid,"provider_id":provider_id,"price":price})
         return self.services[sid]
 
@@ -513,6 +537,8 @@ class AgentWorld:
             "agent_name":self.social.identities[agent_id].get("name",agent_id),
             "title":title,"body":body,"service_id":service_id,
             "created_at":now.isoformat(),"expires_at":(now+BULLETIN_TTL).isoformat()}
+        if self.store:
+            self.store.save_bulletin(self.bulletins[bid])
         self._save_kv()
         self.audit.append("bulletin.posted", {"bulletin_id":bid,"agent_id":agent_id,"service_id":service_id})
         return self.bulletins[bid]
@@ -520,7 +546,10 @@ class AgentWorld:
     def list_bulletins(self):
         now=datetime.now(timezone.utc).isoformat()
         expired=[bid for bid,b in self.bulletins.items() if b["expires_at"] <= now]
-        for bid in expired: del self.bulletins[bid]
+        for bid in expired:
+            del self.bulletins[bid]
+            if self.store:
+                self.store.delete_bulletin(bid)
         return {"bulletins":sorted(self.bulletins.values(),
                 key=lambda b: b["created_at"], reverse=True)}
 

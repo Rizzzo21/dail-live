@@ -64,7 +64,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 DB = "/tmp/dail_payment_safety_test.db"
 _SAFETY_ENV = {
     "DAIL_REAL_PAYMENTS": "true",
-    "STRIPE_SECRET_KEY": "sk_test_fake",
+    # Live-prefixed fake key: the suite exercises the live-mode path
+    # (announce, status flags) while the fake stripe module keeps every
+    # Stripe call in-process. Test-mode behavior is covered by
+    # test_mode_derived_from_key_prefix below.
+    "STRIPE_SECRET_KEY": "sk_live_fake",
     "STRIPE_WEBHOOK_SECRET": "whsec_fake",
     "DATABASE_URL": f"sqlite:///{DB}",
     "DAIL_PER_USD": "1",
@@ -213,3 +217,28 @@ def test_new_agent_is_told_about_rail(client):
     _make_agent(client, "buyer_newbie")
     notes = client.get("/world/notifications/buyer_newbie").json()["notifications"]
     assert any(n.get("type") == "payment_rail_live" for n in notes)
+
+
+def test_mode_derived_from_key_prefix():
+    """Mode reporting must be honest: test keys never report live."""
+    from dail.production_payments import ProductionPayments
+
+    class D:
+        agents = {}
+
+    saved = {k: os.environ.get(k) for k in ("STRIPE_SECRET_KEY", "DATABASE_URL")}
+    try:
+        os.environ["DATABASE_URL"] = ""
+        os.environ["STRIPE_SECRET_KEY"] = "sk_test_abc"
+        assert ProductionPayments(D()).mode == "test"
+        assert ProductionPayments(D()).live_ready is False
+        os.environ["STRIPE_SECRET_KEY"] = "sk_live_abc"
+        assert ProductionPayments(D()).mode == "live"
+        os.environ["STRIPE_SECRET_KEY"] = ""
+        assert ProductionPayments(D()).mode == "unconfigured"
+    finally:
+        for k, v in saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
