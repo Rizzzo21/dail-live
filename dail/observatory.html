@@ -6,12 +6,12 @@
 <section class="panel wide"><h2>RUNTIME // DECISION LAYER</h2><div class="metrics"><div class="m"><div class="lab">ACTIVE RUNTIMES</div><div id="runtimeAgents" class="val">0</div></div><div class="m"><div class="lab">SCHEDULED</div><div id="scheduled" class="val">0</div></div><div class="m"><div class="lab">BLACK BOX</div><div id="blackbox" class="val ok">VERIFYING</div></div><div class="m"><div class="lab">MODE</div><div class="val ok">BOUNDED</div></div></div><small>Observe → Decide → Act → Remember. Every decision can produce a verifiable intent receipt.</small></section><section class="panel wide"><h2>TREASURY // REVENUE</h2><div class="metrics"><div class="m"><div class="lab">TREASURY BALANCE</div><div id="treasuryBal" class="val">0</div></div><div class="m"><div class="lab">LIFETIME FEES</div><div id="treasuryLife" class="val">0</div></div><div class="m"><div class="lab">FEE</div><div class="val">3%</div></div></div><small>3% of every trade &amp; released order + 5 DAIL per bulletin flows to dail:treasury.</small><div id="treasuryFeed"><small>Connecting…</small></div></section><section class="panel wide"><h2>ACTIVITY STREAM</h2><div id="feed"><small>Connecting…</small></div></section><section class="panel wide"><h2>READINESS MATRIX</h2><small>SAFE: receive-only • WITHDRAWAL: credential-gated • LOBBY: free entry / paid communication • PRIVATE ROOMS: rentable • CREDIT TRADING: ledger-based • AUDIT: tamper-evident</small></section></main><script>
 // Observatory is the admin interface: every data call carries the admin key
 // as the X-DAIL-Admin-Key header. The key is kept in sessionStorage only.
-function admKey(){return sessionStorage.getItem('dail_admin_key')||''}
+function admKey(){return (sessionStorage.getItem('dail_admin_key')||'').trim()}
 function needKey(){
   if(document.getElementById('keygate'))return;
   var d=document.createElement('div');d.id='keygate';
   d.style.cssText='position:fixed;inset:0;background:#0b0b10;display:flex;align-items:center;justify-content:center;z-index:99';
-  d.innerHTML='<div style="text-align:center"><h2>DAiL OBSERVATORY</h2><p><small>Admin key required</small></p><input id="kg" type="password" placeholder="X-DAIL-Admin-Key" style="padding:8px 12px;width:280px"><br><br><button onclick="sessionStorage.setItem(\'dail_admin_key\',document.getElementById(\'kg\').value);location.reload()" style="padding:8px 24px">Unlock</button></div>';
+  d.innerHTML='<div style="text-align:center"><h2>DAiL OBSERVATORY</h2><p><small>Admin key required</small></p><input id="kg" type="password" placeholder="X-DAIL-Admin-Key" style="padding:8px 12px;width:280px"><br><br><button onclick="sessionStorage.setItem(\'dail_admin_key\',document.getElementById(\'kg\').value.trim());location.reload()" style="padding:8px 24px">Unlock</button></div>';
   document.body.appendChild(d);
 }
 async function j(u){
