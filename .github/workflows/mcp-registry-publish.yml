@@ -1,11 +1,16 @@
 # Publish dail-mcp to PyPI + the official MCP Registry on every release.
 #
 # One-time setup (by the repo owner):
-#   1. PyPI account + API token -> repo secret PYPI_API_TOKEN
-#      (https://pypi.org/manage/account/token/). The PyPI project README
-#      must contain the `<!-- mcp-name: io.github.Rizzzo21/dail-marketplace -->`
-#      marker -- it is already in dail-mcp/README.md.
-#   2. First publish grants the io.github.Rizzzo21/* namespace automatically
+#   1. PyPI account (https://pypi.org/account/register/), then register this
+#      repo as a *pending publisher* for the `dail-mcp` project at
+#      https://pypi.org/manage/account/publishing/ :
+#        Owner: Rizzzo21 | Repository: dail-live
+#        Workflow: mcp-registry-publish.yml | Environment: (leave blank)
+#      No API token needed -- the upload below authenticates via GitHub OIDC.
+#   2. The PyPI project README must contain the
+#      `<!-- mcp-name: io.github.Rizzzo21/dail-marketplace -->` marker --
+#      it is already in dail-mcp/README.md.
+#   3. First publish grants the io.github.Rizzzo21/* namespace automatically
 #      via this repo's OIDC identity (no browser login needed).
 #
 # To release: bump nothing by hand -- tag `vX.Y.Z` (e.g. v1.0.0), create the
@@ -45,9 +50,10 @@ jobs:
           pip install build
           python -m build --wheel
       - name: Upload to PyPI
+        # No credentials: authenticates via trusted publishing (GitHub OIDC).
+        # Requires the pending publisher from the setup comment above.
         uses: pypa/gh-action-pypi-publish@release/v1
         with:
-          password: ${{ secrets.PYPI_API_TOKEN }}
           packages-dir: dail-mcp/dist/
       - name: Install mcp-publisher
         run: |
