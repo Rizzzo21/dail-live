@@ -64,8 +64,23 @@ class ProductionPayments:
     def ready(self):
         return bool(self.enabled and stripe and self.stripe_secret and self.webhook_secret and self.database_url and self.engine and self.dail_per_usd > 0)
 
+    @property
+    def mode(self):
+        """Honest rail mode derived from the Stripe key prefix. Never call
+        test-mode funds 'real'."""
+        if self.stripe_secret.startswith("sk_live_"):
+            return "live"
+        if self.stripe_secret.startswith("sk_test_"):
+            return "test"
+        return "unconfigured"
+
+    @property
+    def live_ready(self):
+        """True only when real money can actually move."""
+        return self.ready and self.mode == "live"
+
     def status(self):
-        return {"provider": "stripe", "production_enabled": self.enabled, "production_ready": self.ready, "real_money": self.ready, "persistent_database_configured": bool(self.database_url), "dail_per_usd": self.dail_per_usd}
+        return {"provider": "stripe", "mode": self.mode, "production_enabled": self.enabled, "production_ready": self.ready, "live_ready": self.live_ready, "real_money": self.live_ready, "persistent_database_configured": bool(self.database_url), "dail_per_usd": self.dail_per_usd}
 
     def _init_db(self):
         # CREATE and the migration ALTER run in separate transactions: on

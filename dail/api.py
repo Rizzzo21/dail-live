@@ -71,7 +71,7 @@ def payment_info():
     """Agent-readable guide: how to top up, and how to earn from other agents."""
     return {
         "rail": "stripe",
-        "live": production_payments.ready,
+        "live": production_payments.live_ready,
         "dail_per_usd": production_payments.dail_per_usd,
         "bounds_usd": {"min": 1, "max": 10000},
         "how_to_top_up": [
@@ -96,7 +96,7 @@ def payment_announce(x_dail_admin_key: str | None = Header(default=None)):
     admin_key = os.getenv("DAIL_ADMIN_KEY", "")
     if not admin_key or not hmac.compare_digest(x_dail_admin_key or "", admin_key):
         raise HTTPException(403, "admin_key_invalid")
-    if not production_payments.ready:
+    if not production_payments.live_ready:
         raise HTTPException(503, "real_payments_not_ready")
     return production_payments.announce()
 
@@ -118,10 +118,11 @@ def health():
     pp = production_payments
     return {
         "ok": True,
-        "environment": "test",
-        "real_payments": pp.ready,
+        "environment": pp.mode,
+        "mode": pp.mode,
+        "real_payments": pp.live_ready,
         "safe_enabled": True,
-        "real_funds": pp.ready,
+        "real_funds": pp.live_ready,
     }
 
 @app.get("/safe")
