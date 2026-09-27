@@ -55,10 +55,23 @@ def test_trade_fee_flows_to_treasury():
         "item": "widget", "idempotency_key": f"k-{s}"}, headers=_auth(s))
     assert r.status_code == 200, r.text
     t = r.json()
-    assert t["fee"] == 3 and t["seller_net"] == 97
+    assert t["fee"] == 10 and t["seller_net"] == 90
     assert _bal(b) == 0           # buyer paid 100
-    assert _bal(s) == 197         # seller: 100 + 97
-    assert _treasury()["balance"] == t0 + 3
+    assert _bal(s) == 190         # seller: 100 + 90
+    assert _treasury()["balance"] == t0 + 10
+
+
+def test_minimum_fee_floor_on_micro_trade():
+    s, b = _uid("s"), _uid("b")
+    _make(s); _make(b)
+    t0 = _treasury()["balance"]
+    r = client.post("/world/trades", json={
+        "seller_id": s, "buyer_id": b, "amount": 5,
+        "item": "micro", "idempotency_key": f"micro-{s}"}, headers=_auth(s))
+    assert r.status_code == 200, r.text
+    t = r.json()
+    assert t["fee"] == 1 and t["seller_net"] == 4  # 10% of 5 truncates to 0 -> floor 1
+    assert _treasury()["balance"] == t0 + 1
 
 
 def test_trade_replay_still_idempotent_with_fee():
@@ -68,7 +81,7 @@ def test_trade_replay_still_idempotent_with_fee():
             "item": "w", "idempotency_key": f"rk-{s}"}
     assert client.post("/world/trades", json=body, headers=_auth(s)).status_code == 200
     assert client.post("/world/trades", json=body, headers=_auth(s)).status_code == 200
-    assert _bal(b) == 0 and _bal(s) == 197  # charged exactly once
+    assert _bal(b) == 0 and _bal(s) == 190  # charged exactly once
 
 
 def test_escrow_order_lifecycle_with_fee():
@@ -97,9 +110,9 @@ def test_escrow_order_lifecycle_with_fee():
                     json={"agent_id": b}, headers=_auth(b))
     assert r.status_code == 200, r.text
     assert r.json()["status"] == "completed"
-    assert r.json()["fee"] == 3
-    assert _bal(s) == 197 and _bal(b) == 0
-    assert _treasury()["balance"] == t0 + 3
+    assert r.json()["fee"] == 10
+    assert _bal(s) == 190 and _bal(b) == 0
+    assert _treasury()["balance"] == t0 + 10
 
 
 def test_order_dispute_and_buyer_refund():
@@ -135,14 +148,14 @@ def test_referral_reward_on_first_trade():
     inviter, new = _uid("inv"), _uid("new")
     _make(inviter)                       # 100
     _make(new, referred_by=inviter)      # 100
-    # trade 1: new sells 20 to inviter. fee = 20*300//10000 = 0.
-    # inviter: 100 - 20 = 80, then +10 referral reward. new: 100 + 20 = 120.
+    # trade 1: new sells 20 to inviter. fee = max(1, 20*1000//10000) = 2.
+    # inviter: 100 - 20 = 80, then +10 referral reward. new: 100 + 18 = 118.
     r = client.post("/world/trades", json={
         "seller_id": new, "buyer_id": inviter, "amount": 20,
         "item": "y", "idempotency_key": f"ref-{new}"}, headers=_auth(new))
     assert r.status_code == 200, r.text
     assert _bal(inviter) == 90, _bal(inviter)
-    assert _bal(new) == 120, _bal(new)
+    assert _bal(new) == 118, _bal(new)
     # trade 2: reward must not pay twice. inviter: 90 - 20 = 70.
     r = client.post("/world/trades", json={
         "seller_id": new, "buyer_id": inviter, "amount": 20,
@@ -160,7 +173,7 @@ def test_treasury_report_shape():
     t = _treasury()
     assert t["treasury"] == "dail:treasury"
     assert t["currency"] == "DAIL"
-    assert t["fee_bps"] == 300
+    assert t["fee_bps"] == 1000
     assert isinstance(t["events"], list)
 
 

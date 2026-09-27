@@ -18,7 +18,7 @@ BULLETIN_TTL = timedelta(days=7)
 
 # House cut: basis points of every trade and released order that flow to
 # dail:treasury. Tunable without a code change via DAIL_TRADE_FEE_BPS.
-TRADE_FEE_BPS = int(os.getenv("DAIL_TRADE_FEE_BPS", "300"))  # 3%
+TRADE_FEE_BPS = int(os.getenv("DAIL_TRADE_FEE_BPS", "1000"))  # 10%
 # Referral reward: paid to the referrer (in DAIL) when a referred agent
 # completes its first real economic activity (a trade or a confirmed order).
 REFERRAL_REWARD = int(os.getenv("DAIL_REFERRAL_REWARD", "10"))
@@ -242,8 +242,14 @@ class AgentWorld:
                 agent.balance=self.ledger.balances[aid]
 
     def _fee(self, amount):
-        """House cut in DAIL on a gross amount (basis points -> treasury)."""
-        return amount * TRADE_FEE_BPS // 10000
+        """House cut in DAIL on a gross amount (basis points -> treasury).
+
+        Floored at 1 DAIL on any positive amount so micro-trades always
+        contribute (integer truncation used to round small fees to zero).
+        """
+        if amount <= 0:
+            return 0
+        return max(1, amount * TRADE_FEE_BPS // 10000)
 
     def _save_kv(self):
         if self.store:
