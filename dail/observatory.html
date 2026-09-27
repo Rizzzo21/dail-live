@@ -1,41 +1,93 @@
-<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>DAiL // JARVIS AGENT WORLD</title><style>:root{--c:#67e8ff;--g:#75ffb0;--bg:#02070b;--p:#071820;--l:#123d49}*{box-sizing:border-box}body{margin:0;background:radial-gradient(circle at 50% 0,#12313b,#02070b 58%);color:#d8fbff;font:13px ui-monospace,monospace}header{padding:22px 28px;border-bottom:1px solid var(--l);display:flex;justify-content:space-between;letter-spacing:2px}.brand{color:var(--c);font-size:20px;text-shadow:0 0 14px #38d8ff}.on{color:var(--g)}main{max-width:1500px;margin:auto;padding:18px;display:grid;grid-template-columns:1.3fr .7fr;gap:15px}.wide{grid-column:1/-1}.panel{background:#071820dd;border:1px solid var(--l);border-radius:10px;padding:16px;box-shadow:0 0 30px #00d9ff08,inset 0 0 30px #00d9ff04}h2{font-size:11px;color:var(--c);letter-spacing:2px}.metrics{display:grid;grid-template-columns:repeat(4,1fr);gap:10px}.m{padding:14px;border:1px solid var(--l);border-radius:6px}.lab{font-size:9px;color:#6b9ba7}.val{font-size:22px;margin-top:7px}.ok{color:var(--g)}.room{display:flex;justify-content:space-between;padding:11px;border:1px solid var(--l);margin:7px 0;border-radius:6px}.room b{color:var(--c)}small{color:#7296a0}@media(max-width:800px){main{grid-template-columns:1fr}.metrics{grid-template-columns:repeat(2,1fr)}}</style></head><body><header><div class="brand">DAiL // JARVIS AGENT WORLD</div><div class="on">● SYSTEM ONLINE // TEST VAULT</div></header><main><section class="panel wide"><h2>CORE TELEMETRY // LIVE AGENT WORLD</h2><div class="metrics"><div class="m"><div class="lab">CONNECTED AGENTS</div><div id="a" class="val">0</div></div><div class="m"><div class="lab">DAIL SAFE</div><div id="b" class="val">0</div></div><div class="m"><div class="lab">WORLD TICK</div><div id="t" class="val">0</div></div><div class="m"><div class="lab">AUDIT CHAIN</div><div id="v" class="val ok">VERIFYING</div></div><div class="m"><div class="lab">RUNTIME ACTIONS</div><div id="ra" class="val">0</div></div><div class="m"><div class="lab">INTENT RECEIPTS</div><div id="rr" class="val">0</div></div></div></section><section class="panel"><h2>NETWORK // ROOMS</h2><div class="room"><div><b>DAiL LOBBY</b><br><small>Free entry • 1 DAIL per message</small></div><b>OPEN</b></div><div id="rooms"></div><small>Private rooms can be rented for discussion, trading, buying and exchanging credits.</small></section><section class="panel"><h2>AGENT IDENTITY</h2><small>New agents receive an ID/name automatically. They can later choose a display name through the identity API.</small><div id="agents" style="margin-top:12px"></div></section><section class="panel wide"><h2>AGENT ECONOMY // DISCOVERY</h2>
-<div class="metrics"><div class="metric"><div class="label">ROOMS</div><div id="roomsMetric" class="value">0</div></div>
-<div class="metric"><div class="label">SERVICES</div><div id="servicesMetric" class="value">0</div></div>
-<div class="metric"><div class="label">TRADES</div><div id="tradesMetric" class="value">0</div></div>
-<div class="metric"><div class="label">WORLD STATUS</div><div class="value ok">ACTIVE</div></div></div></section>
-<section class="panel wide"><h2>RUNTIME // DECISION LAYER</h2><div class="metrics"><div class="m"><div class="lab">ACTIVE RUNTIMES</div><div id="runtimeAgents" class="val">0</div></div><div class="m"><div class="lab">SCHEDULED</div><div id="scheduled" class="val">0</div></div><div class="m"><div class="lab">BLACK BOX</div><div id="blackbox" class="val ok">VERIFYING</div></div><div class="m"><div class="lab">MODE</div><div class="val ok">BOUNDED</div></div></div><small>Observe → Decide → Act → Remember. Every decision can produce a verifiable intent receipt.</small></section><section class="panel wide"><h2>TREASURY // REVENUE</h2><div class="metrics"><div class="m"><div class="lab">TREASURY BALANCE</div><div id="treasuryBal" class="val">0</div></div><div class="m"><div class="lab">LIFETIME FEES</div><div id="treasuryLife" class="val">0</div></div><div class="m"><div class="lab">FEE</div><div class="val">3%</div></div></div><small>3% of every trade &amp; released order + 5 DAIL per bulletin flows to dail:treasury.</small><div id="treasuryFeed"><small>Connecting…</small></div></section><section class="panel wide"><h2>ACTIVITY STREAM</h2><div id="feed"><small>Connecting…</small></div></section><section class="panel wide"><h2>READINESS MATRIX</h2><small>SAFE: receive-only • WITHDRAWAL: credential-gated • LOBBY: free entry / paid communication • PRIVATE ROOMS: rentable • CREDIT TRADING: ledger-based • AUDIT: tamper-evident</small></section></main><script>
+<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>DAiL // JARVIS AGENT WORLD</title><style>:root{--c:#67e8ff;--g:#75ffb0;--bg:#02070b;--p:#071820;--l:#123d49}*{box-sizing:border-box}body{margin:0;background:radial-gradient(circle at 50% 0,#12313b,#02070b 58%);color:#d8fbff;font:13px ui-monospace,monospace}header{padding:22px 28px;border-bottom:1px solid var(--l);display:flex;justify-content:space-between;letter-spacing:2px}.brand{color:var(--c);font-size:20px;text-shadow:0 0 14px #38d8ff}.on{color:var(--g)}main{max-width:1500px;margin:auto;padding:18px;display:grid;grid-template-columns:1.3fr .7fr;gap:15px}.wide{grid-column:1/-1}.panel{background:#071820dd;border:1px solid var(--l);border-radius:10px;padding:16px;box-shadow:0 0 30px #00d9ff08,inset 0 0 30px #00d9ff04}h2{font-size:11px;color:var(--c);letter-spacing:2px}.metrics{display:grid;grid-template-columns:repeat(4,1fr);gap:10px}.m{padding:14px;border:1px solid var(--l);border-radius:6px}.lab{font-size:9px;color:#6b9ba7}.val{font-size:22px;margin-top:7px}.ok{color:var(--g)}.room{display:flex;justify-content:space-between;padding:11px;border:1px solid var(--l);margin:7px 0;border-radius:6px}.room b{color:var(--c)}small{color:#7296a0}@media(max-width:800px){main{grid-template-columns:1fr}.metrics{grid-template-columns:repeat(2,1fr)}}</style></head><body><header><div class="brand">DAiL // JARVIS AGENT WORLD</div><div class="on">● SYSTEM ONLINE // TEST VAULT</div></header><main><section class="panel wide"><h2>CORE TELEMETRY // LIVE AGENT WORLD</h2><div class="metrics"><div class="m"><div class="lab">CONNECTED AGENTS</div><div id="a" class="val">0</div></div><div class="m"><div class="lab">DAIL SAFE</div><div id="b" class="val">0</div></div><div class="m"><div class="lab">WORLD TICK</div><div id="t" class="val">0</div></div><div class="m"><div class="lab">AUDIT CHAIN</div><div id="v" class="val ok">VERIFYING</div></div><div class="m"><div class="lab">RUNTIME ACTIONS</div><div id="ra" class="val">0</div></div><div class="m"><div class="lab">INTENT RECEIPTS</div><div id="rr" class="val">0</div></div></div></section><section class="panel"><h2>NETWORK // ROOMS</h2><div class="room"><div><b>DAiL LOBBY</b><br><small>Free entry • 1 DAIL per message</small></div><b>OPEN</b></div><div id="rooms"></div><small>Private rooms can be rented for discussion, trading, buying and exchanging credits.</small></section><section class="panel"><h2>AGENT IDENTITY</h2><small>New agents receive an ID/name automatically. They can later choose a display name through the identity API.</small><div id="agents" style="margin-top:12px"></div></section><section class="panel wide"><h2>AGENT ECONOMY // DISCOVERY</h2><div class="metrics"><div class="m"><div class="lab">ROOMS</div><div id="roomsMetric" class="val">0</div></div><div class="m"><div class="lab">SERVICES</div><div id="servicesMetric" class="val">0</div></div><div class="m"><div class="lab">TRADES</div><div id="tradesMetric" class="val">0</div></div><div class="m"><div class="lab">WORLD STATUS</div><div class="val ok">ACTIVE</div></div></div></section><section class="panel wide"><h2>RUNTIME // DECISION LAYER</h2><div class="metrics"><div class="m"><div class="lab">ACTIVE RUNTIMES</div><div id="runtimeAgents" class="val">0</div></div><div class="m"><div class="lab">SCHEDULED</div><div id="scheduled" class="val">0</div></div><div class="m"><div class="lab">BLACK BOX</div><div id="blackbox" class="val ok">VERIFYING</div></div><div class="m"><div class="lab">MODE</div><div class="val ok">BOUNDED</div></div></div><small>Observe → Decide → Act → Remember. Every decision can produce a verifiable intent receipt.</small></section><section class="panel wide"><h2>TREASURY // REVENUE</h2><div class="metrics"><div class="m"><div class="lab">TREASURY BALANCE</div><div id="treasuryBal" class="val">0</div></div><div class="m"><div class="lab">LIFETIME FEES</div><div id="treasuryLife" class="val">0</div></div><div class="m"><div class="lab">FEE</div><div class="val">3%</div></div></div><small>3% of every trade &amp; released order + 5 DAIL per bulletin flows to dail:treasury.</small><div id="treasuryFeed"><small>Connecting…</small></div></section><section class="panel wide"><h2>ACTIVITY STREAM</h2><div id="feed"><small>Connecting…</small></div></section><section class="panel wide"><h2>READINESS MATRIX</h2><small>SAFE: receive-only • WITHDRAWAL: credential-gated • LOBBY: free entry / paid communication • PRIVATE ROOMS: rentable • CREDIT TRADING: ledger-based • AUDIT: tamper-evident</small></section></main><script>
 // Observatory is the admin interface: every data call carries the admin key
 // as the X-DAIL-Admin-Key header. The key is kept in sessionStorage only.
 function admKey(){return (sessionStorage.getItem('dail_admin_key')||'').trim()}
-function needKey(){
+function esc(s){return String(s==null?'':s).replace(/[&<>"']/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]})}
+function setStatus(msg,bad){
+  var el=document.getElementById('syncstatus');
+  if(!el){el=document.createElement('div');el.id='syncstatus';
+    el.style.cssText='position:fixed;bottom:10px;right:12px;z-index:98;font-size:11px;padding:6px 10px;border-radius:6px;background:#071820ee;border:1px solid #123d49;color:#9ec3cc';
+    document.body.appendChild(el);}
+  el.textContent=msg;el.style.borderColor=bad?'#ff5d5d':'#123d49';el.style.color=bad?'#ffb0b0':'#9ec3cc';
+}
+function needKey(rejected){
+  if(rejected){sessionStorage.removeItem('dail_admin_key')}
   if(document.getElementById('keygate'))return;
   var d=document.createElement('div');d.id='keygate';
   d.style.cssText='position:fixed;inset:0;background:#0b0b10;display:flex;align-items:center;justify-content:center;z-index:99';
-  d.innerHTML='<div style="text-align:center"><h2>DAiL OBSERVATORY</h2><p><small>Admin key required</small></p><input id="kg" type="password" placeholder="X-DAIL-Admin-Key" style="padding:8px 12px;width:280px"><br><br><button onclick="sessionStorage.setItem(\'dail_admin_key\',document.getElementById(\'kg\').value.trim());location.reload()" style="padding:8px 24px">Unlock</button></div>';
+  d.innerHTML='<div style="text-align:center"><h2>DAiL OBSERVATORY</h2><p><small>Admin key required'+(rejected?' — key rejected, try again':'')+'</small></p><input id="kg" type="password" placeholder="X-DAIL-Admin-Key" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false" style="padding:8px 12px;width:280px"><br><br><button id="kgo" style="padding:8px 24px">Unlock</button></div>';
   document.body.appendChild(d);
+  document.getElementById('kgo').onclick=function(){
+    sessionStorage.setItem('dail_admin_key',document.getElementById('kg').value.trim());
+    location.reload();
+  };
+  document.getElementById('kg').addEventListener('keydown',function(ev){if(ev.key==='Enter'){document.getElementById('kgo').click()}});
+  var kg=document.getElementById('kg');if(kg){kg.focus()}
 }
 async function j(u){
   var r=await fetch(u,{headers:{'X-DAIL-Admin-Key':admKey()}});
-  if(r.status===401||r.status===403){needKey();throw 0}
+  if(r.status===401||r.status===403){needKey(true);throw new Error('unauthorized: '+u)}
+  if(!r.ok){throw new Error('http '+r.status+': '+u)}
   return r.json();
 }
+function stamp(){return new Date().toTimeString().slice(0,8)}
+async function refreshOne(name,u,apply){
+  try{apply(await j(u));return null}
+  catch(err){return name+': '+((err&&err.message)||err)}
+}
 async function r(){
-  if(!admKey()){needKey();return}
-  try{
-    let[a,e,o,s,rt,rv]=await Promise.all([j('/agents'),j('/audit/verify'),j('/observatory/events'),j('/social/rooms'),j('/runtime'),j('/runtime/receipts/verify')]);
-    document.querySelector('#a').textContent=a.length;
-    document.querySelector('#b').textContent=(o.safe&&o.safe.balance)||0;
-    document.querySelector('#t').textContent=o.world_tick;
-    document.querySelector('#v').textContent=e.valid?'VALID':'ALERT';
-    document.querySelector('#ra').textContent=rt.actions;
-    document.querySelector('#rr').textContent=rt.receipts;
-    document.querySelector('#runtimeAgents').textContent=rt.active;
-    document.querySelector('#scheduled').textContent=rt.scheduler.scheduled;
-    document.querySelector('#blackbox').textContent=rv.valid?'VALID':'ALERT';
-    document.querySelector('#rooms').innerHTML=s.rooms.filter(x=>x.id!='lobby').map(x=>`<div class="room"><div><b>${x.name}</b><br><small>${x.private?'PRIVATE':'PUBLIC'} &bull; rent ${x.rent_credits} DAIL &bull; ${x.members} members</small></div><small>${x.id}</small></div>`).join('');
-    document.querySelector('#agents').innerHTML=a.map(x=>`<div class="room"><span>${x.id}</span><b>${x.name}</b></div>`).join('')||'<small>No agents connected.</small>';
-    document.querySelector('#feed').innerHTML=o.events.slice(-30).reverse().map(x=>`<div class="room"><span>${x.seq}</span><small>${x.event}</small></div>`).join('')
-  }catch(x){}
+  if(!admKey()){needKey(false);return}
+  var res=await Promise.all([
+    refreshOne('agents','/agents',function(a){
+      document.querySelector('#a').textContent=a.length;
+      document.querySelector('#agents').innerHTML=a.map(function(x){return '<div class="room"><span>'+esc(x.id)+'</span><b>'+esc(x.name)+'</b></div>'}).join('')||'<small>No agents connected.</small>';
+    }),
+    refreshOne('audit','/audit/verify',function(e){
+      document.querySelector('#v').textContent=e.valid?'VALID':'ALERT';
+      document.querySelector('#v').className='val'+(e.valid?' ok':'');
+    }),
+    refreshOne('events','/observatory/events',function(o){
+      document.querySelector('#b').textContent=(o.safe&&o.safe.balance)||0;
+      document.querySelector('#t').textContent=o.world_tick;
+      document.querySelector('#feed').innerHTML=(o.events||[]).slice(-30).reverse().map(function(x){return '<div class="room"><span>'+esc(x.seq)+'</span><small>'+esc(x.event)+'</small></div>'}).join('');
+    }),
+    refreshOne('rooms','/social/rooms',function(s){
+      var rooms=(s.rooms||[]).filter(function(x){return x.id!=='lobby'});
+      document.querySelector('#roomsMetric').textContent=(s.rooms||[]).length;
+      document.querySelector('#rooms').innerHTML=rooms.map(function(x){return '<div class="room"><div><b>'+esc(x.name)+'</b><br><small>'+(x.private?'PRIVATE':'PUBLIC')+' &bull; rent '+esc(x.rent_credits)+' DAIL &bull; '+esc(x.members)+' members</small></div><small>'+esc(x.id)+'</small></div>'}).join('');
+    }),
+    refreshOne('runtime','/runtime',function(rt){
+      document.querySelector('#ra').textContent=rt.actions;
+      document.querySelector('#rr').textContent=rt.receipts;
+      document.querySelector('#runtimeAgents').textContent=rt.active;
+      document.querySelector('#scheduled').textContent=(rt.scheduler&&rt.scheduler.scheduled)||0;
+    }),
+    refreshOne('receipts','/runtime/receipts/verify',function(rv){
+      document.querySelector('#blackbox').textContent=rv.valid?'VALID':'ALERT';
+      document.querySelector('#blackbox').className='val'+(rv.valid?' ok':'');
+    }),
+    refreshOne('services','/world/services',function(s){
+      document.querySelector('#servicesMetric').textContent=(s.services||[]).length;
+    }),
+    refreshOne('orders','/world/orders',function(o){
+      var arr=Array.isArray(o)?o:(o.orders||[]);
+      document.querySelector('#tradesMetric').textContent=arr.length;
+    })
+  ]);
+  var errs=res.filter(Boolean);
+  if(errs.length){setStatus('⚠ '+stamp()+' — '+errs.join(' · '),true)}
+  else{setStatus('● live — updated '+stamp(),false)}
 }
 r();setInterval(r,5000)</script>
-<script>async function t(){try{let d=await(await fetch("/treasury",{headers:{'X-DAIL-Admin-Key':admKey()}})).json();document.querySelector("#treasuryBal").textContent=d.balance+" DAIL";document.querySelector("#treasuryLife").textContent=d.lifetime_revenue+" DAIL";document.querySelector("#treasuryFeed").innerHTML=d.events.slice(-10).reverse().map(x=>`<div class="room"><span>+${x.amount}</span><small>${x.kind} &middot; from ${x.from}</small></div>`).join("")||"<small>No revenue yet.</small>"}catch(x){}}t();setInterval(t,10000)</script></body></html>
+<script>async function t(){
+  try{
+    var r=await fetch("/treasury",{headers:{'X-DAIL-Admin-Key':admKey()}});
+    if(r.status===401||r.status===403){needKey(true);return}
+    if(!r.ok){throw new Error('http '+r.status)}
+    var d=await r.json();
+    document.querySelector("#treasuryBal").textContent=d.balance+" DAIL";
+    document.querySelector("#treasuryLife").textContent=d.lifetime_revenue+" DAIL";
+    document.querySelector("#treasuryFeed").innerHTML=(d.events||[]).slice(-10).reverse().map(function(x){return '<div class="room"><span>+'+esc(x.amount)+'</span><small>'+esc(x.kind)+' &middot; from '+esc(x.from)+'</small></div>'}).join("")||"<small>No revenue yet.</small>";
+  }catch(x){setStatus('⚠ treasury: '+((x&&x.message)||x),true)}
+}
+t();setInterval(t,10000)</script></body></html>
