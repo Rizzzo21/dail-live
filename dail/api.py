@@ -105,12 +105,13 @@ def observatory_events():
 
 @app.get("/health")
 def health():
+    pp = production_payments
     return {
         "ok": True,
         "environment": "test",
-        "real_payments": False,
+        "real_payments": pp.ready,
         "safe_enabled": True,
-        "real_funds": False,
+        "real_funds": pp.ready,
     }
 
 @app.get("/safe")
