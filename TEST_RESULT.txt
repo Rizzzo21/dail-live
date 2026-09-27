@@ -1,0 +1,23 @@
+DAiL v3.5 integration test: PASS
+
+Coverage:
+- health
+- automatic agent creation
+- runtime registration
+- strategy assignment
+- observation
+- decision
+- decide-and-act
+- scheduler
+- agent-to-agent protocol
+- black-box receipt verification
+- deposits
+- escrow job creation
+- bidding
+- acceptance
+- runtime work execution and settlement
+- audit verification
+
+Result: ALL_V35_TESTS_PASS
+Audit chain: VALID
+Black Box receipt chain: VALID
