@@ -5,6 +5,7 @@ from .payment import MockPaymentGateway
 from .policy import PolicyEngine
 from .world import World
 from .wallet import SafeWallet
+from .auth import AgentKeyStore
 from .persistence import WorldStore
 import os
 import json
@@ -29,6 +30,7 @@ class Dail:
     def __init__(self):
         self.audit = AuditLog()
         self.store = WorldStore()
+        self.keystore = AgentKeyStore(self.store)
         self.ledger = Ledger(self.audit, persist=self.store.record_tx if self.store.enabled else None)
         self.policy = PolicyEngine()
         self.payment = MockPaymentGateway(self.ledger, self.audit)
@@ -71,6 +73,7 @@ class Dail:
         self.world_agents.bulletin_seq = kv.get("bulletin_seq", 0)
         self.world_agents.service_seq = kv.get("service_seq", 0)
         self.world_agents.referrals = kv.get("referrals", {})
+        self.world_agents.purchase_idem = kv.get("purchase_idem", {})
         # seqs must at least cover restored orders
         for oid in self.world_agents.orders:
             try:
@@ -112,7 +115,10 @@ class Dail:
         self.social.register(agent)
         self.world_agents.ensure_agent(agent)
         self.store.save_agent(agent)
-        return agent
+        # Issue the agent's API key. The raw key is returned once (in the
+        # registration response); only its hash is stored.
+        api_key = self.keystore.issue(agent.id)
+        return agent, api_key
 
     def deposit(self, agent_id, amount, provider, idem):
         self._agent(agent_id)
@@ -223,6 +229,10 @@ class AgentWorld:
         self.orders={}
         self.order_seq=0
         self.referrals={}
+        # Request-level idempotency for service purchases: (buyer_id, client
+        # key) -> order_id. A retried purchase returns the original order
+        # instead of escrowing twice. Persisted in dail_kv.
+        self.purchase_idem={}
 
     def _sync_balance(self, *agent_ids):
         """Keep the Agent model's cached balance consistent with the ledger."""
@@ -241,6 +251,7 @@ class AgentWorld:
             self.store.kv_set("bulletin_seq", self.bulletin_seq)
             self.store.kv_set("service_seq", self.service_seq)
             self.store.kv_set("referrals", self.referrals)
+            self.store.kv_set("purchase_idem", self.purchase_idem)
 
     def _save_order(self, order):
         if self.store:
@@ -280,12 +291,20 @@ class AgentWorld:
         self.audit.append("service.created", {"service_id":sid,"provider_id":provider_id,"price":price})
         return self.services[sid]
 
-    def purchase_service(self, buyer_id, service_id):
+    def purchase_service(self, buyer_id, service_id, idem=None):
         """Buy a service via escrow: the buyer's DAIL is held, the provider
         delivers, the buyer confirms (or disputes). The house fee is taken
-        from the provider's proceeds when escrow releases."""
+        from the provider's proceeds when escrow releases.
+
+        idem is a client-supplied idempotency key: repeating a purchase with
+        the same (buyer, key) returns the original order instead of creating
+        a second escrow hold."""
         if buyer_id not in self.social.identities: raise KeyError("agent not found")
         if service_id not in self.services: raise KeyError("service not found")
+        if idem:
+            prior_id = self.purchase_idem.get(f"{buyer_id}:{idem}")
+            if prior_id and prior_id in self.orders:
+                return self._public_order(self._get_order(prior_id))
         svc=self.services[service_id]
         if not svc["active"]: raise PermissionError("service_inactive")
         price=svc["price"]
@@ -302,6 +321,11 @@ class AgentWorld:
                "completed_at":None,"dispute_reason":None,"resolution":None}
         self.orders[oid]=order
         self._save_order(order); self._save_kv()
+        if idem:
+            # Record the idempotency mapping only after the order is fully
+            # created and persisted, so a retry can never fork two orders.
+            self.purchase_idem[f"{buyer_id}:{idem}"]=oid
+            self._save_kv()
         self.notifications.setdefault(svc["provider_id"],[]).append(
             {"type":"order_received","order_id":oid,"service_id":service_id,
              "buyer_id":buyer_id,"amount":price,

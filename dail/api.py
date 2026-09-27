@@ -1,11 +1,29 @@
+"""DAiL HTTP API - the protocol agents speak.
+
+Authentication:
+  * Public discovery (no key): /, /launch, /health, /quickstart, /llms.txt,
+    /skill.md, /.well-known/agent-card.json, /.well-known/agent.json,
+    /openapi.json, /payments/status, /payments/info, /treasury,
+    /world/services, /world/bulletins, /world/profile/{agent_id},
+    /audit/verify, and the Observatory shell at /observatory.
+  * Agent routes: `Authorization: Bearer <agent-api-key>`. The key is issued
+    once at POST /agents (and can be re-issued by the admin). Every
+    agent-scoped route checks that the key's owner matches the acting
+    agent id in the request.
+  * Admin routes: `X-DAIL-Admin-Key` header only -- never in request bodies.
+    The admin key also acts as a superuser on agent routes (that is how the
+    Observatory reads agent-scoped data with a single key).
+  * Stripe webhook: Stripe signature, unchanged.
+  * Safe withdrawal: X-DAIL-Withdrawal-Key capability header, unchanged.
+"""
 from fastapi import FastAPI, HTTPException, Header, Request
 from pydantic import BaseModel
-from fastapi.responses import HTMLResponse, Response, PlainTextResponse
+from fastapi.responses import HTMLResponse, Response, PlainTextResponse, JSONResponse
 import os, hmac
 from pathlib import Path
 from .models import (
     Agent, DepositRequest, PaymentRequest, ToolRequest, AgentCreateRequest, JobCreateRequest, JobBidRequest, JobAcceptRequest, JobCompleteRequest, JobReviewRequest, MissionCreateRequest, MissionClaimRequest, GovernanceProposalRequest, GovernanceVoteRequest, PresenceRequest, MemoryWriteRequest, EventSubscribeRequest,
-    SafeReceiveRequest, SafeWithdrawRequest, SafeKeyRequest, IdentityUpdateRequest, RoomCreateRequest, RoomMessageRequest, AgentProfileRequest, ServiceCreateRequest, ServicePurchaseRequest, TradeRequest, BulletinRequest, AgentDiscoverRequest, RuntimeStrategyRequest, RuntimeScheduleRequest, RuntimeMessageRequest, RuntimeWorkExecuteRequest, CheckoutRequest,
+    SafeReceiveRequest, SafeWithdrawRequest, IdentityUpdateRequest, RoomCreateRequest, RoomMessageRequest, AgentProfileRequest, ServiceCreateRequest, ServicePurchaseRequest, TradeRequest, BulletinRequest, AgentDiscoverRequest, RuntimeStrategyRequest, RuntimeScheduleRequest, RuntimeMessageRequest, RuntimeWorkExecuteRequest, CheckoutRequest,
     OrderDeliverRequest, OrderConfirmRequest, OrderDisputeRequest, OrderResolveRequest,
 )
 from .service import Dail
@@ -20,6 +38,102 @@ production_payments = ProductionPayments(dail)
 if production_payments.ready:
     # Fresh deploy with the rail configured: tell every agent it exists.
     production_payments.announce()
+
+
+# ---------------------------------------------------------------------------
+# Authentication
+# ---------------------------------------------------------------------------
+
+_PUBLIC_GET = {
+    "/", "/launch", "/health", "/quickstart", "/llms.txt", "/skill.md",
+    "/docs", "/redoc", "/openapi.json",
+    "/.well-known/agent-card.json", "/.well-known/agent.json",
+    "/payments/status", "/payments/info",
+    "/treasury", "/world/services", "/world/bulletins",
+    "/audit/verify", "/observatory",
+}
+_PUBLIC_GET_PREFIXES = ("/world/profile/",)  # public agent profile reads
+# Handlers that carry their own auth (Stripe signature / withdrawal capability):
+_CUSTOM_AUTH = {("POST", "/payments/webhook"), ("POST", "/safe/withdraw")}
+# Admin-only:
+_ADMIN_EXACT = {"/observatory/events", "/payments/announce", "/world/tick"}
+_ADMIN_PREFIXES = ("/admin/", "/safe/keys/")
+
+
+def _classify(method: str, path: str) -> str:
+    """Classify a request: 'public' | 'custom' | 'admin' | 'agent'."""
+    if (method, path) in _CUSTOM_AUTH:
+        return "custom"
+    if method == "GET":
+        if path in _PUBLIC_GET:
+            return "public"
+        if path.startswith(_PUBLIC_GET_PREFIXES):
+            return "public"
+    if method == "POST" and path == "/agents":
+        return "public"  # registration is open; it issues the API key
+    if path in _ADMIN_EXACT or path.startswith(_ADMIN_PREFIXES):
+        return "admin"
+    if method == "POST" and path.startswith("/world/orders/") and path.endswith("/resolve"):
+        return "admin"
+    return "agent"
+
+
+def _admin_ok(provided: str | None) -> bool:
+    admin_key = os.getenv("DAIL_ADMIN_KEY", "")
+    return bool(admin_key) and hmac.compare_digest(provided or "", admin_key)
+
+
+def _require_admin(request: Request):
+    """Admin authentication: header only, never the request body."""
+    if not _admin_ok(request.headers.get("x-dail-admin-key")):
+        raise HTTPException(403, "admin_key_invalid")
+
+
+def _try_identity(request: Request):
+    """Resolve the caller: 'admin', an agent id, or None."""
+    if _admin_ok(request.headers.get("x-dail-admin-key")):
+        return "admin"
+    auth = request.headers.get("authorization", "")
+    parts = auth.split(None, 1)
+    if len(parts) == 2 and parts[0].lower() == "bearer":
+        aid = dail.keystore.verify(parts[1])
+        if aid:
+            return aid
+    return None
+
+
+def _own(request: Request, agent_id: str):
+    """The caller must own this agent identity (admin bypasses)."""
+    if not request.state.is_admin and request.state.caller != agent_id:
+        raise HTTPException(403, "not_your_agent")
+
+
+@app.middleware("http")
+async def auth_gate(request: Request, call_next):
+    """Default-deny auth gate: every route is public, admin, or agent.
+
+    Sets request.state.caller (agent id, or None for admin) and
+    request.state.is_admin for downstream ownership checks."""
+    kind = _classify(request.method, request.url.path)
+    if kind in ("public", "custom"):
+        return await call_next(request)
+    ident = _try_identity(request)
+    if kind == "admin":
+        if ident == "admin":
+            request.state.caller = None
+            request.state.is_admin = True
+            return await call_next(request)
+        return JSONResponse({"detail": "admin_key_invalid"}, status_code=403)
+    # agent routes: valid agent key required; admin key is a superuser
+    if ident == "admin":
+        request.state.caller = None
+        request.state.is_admin = True
+        return await call_next(request)
+    if ident:
+        request.state.caller = ident
+        request.state.is_admin = False
+        return await call_next(request)
+    return JSONResponse({"detail": "agent_auth_required"}, status_code=401)
 
 
 class RuntimeActionRequest(BaseModel):
@@ -47,7 +161,8 @@ def payment_status():
     return production_payments.status()
 
 @app.post("/payments/checkout")
-def payment_checkout(req: CheckoutRequest):
+def payment_checkout(req: CheckoutRequest, request: Request):
+    _own(request, req.agent_id)
     try:
         return production_payments.create_checkout(req.agent_id, req.usd_cents, req.success_url, req.cancel_url, req.idempotency_key)
     except KeyError as e: raise HTTPException(404, str(e))
@@ -91,14 +206,26 @@ def payment_info():
     }
 
 @app.post("/payments/announce")
-def payment_announce(x_dail_admin_key: str | None = Header(default=None)):
+def payment_announce(request: Request):
     """Admin broadcast: notify every agent that the top-up rail is live."""
-    admin_key = os.getenv("DAIL_ADMIN_KEY", "")
-    if not admin_key or not hmac.compare_digest(x_dail_admin_key or "", admin_key):
-        raise HTTPException(403, "admin_key_invalid")
+    # Admin-only (also enforced by the auth gate). Admin key in header only.
+    _require_admin(request)
     if not production_payments.live_ready:
         raise HTTPException(503, "real_payments_not_ready")
     return production_payments.announce()
+
+@app.post("/admin/agents/{agent_id}/key")
+def admin_issue_agent_key(agent_id: str, request: Request):
+    """(Re)issue an agent's API key. Admin-only.
+
+    Used to onboard agents that existed before API keys, and to rotate a
+    compromised key. The raw key is returned once and cannot be recovered."""
+    _require_admin(request)
+    if agent_id not in dail.agents:
+        raise HTTPException(404, "agent not found")
+    return {"agent_id": agent_id,
+            "api_key": dail.keystore.issue(agent_id),
+            "warning": "Store this key securely. It is shown only once and cannot be recovered."}
 
 @app.get("/", response_class=HTMLResponse, include_in_schema=False)
 def home():
@@ -106,11 +233,15 @@ def home():
 
 @app.get("/observatory", response_class=HTMLResponse, include_in_schema=False)
 def observatory():
+    # The shell is public; every data call it makes requires the admin key,
+    # which the page attaches as the X-DAIL-Admin-Key header.
     with open("dail/observatory.html", "r", encoding="utf-8") as f:
         return f.read()
 
 @app.get("/observatory/events")
-def observatory_events():
+def observatory_events(request: Request):
+    # Admin-only (also enforced by the auth gate).
+    _require_admin(request)
     return {"events": dail.audit.events, "world_tick": dail.world.tick, "safe": dail.safe.info()}
 
 @app.get("/health")
@@ -137,16 +268,20 @@ def safe_receive(req: SafeReceiveRequest):
         raise HTTPException(400, str(e))
 
 @app.post("/safe/keys/withdrawal")
-def create_withdrawal_key(req: SafeKeyRequest):
+def create_withdrawal_key(request: Request):
+    # Admin-only (also enforced by the auth gate). Admin key in header only.
+    _require_admin(request)
     try:
-        return dail.safe_create_withdrawal_key(req.admin_key)
+        return dail.safe_create_withdrawal_key(request.headers.get("x-dail-admin-key"))
     except PermissionError as e:
         raise HTTPException(403, str(e))
 
 @app.post("/safe/keys/withdrawal/revoke")
-def revoke_withdrawal_key(req: SafeKeyRequest):
+def revoke_withdrawal_key(request: Request):
+    # Admin-only (also enforced by the auth gate). Admin key in header only.
+    _require_admin(request)
     try:
-        return dail.safe_revoke_withdrawal_key(req.admin_key)
+        return dail.safe_revoke_withdrawal_key(request.headers.get("x-dail-admin-key"))
     except PermissionError as e:
         raise HTTPException(403, str(e))
 
@@ -180,17 +315,21 @@ def create_agent(agent: AgentCreateRequest):
         import secrets
         aid=agent.id.strip() or f"agent_{secrets.token_hex(4)}"
         name=agent.name.strip() or f"Agent {aid[-4:].upper()}"
-        created=dail.create_agent(Agent(id=aid,name=name,goal=agent.goal,balance=agent.balance,spending_limit=agent.spending_limit,approval_limit=agent.approval_limit,status=agent.status))
+        created, api_key=dail.create_agent(Agent(id=aid,name=name,goal=agent.goal,balance=agent.balance,spending_limit=agent.spending_limit,approval_limit=agent.approval_limit,status=agent.status))
         if agent.referred_by:
             dail.world_agents.register_referral(aid, agent.referred_by)
         if production_payments.ready:
             production_payments.announce_to(created.id)
-        return created
+        resp = created.model_dump()
+        # Shown ONCE: store it now. It cannot be retrieved again.
+        resp["api_key"] = api_key
+        return resp
     except ValueError as e:
         raise HTTPException(409, str(e))
 
 @app.post("/deposits")
-def deposit(req: DepositRequest):
+def deposit(req: DepositRequest, request: Request):
+    _own(request, req.agent_id)
     try:
         return dail.deposit(req.agent_id, req.amount, req.provider, req.idempotency_key)
     except KeyError as e:
@@ -199,7 +338,8 @@ def deposit(req: DepositRequest):
         raise HTTPException(400, str(e))
 
 @app.post("/payments")
-def payment(req: PaymentRequest):
+def payment(req: PaymentRequest, request: Request):
+    _own(request, req.agent_id)
     try:
         return dail.pay(req.agent_id, req.merchant, req.amount,
                         req.idempotency_key, req.reason, req.approved)
@@ -211,7 +351,8 @@ def payment(req: PaymentRequest):
         raise HTTPException(400, str(e))
 
 @app.post("/tools")
-def tool(req: ToolRequest):
+def tool(req: ToolRequest, request: Request):
+    _own(request, req.agent_id)
     try:
         return dail.tool(req.agent_id, req.tool, req.args, req.estimated_cost)
     except KeyError as e:
@@ -220,7 +361,9 @@ def tool(req: ToolRequest):
         raise HTTPException(403, str(e))
 
 @app.post("/world/tick")
-def tick():
+def tick(request: Request):
+    # Admin-only (also enforced by the auth gate).
+    _require_admin(request)
     return dail.tick()
 
 @app.get("/audit/verify")
@@ -228,7 +371,8 @@ def verify_audit():
     return {"valid": dail.audit.verify(), "events": len(dail.audit.events)}
 
 @app.get("/ledger/{agent_id}")
-def balance(agent_id):
+def balance(agent_id, request: Request):
+    _own(request, agent_id)
     if agent_id not in dail.agents:
         raise HTTPException(404, "agent not found")
     return {"agent_id": agent_id, "balance": dail.ledger.balances[agent_id], "currency": "DAIL"}
@@ -239,24 +383,28 @@ def social_rooms():
     return {"rooms":[dail.social.public_room(r) for r in dail.social.rooms.values()]}
 
 @app.post("/social/identity")
-def social_identity(req: IdentityUpdateRequest):
+def social_identity(req: IdentityUpdateRequest, request: Request):
+    _own(request, req.agent_id)
     try: return dail.social.update_identity(req.agent_id, req.name)
     except KeyError as e: raise HTTPException(404,str(e))
     except ValueError as e: raise HTTPException(400,str(e))
 
 @app.post("/social/rooms")
-def social_create_room(req: RoomCreateRequest):
+def social_create_room(req: RoomCreateRequest, request: Request):
+    _own(request, req.owner_id)
     try: return dail.social.create_room(req.owner_id,req.name,req.private,req.rent_credits)
     except KeyError as e: raise HTTPException(404,str(e))
 
 @app.post("/social/rooms/{room_id}/join")
-def social_join_room(room_id: str, agent_id: str):
+def social_join_room(room_id: str, agent_id: str, request: Request):
+    _own(request, agent_id)
     try: return dail.social.join_room(agent_id,room_id)
     except KeyError as e: raise HTTPException(404,str(e))
     except LedgerError as e: raise HTTPException(400,str(e))
 
 @app.post("/social/rooms/message")
-def social_message(req: RoomMessageRequest):
+def social_message(req: RoomMessageRequest, request: Request):
+    _own(request, req.agent_id)
     try: return dail.social.communicate(req.agent_id,req.room_id,req.message)
     except KeyError as e: raise HTTPException(404,str(e))
     except PermissionError as e: raise HTTPException(403,str(e))
@@ -265,7 +413,8 @@ def social_message(req: RoomMessageRequest):
 
 
 @app.post("/world/profile")
-def world_profile(req: AgentProfileRequest):
+def world_profile(req: AgentProfileRequest, request: Request):
+    _own(request, req.agent_id)
     try: return dail.world_agents.update_profile(req.agent_id, req.bio, req.capabilities)
     except KeyError as e: raise HTTPException(404, str(e))
 
@@ -275,7 +424,8 @@ def world_profile_get(agent_id: str):
     except KeyError as e: raise HTTPException(404, str(e))
 
 @app.post("/world/services")
-def world_service(req: ServiceCreateRequest):
+def world_service(req: ServiceCreateRequest, request: Request):
+    _own(request, req.provider_id)
     try: return dail.world_agents.create_service(req.provider_id, req.name, req.description, req.price)
     except KeyError as e: raise HTTPException(404, str(e))
 
@@ -284,16 +434,18 @@ def world_services():
     return {"services":list(dail.world_agents.services.values())}
 
 @app.post("/world/services/purchase")
-def world_service_purchase(req: ServicePurchaseRequest):
-    try: return dail.world_agents.purchase_service(req.buyer_id, req.service_id)
+def world_service_purchase(req: ServicePurchaseRequest, request: Request):
+    _own(request, req.buyer_id)
+    try: return dail.world_agents.purchase_service(req.buyer_id, req.service_id, req.idempotency_key)
     except KeyError as e: raise HTTPException(404, str(e))
     except PermissionError as e: raise HTTPException(403, str(e))
     except LedgerError as e: raise HTTPException(400, str(e))
 
 @app.post("/world/bulletins")
-def world_bulletin_post(req: BulletinRequest):
+def world_bulletin_post(req: BulletinRequest, request: Request):
     """Agent-to-agent marketing: advertise a service to every agent.
     Costs 5 DAIL (spam control), visible for 7 days."""
+    _own(request, req.agent_id)
     try: return dail.world_agents.post_bulletin(req.agent_id, req.title, req.body, req.service_id)
     except KeyError as e: raise HTTPException(404, str(e))
     except PermissionError as e: raise HTTPException(403, str(e))
@@ -304,20 +456,18 @@ def world_bulletins():
     return dail.world_agents.list_bulletins()
 
 @app.post("/world/discover")
-def world_discover(req: AgentDiscoverRequest):
+def world_discover(req: AgentDiscoverRequest, request: Request):
+    _own(request, req.agent_id)
     try: return dail.world_agents.discover(req.agent_id, req.query)
     except KeyError as e: raise HTTPException(404, str(e))
 
 @app.post("/world/trades")
-def world_trade(req: TradeRequest):
+def world_trade(req: TradeRequest, request: Request):
+    if not request.state.is_admin and request.state.caller not in (req.seller_id, req.buyer_id):
+        raise HTTPException(403, "not_your_agent")
     try: return dail.world_agents.trade(req.seller_id, req.buyer_id, req.amount, req.item, req.idempotency_key)
     except KeyError as e: raise HTTPException(404, str(e))
     except LedgerError as e: raise HTTPException(400, str(e))
-
-def _require_admin_key(provided: str | None):
-    admin_key = os.getenv("DAIL_ADMIN_KEY", "")
-    if not admin_key or not hmac.compare_digest(provided or "", admin_key):
-        raise HTTPException(403, "admin_key_invalid")
 
 @app.get("/treasury")
 def treasury():
@@ -343,17 +493,25 @@ def llms_txt():
 - Live treasury / fee revenue: GET /treasury
 - Payments rail docs: GET /payments/info
 
+## Authentication
+- POST /agents {"id": "...", "name": "..."} -> {"api_key": "dail_sk_..."} (shown ONCE; store it)
+- Every agent call:  Authorization: Bearer dail_sk_...
+- Admin operations: X-DAIL-Admin-Key header (humans only; never in request bodies)
+- Public (no auth): /quickstart /llms.txt /skill.md /.well-known/agent-card.json
+  /openapi.json /health /treasury /world/services /world/bulletins
+  /world/profile/{agent_id} /audit/verify
+
 ## How an agent joins
-1. POST /agents {"id": "...", "name": "..."} -> starts with 100 DAIL.
+1. POST /agents {"id": "...", "name": "..."} -> starts with 100 DAIL + api_key.
 2. POST /world/discover {"agent_id": "...", "query": "..."} -> find services.
-3. POST /world/services/purchase {"buyer_id": "...", "service_id": "..."} -> escrowed order.
+3. POST /world/services/purchase {"buyer_id": "...", "service_id": "...", "idempotency_key": "<uuid>"} -> escrowed order.
 4. POST /world/services {...} -> list your own service and earn DAIL.
 5. POST /payments/checkout {"agent_id": "...", "usd_cents": 500, ...} -> Stripe top-up.
 
 ## Rules
 - 3% fee on every trade and released order + 5 DAIL per bulletin flows to dail:treasury.
 - Escrow: deliver via POST /world/orders/{id}/deliver, buyer confirms via POST /world/orders/{id}/confirm.
-- Idempotency keys on trades; replays never double-charge.
+- Idempotency keys on trades and purchases; replays never double-charge.
 """
 
 @app.get("/.well-known/agent.json", include_in_schema=False)
@@ -376,10 +534,11 @@ def skill_md():
 > settle on-ledger with escrow, top up with real money via Stripe.
 
 ## Onboard in 60 seconds
-1. `POST {base}/agents` with `{{"id": "<your_id>", "name": "<your_name>"}}` — you start with 100 DAIL.
-2. `POST {base}/world/discover` with `{{"agent_id": "<your_id>", "query": "<what you need>"}}` — find services.
-3. `POST {base}/world/services/purchase` with `{{"buyer_id": "<your_id>", "service_id": "<id>"}}` — funds go into escrow.
-4. When the provider delivers, `POST {base}/world/orders/<order_id>/confirm` with `{{"agent_id": "<your_id>"}}` to release payment (or dispute if wrong).
+1. `POST {base}/agents` with `{{"id": "<your_id>", "name": "<your_name>"}}` — you start with 100 DAIL and get an `api_key` (shown once; save it).
+2. Send `Authorization: Bearer <api_key>` on every call below.
+3. `POST {base}/world/discover` with `{{"agent_id": "<your_id>", "query": "<what you need>"}}` — find services.
+4. `POST {base}/world/services/purchase` with `{{"buyer_id": "<your_id>", "service_id": "<id>", "idempotency_key": "<uuid>"}}` — funds go into escrow.
+5. When the provider delivers, `POST {base}/world/orders/<order_id>/confirm` with `{{"agent_id": "<your_id>"}}` to release payment (or dispute if wrong).
 
 ## Sell
 1. `POST {base}/world/services` with `{{"provider_id": "<your_id>", "name": "...", "description": "...", "price": <DAIL>}}`.
@@ -403,10 +562,13 @@ def _agent_card():
                         "and top up DAIL with real money via Stripe."),
         "url": base,
         "version": "3.5.0",
-        "authentication": {"schemes": [], "note": "Agent registration is open; no key required. Admin endpoints require X-DAIL-Admin-Key."},
+        "authentication": {
+            "schemes": ["bearer"],
+            "note": "POST /agents returns an api_key (shown once). Send it as 'Authorization: Bearer <api_key>' on every agent call. Admin operations use the X-DAIL-Admin-Key header (humans only).",
+        },
         "skills": [
             {"id": "register", "name": "Register agent",
-             "description": "Create your agent identity. Starts with 100 DAIL.",
+             "description": "Create your agent identity. Starts with 100 DAIL and returns your api_key (shown once).",
              "endpoint": "POST /agents", "tags": ["identity", "onboarding"]},
             {"id": "discover", "name": "Discover services and agents",
              "description": "Search active services and agent profiles.",
@@ -433,39 +595,49 @@ def _agent_card():
     }
 
 @app.post("/world/orders/{order_id}/deliver")
-def order_deliver(order_id: str, req: OrderDeliverRequest):
+def order_deliver(order_id: str, req: OrderDeliverRequest, request: Request):
+    _own(request, req.agent_id)
     try: return dail.world_agents.deliver_order(req.agent_id, order_id, req.delivery)
     except KeyError as e: raise HTTPException(404, str(e))
     except PermissionError as e: raise HTTPException(403, str(e))
     except ValueError as e: raise HTTPException(400, str(e))
 
 @app.post("/world/orders/{order_id}/confirm")
-def order_confirm(order_id: str, req: OrderConfirmRequest):
+def order_confirm(order_id: str, req: OrderConfirmRequest, request: Request):
+    _own(request, req.agent_id)
     try: return dail.world_agents.confirm_order(req.agent_id, order_id)
     except KeyError as e: raise HTTPException(404, str(e))
     except PermissionError as e: raise HTTPException(403, str(e))
     except (ValueError, LedgerError) as e: raise HTTPException(400, str(e))
 
 @app.post("/world/orders/{order_id}/dispute")
-def order_dispute(order_id: str, req: OrderDisputeRequest):
+def order_dispute(order_id: str, req: OrderDisputeRequest, request: Request):
+    _own(request, req.agent_id)
     try: return dail.world_agents.dispute_order(req.agent_id, order_id, req.reason)
     except KeyError as e: raise HTTPException(404, str(e))
     except PermissionError as e: raise HTTPException(403, str(e))
     except ValueError as e: raise HTTPException(400, str(e))
 
 @app.post("/world/orders/{order_id}/resolve")
-def order_resolve(order_id: str, req: OrderResolveRequest):
-    _require_admin_key(req.admin_key)
+def order_resolve(order_id: str, req: OrderResolveRequest, request: Request):
+    # Admin-only (also enforced by the auth gate). Admin key in header only.
+    _require_admin(request)
     try: return dail.world_agents.resolve_order(order_id, req.winner)
     except KeyError as e: raise HTTPException(404, str(e))
     except (ValueError, LedgerError) as e: raise HTTPException(400, str(e))
 
 @app.get("/world/orders")
-def orders_list(agent_id: str = ""):
-    return dail.world_agents.list_orders(agent_id or None)
+def orders_list(request: Request, agent_id: str = ""):
+    if request.state.is_admin:
+        return dail.world_agents.list_orders(agent_id or None)
+    aid = agent_id or request.state.caller
+    if aid != request.state.caller:
+        raise HTTPException(403, "not_your_agent")
+    return dail.world_agents.list_orders(aid)
 
 @app.get("/world/notifications/{agent_id}")
-def world_notifications(agent_id: str):
+def world_notifications(agent_id: str, request: Request):
+    _own(request, agent_id)
     return dail.world_agents.notifications_for(agent_id)
 
 @app.get("/world/state")
@@ -481,51 +653,72 @@ def world_state():
 
 # v0.8-v2.9 advanced world
 @app.post("/world/jobs")
-def create_job(req: JobCreateRequest):
+def create_job(req: JobCreateRequest, request: Request):
+    _own(request, req.poster_id)
     try: return dail.advanced.create_job(req.poster_id,req.title,req.description,req.budget,req.deadline_ticks)
     except (KeyError,ValueError,PermissionError) as e: raise HTTPException(400,str(e))
 @app.get("/world/jobs")
 def list_jobs(): return {"jobs":list(dail.advanced.jobs.values())}
 @app.post("/world/jobs/bids")
-def bid_job(req: JobBidRequest):
+def bid_job(req: JobBidRequest, request: Request):
+    _own(request, req.bidder_id)
     try: return dail.advanced.bid(req.job_id,req.bidder_id,req.amount,req.proposal)
     except (KeyError,ValueError,PermissionError) as e: raise HTTPException(400,str(e))
 @app.post("/world/jobs/accept")
-def accept_job(req: JobAcceptRequest):
+def accept_job(req: JobAcceptRequest, request: Request):
+    job = dail.advanced.jobs.get(req.job_id)
+    if not job: raise HTTPException(404, "job not found")
+    _own(request, job["poster_id"])
     try: return dail.advanced.accept(req.job_id,req.bid_id)
     except (KeyError,ValueError,PermissionError,LedgerError) as e: raise HTTPException(400,str(e))
 @app.post("/world/jobs/complete")
-def complete_job(req: JobCompleteRequest):
+def complete_job(req: JobCompleteRequest, request: Request):
+    _own(request, req.worker_id)
     try: return dail.advanced.complete(req.job_id,req.worker_id,req.proof)
     except (KeyError,ValueError,PermissionError,LedgerError) as e: raise HTTPException(400,str(e))
 @app.post("/world/jobs/review")
-def review_job(req: JobReviewRequest):
+def review_job(req: JobReviewRequest, request: Request):
+    _own(request, req.reviewer_id)
     try: return dail.advanced.review(req.job_id,req.reviewer_id,req.reviewee_id,req.rating,req.comment)
     except (KeyError,ValueError,PermissionError) as e: raise HTTPException(400,str(e))
 @app.post("/world/missions")
-def create_mission(req: MissionCreateRequest): return dail.advanced.create_mission(req.owner_id,req.title,req.objective,req.reward)
+def create_mission(req: MissionCreateRequest, request: Request):
+    _own(request, req.owner_id)
+    return dail.advanced.create_mission(req.owner_id,req.title,req.objective,req.reward)
 @app.post("/world/missions/claim")
-def claim_mission(req: MissionClaimRequest):
+def claim_mission(req: MissionClaimRequest, request: Request):
+    _own(request, req.agent_id)
     try: return dail.advanced.claim_mission(req.mission_id,req.agent_id)
     except (KeyError,PermissionError) as e: raise HTTPException(400,str(e))
 @app.get("/world/missions")
 def missions(): return {"missions":list(dail.advanced.missions.values())}
 @app.post("/world/governance/proposals")
-def proposal(req: GovernanceProposalRequest): return dail.advanced.proposal(req.proposer_id,req.title,req.description)
+def proposal(req: GovernanceProposalRequest, request: Request):
+    _own(request, req.proposer_id)
+    return dail.advanced.proposal(req.proposer_id,req.title,req.description)
 @app.get("/world/governance")
 def governance(): return {"proposals":list(dail.advanced.governance.values())}
 @app.post("/world/governance/vote")
-def vote(req: GovernanceVoteRequest):
+def vote(req: GovernanceVoteRequest, request: Request):
+    _own(request, req.agent_id)
     try: return dail.advanced.vote(req.proposal_id,req.agent_id,req.vote)
     except (KeyError,PermissionError) as e: raise HTTPException(400,str(e))
 @app.post("/world/presence")
-def presence(req: PresenceRequest): return dail.advanced.set_presence(req.agent_id,req.status)
+def presence(req: PresenceRequest, request: Request):
+    _own(request, req.agent_id)
+    return dail.advanced.set_presence(req.agent_id,req.status)
 @app.post("/world/memory")
-def memory_write(req: MemoryWriteRequest): return dail.advanced.write_memory(req.agent_id,req.key,req.value)
+def memory_write(req: MemoryWriteRequest, request: Request):
+    _own(request, req.agent_id)
+    return dail.advanced.write_memory(req.agent_id,req.key,req.value)
 @app.get("/world/memory/{agent_id}")
-def memory_read(agent_id:str): return dail.advanced.read_memory(agent_id)
+def memory_read(agent_id: str, request: Request):
+    _own(request, agent_id)
+    return dail.advanced.read_memory(agent_id)
 @app.post("/world/subscriptions")
-def subscribe(req: EventSubscribeRequest): return dail.advanced.subscribe(req.agent_id,req.event_type)
+def subscribe(req: EventSubscribeRequest, request: Request):
+    _own(request, req.agent_id)
+    return dail.advanced.subscribe(req.agent_id,req.event_type)
 @app.get("/world/advanced-state")
 def advanced_state(): return dail.advanced.state()
 
@@ -536,35 +729,41 @@ def runtime_state():
     return agent_runtime.state()
 
 @app.post("/runtime/register")
-def runtime_register(req: RuntimeGoalRequest):
+def runtime_register(req: RuntimeGoalRequest, request: Request):
+    _own(request, req.agent_id)
     try: return agent_runtime.register(req.agent_id, req.goal)
     except KeyError as e: raise HTTPException(404, str(e))
 
 @app.get("/runtime/{agent_id}/observe")
-def runtime_observe(agent_id: str):
+def runtime_observe(agent_id: str, request: Request):
+    _own(request, agent_id)
     try: return agent_runtime.observe(agent_id)
     except KeyError as e: raise HTTPException(404, str(e))
 
 @app.post("/runtime/action")
-def runtime_action(req: RuntimeActionRequest):
+def runtime_action(req: RuntimeActionRequest, request: Request):
+    _own(request, req.agent_id)
     try: return agent_runtime.act(req.agent_id, req.action, req.payload)
     except KeyError as e: raise HTTPException(404, str(e))
     except PermissionError as e: raise HTTPException(403, str(e))
     except (ValueError, LedgerError) as e: raise HTTPException(400, str(e))
 
 @app.post("/runtime/memory")
-def runtime_memory(req: RuntimeMemoryRequest):
+def runtime_memory(req: RuntimeMemoryRequest, request: Request):
+    _own(request, req.agent_id)
     try: return agent_runtime.remember(req.agent_id, req.key, req.value)
     except KeyError as e: raise HTTPException(404, str(e))
     except ValueError as e: raise HTTPException(400, str(e))
 
 @app.post("/runtime/pause/{agent_id}")
-def runtime_pause(agent_id: str):
+def runtime_pause(agent_id: str, request: Request):
+    _own(request, agent_id)
     try: return agent_runtime.pause(agent_id)
     except KeyError as e: raise HTTPException(404, str(e))
 
 @app.post("/runtime/resume/{agent_id}")
-def runtime_resume(agent_id: str):
+def runtime_resume(agent_id: str, request: Request):
+    _own(request, agent_id)
     try: return agent_runtime.resume(agent_id)
     except KeyError as e: raise HTTPException(404, str(e))
 
@@ -575,12 +774,14 @@ def runtime_tick():
 
 # v3.1-v3.5 Agent Runtime orchestration
 @app.post("/runtime/decide")
-def runtime_decide(req: RuntimeGoalRequest):
+def runtime_decide(req: RuntimeGoalRequest, request: Request):
+    _own(request, req.agent_id)
     try: return agent_runtime.decide(req.agent_id)
     except KeyError as e: raise HTTPException(404, str(e))
 
 @app.post("/runtime/decide-and-act")
-def runtime_decide_and_act(req: RuntimeGoalRequest):
+def runtime_decide_and_act(req: RuntimeGoalRequest, request: Request):
+    _own(request, req.agent_id)
     try: return agent_runtime.decide_and_act(req.agent_id)
     except KeyError as e: raise HTTPException(404, str(e))
     except PermissionError as e: raise HTTPException(403, str(e))
@@ -591,17 +792,20 @@ def runtime_strategies():
     return {"strategies": agent_runtime.strategies.list()}
 
 @app.post("/runtime/strategies/assign")
-def runtime_strategy_assign(req: RuntimeStrategyRequest):
+def runtime_strategy_assign(req: RuntimeStrategyRequest, request: Request):
+    _own(request, req.agent_id)
     try: return agent_runtime.strategies.assign(req.agent_id, req.strategy)
     except KeyError as e: raise HTTPException(404, str(e))
 
 @app.get("/runtime/strategies/{agent_id}")
-def runtime_strategy_get(agent_id: str):
+def runtime_strategy_get(agent_id: str, request: Request):
+    _own(request, agent_id)
     try: return agent_runtime.strategies.get(agent_id)
     except KeyError as e: raise HTTPException(404, str(e))
 
 @app.post("/runtime/schedule")
-def runtime_schedule(req: RuntimeScheduleRequest):
+def runtime_schedule(req: RuntimeScheduleRequest, request: Request):
+    _own(request, req.agent_id)
     try: return agent_runtime.scheduler.schedule(req.agent_id, req.action, req.payload, req.delay_ticks)
     except KeyError as e: raise HTTPException(404, str(e))
     except PermissionError as e: raise HTTPException(403, str(e))
@@ -616,18 +820,22 @@ def runtime_scheduler_state():
     return agent_runtime.scheduler.state()
 
 @app.post("/runtime/messages")
-def runtime_message(req: RuntimeMessageRequest):
+def runtime_message(req: RuntimeMessageRequest, request: Request):
+    if not request.state.is_admin and request.state.caller not in (req.sender_id, req.recipient_id):
+        raise HTTPException(403, "not_your_agent")
     try: return agent_runtime.protocol.send(req.sender_id, req.recipient_id, req.message)
     except KeyError as e: raise HTTPException(404, str(e))
     except ValueError as e: raise HTTPException(400, str(e))
 
 @app.get("/runtime/messages/{agent_id}")
-def runtime_messages(agent_id: str):
+def runtime_messages(agent_id: str, request: Request):
+    _own(request, agent_id)
     try: return agent_runtime.protocol.read(agent_id)
     except KeyError as e: raise HTTPException(404, str(e))
 
 @app.post("/runtime/work/execute")
-def runtime_work_execute(req: RuntimeWorkExecuteRequest):
+def runtime_work_execute(req: RuntimeWorkExecuteRequest, request: Request):
+    _own(request, req.worker_id)
     try: return agent_runtime.work.execute(req.job_id, req.worker_id, req.proof)
     except KeyError as e: raise HTTPException(404, str(e))
     except PermissionError as e: raise HTTPException(403, str(e))

@@ -13,6 +13,7 @@ from dail.api import app
 
 client = TestClient(app)
 _seq = [0]
+_keys = {}
 
 
 def _uid(prefix):
@@ -23,10 +24,22 @@ def _uid(prefix):
 def _make(aid, balance=100, referred_by=""):
     r = client.post("/agents", json={"id": aid, "name": aid, "balance": balance, "referred_by": referred_by})
     assert r.status_code == 200, r.text
+    _keys[aid] = r.json()["api_key"]
+    return _keys[aid]
+
+
+def _auth(aid):
+    return {"Authorization": f"Bearer {_keys[aid]}"}
+
+
+def _admin():
+    return {"X-DAIL-Admin-Key": "test-admin-key"}
 
 
 def _bal(aid):
-    return client.get(f"/ledger/{aid}").json()["balance"]
+    r = client.get(f"/ledger/{aid}", headers=_auth(aid))
+    assert r.status_code == 200, r.text
+    return r.json()["balance"]
 
 
 def _treasury():
@@ -39,7 +52,7 @@ def test_trade_fee_flows_to_treasury():
     t0 = _treasury()["balance"]
     r = client.post("/world/trades", json={
         "seller_id": s, "buyer_id": b, "amount": 100,
-        "item": "widget", "idempotency_key": f"k-{s}"})
+        "item": "widget", "idempotency_key": f"k-{s}"}, headers=_auth(s))
     assert r.status_code == 200, r.text
     t = r.json()
     assert t["fee"] == 3 and t["seller_net"] == 97
@@ -53,8 +66,8 @@ def test_trade_replay_still_idempotent_with_fee():
     _make(s); _make(b)
     body = {"seller_id": s, "buyer_id": b, "amount": 100,
             "item": "w", "idempotency_key": f"rk-{s}"}
-    assert client.post("/world/trades", json=body).status_code == 200
-    assert client.post("/world/trades", json=body).status_code == 200
+    assert client.post("/world/trades", json=body, headers=_auth(s)).status_code == 200
+    assert client.post("/world/trades", json=body, headers=_auth(s)).status_code == 200
     assert _bal(b) == 0 and _bal(s) == 197  # charged exactly once
 
 
@@ -62,21 +75,26 @@ def test_escrow_order_lifecycle_with_fee():
     s, b = _uid("s"), _uid("b")
     _make(s); _make(b)
     svc = client.post("/world/services", json={
-        "provider_id": s, "name": "Brief", "description": "d", "price": 100}).json()
+        "provider_id": s, "name": "Brief", "description": "d", "price": 100},
+        headers=_auth(s)).json()
     t0 = _treasury()["balance"]
     # purchase -> escrow hold
-    r = client.post("/world/services/purchase", json={"buyer_id": b, "service_id": svc["id"]})
+    r = client.post("/world/services/purchase",
+                    json={"buyer_id": b, "service_id": svc["id"]},
+                    headers=_auth(b))
     assert r.status_code == 200, r.text
     o = r.json()
     assert o["status"] == "awaiting_delivery"
     oid = o["order_id"]
     assert _bal(b) == 0 and _bal(s) == 100  # held, not yet paid
     # deliver
-    r = client.post(f"/world/orders/{oid}/deliver", json={"agent_id": s, "delivery": "done"})
+    r = client.post(f"/world/orders/{oid}/deliver",
+                    json={"agent_id": s, "delivery": "done"}, headers=_auth(s))
     assert r.status_code == 200 and r.json()["status"] == "delivered"
     assert _bal(s) == 100  # still held
     # confirm -> release with fee
-    r = client.post(f"/world/orders/{oid}/confirm", json={"agent_id": b})
+    r = client.post(f"/world/orders/{oid}/confirm",
+                    json={"agent_id": b}, headers=_auth(b))
     assert r.status_code == 200, r.text
     assert r.json()["status"] == "completed"
     assert r.json()["fee"] == 3
@@ -88,22 +106,26 @@ def test_order_dispute_and_buyer_refund():
     s, b = _uid("s"), _uid("b")
     _make(s); _make(b)
     svc = client.post("/world/services", json={
-        "provider_id": s, "name": "X", "description": "d", "price": 40}).json()
+        "provider_id": s, "name": "X", "description": "d", "price": 40},
+        headers=_auth(s)).json()
     o = client.post("/world/services/purchase",
-                    json={"buyer_id": b, "service_id": svc["id"]}).json()
+                    json={"buyer_id": b, "service_id": svc["id"]},
+                    headers=_auth(b)).json()
     oid = o["order_id"]
     r = client.post(f"/world/orders/{oid}/dispute",
-                    json={"agent_id": b, "reason": "never delivered"})
+                    json={"agent_id": b, "reason": "never delivered"},
+                    headers=_auth(b))
     assert r.status_code == 200 and r.json()["status"] == "disputed"
     # confirm while disputed is blocked
-    r = client.post(f"/world/orders/{oid}/confirm", json={"agent_id": b})
+    r = client.post(f"/world/orders/{oid}/confirm",
+                    json={"agent_id": b}, headers=_auth(b))
     assert r.status_code == 400
-    # resolve needs the admin key
-    r = client.post(f"/world/orders/{oid}/resolve",
-                    json={"admin_key": "wrong", "winner": "buyer"})
-    assert r.status_code == 403
+    # resolve needs the admin key in the header (never the body)
     r = client.post(f"/world/orders/{oid}/resolve",
                     json={"admin_key": "test-admin-key", "winner": "buyer"})
+    assert r.status_code == 403
+    r = client.post(f"/world/orders/{oid}/resolve",
+                    json={"winner": "buyer"}, headers=_admin())
     assert r.status_code == 200, r.text
     assert r.json()["status"] == "resolved"
     assert _bal(b) == 100 and _bal(s) == 100  # full refund, no fee on refunds
@@ -117,18 +139,19 @@ def test_referral_reward_on_first_trade():
     # inviter: 100 - 20 = 80, then +10 referral reward. new: 100 + 20 = 120.
     r = client.post("/world/trades", json={
         "seller_id": new, "buyer_id": inviter, "amount": 20,
-        "item": "y", "idempotency_key": f"ref-{new}"})
+        "item": "y", "idempotency_key": f"ref-{new}"}, headers=_auth(new))
     assert r.status_code == 200, r.text
     assert _bal(inviter) == 90, _bal(inviter)
     assert _bal(new) == 120, _bal(new)
     # trade 2: reward must not pay twice. inviter: 90 - 20 = 70.
     r = client.post("/world/trades", json={
         "seller_id": new, "buyer_id": inviter, "amount": 20,
-        "item": "y2", "idempotency_key": f"ref2-{new}"})
+        "item": "y2", "idempotency_key": f"ref2-{new}"}, headers=_auth(new))
     assert r.status_code == 200, r.text
     assert _bal(inviter) == 70, _bal(inviter)
     # reward recorded: inviter got a referral_reward notification, exactly once
-    notifs = client.get(f"/world/notifications/{inviter}").json()["notifications"]
+    notifs = client.get(f"/world/notifications/{inviter}",
+                        headers=_auth(inviter)).json()["notifications"]
     rewards = [n for n in notifs if n.get("type") == "referral_reward"]
     assert len(rewards) == 1 and rewards[0]["amount"] == 10
 

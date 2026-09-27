@@ -105,15 +105,20 @@ def client():
 def _make_agent(client, aid):
     r = client.post("/agents", json={"id": aid, "name": aid, "balance": 0})
     assert r.status_code == 200, r.text
+    return r.json()["api_key"]
 
 
-def _checkout(client, agent_id, usd_cents=500, idempotency_key=None):
+def _auth(key):
+    return {"Authorization": f"Bearer {key}"}
+
+
+def _checkout(client, agent_id, key, usd_cents=500, idempotency_key=None):
     body = {"agent_id": agent_id, "usd_cents": usd_cents,
             "success_url": "https://example.com/s",
             "cancel_url": "https://example.com/c"}
     if idempotency_key:
         body["idempotency_key"] = idempotency_key
-    r = client.post("/payments/checkout", json=body)
+    r = client.post("/payments/checkout", json=body, headers=_auth(key))
     assert r.status_code == 200, r.text
     return r.json()
 
@@ -124,39 +129,47 @@ def _webhook(client, event_type, session_id, signature="valid-signature"):
                        headers={"stripe-signature": signature})
 
 
-def _balance(client, agent_id):
-    return client.get(f"/ledger/{agent_id}").json()["balance"]
+def _balance(client, agent_id, key):
+    r = client.get(f"/ledger/{agent_id}", headers=_auth(key))
+    assert r.status_code == 200, r.text
+    return r.json()["balance"]
+
+
+def _notifications(client, agent_id, key):
+    r = client.get(f"/world/notifications/{agent_id}", headers=_auth(key))
+    assert r.status_code == 200, r.text
+    return r.json()["notifications"]
 
 
 def test_webhook_credits_once_and_replay_is_safe(client):
-    _make_agent(client, "buyer_replay")
-    co = _checkout(client, "buyer_replay", 500)
-    assert _balance(client, "buyer_replay") == 0
+    key = _make_agent(client, "buyer_replay")
+    co = _checkout(client, "buyer_replay", key, 500)
+    assert _balance(client, "buyer_replay", key) == 0
     r = _webhook(client, "checkout.session.completed", co["session_id"])
     assert r.status_code == 200, r.text
     assert r.json()["duplicate"] is False
     assert r.json()["transaction_id"]
-    assert _balance(client, "buyer_replay") == 5
+    assert _balance(client, "buyer_replay", key) == 5
     # Replay the same webhook: credited exactly once.
     r2 = _webhook(client, "checkout.session.completed", co["session_id"])
     assert r2.json()["duplicate"] is True
-    assert _balance(client, "buyer_replay") == 5
+    assert _balance(client, "buyer_replay", key) == 5
 
 
 def test_async_payment_succeeded_also_credits(client):
-    _make_agent(client, "buyer_async")
-    co = _checkout(client, "buyer_async", 300)
+    key = _make_agent(client, "buyer_async")
+    co = _checkout(client, "buyer_async", key, 300)
     r = _webhook(client, "checkout.session.async_payment_succeeded", co["session_id"])
     assert r.status_code == 200
-    assert _balance(client, "buyer_async") == 3
+    assert _balance(client, "buyer_async", key) == 3
 
 
 def test_bad_signature_rejected(client):
-    _make_agent(client, "buyer_sig")
-    co = _checkout(client, "buyer_sig", 500)
+    key = _make_agent(client, "buyer_sig")
+    co = _checkout(client, "buyer_sig", key, 500)
     r = _webhook(client, "checkout.session.completed", co["session_id"], signature="bogus")
     assert r.status_code == 400
-    assert _balance(client, "buyer_sig") == 0
+    assert _balance(client, "buyer_sig", key) == 0
 
 
 def test_unknown_session_rejected(client):
@@ -165,34 +178,35 @@ def test_unknown_session_rejected(client):
 
 
 def test_expired_session_marked(client):
-    _make_agent(client, "buyer_exp")
-    co = _checkout(client, "buyer_exp", 500)
+    key = _make_agent(client, "buyer_exp")
+    co = _checkout(client, "buyer_exp", key, 500)
     r = _webhook(client, "checkout.session.expired", co["session_id"])
     assert r.status_code == 200
     assert r.json()["event"] == "checkout.session.expired"
-    assert _balance(client, "buyer_exp") == 0
+    assert _balance(client, "buyer_exp", key) == 0
 
 
 def test_idempotent_checkout_creation(client):
-    _make_agent(client, "buyer_idem")
-    a = _checkout(client, "buyer_idem", 700, idempotency_key="key-abc")
-    b = _checkout(client, "buyer_idem", 700, idempotency_key="key-abc")
+    key = _make_agent(client, "buyer_idem")
+    a = _checkout(client, "buyer_idem", key, 700, idempotency_key="key-abc")
+    b = _checkout(client, "buyer_idem", key, 700, idempotency_key="key-abc")
     assert a["session_id"] == b["session_id"]
     assert a["checkout_url"] == b["checkout_url"]
 
 
 def test_pending_cap_rate_limits(client):
-    _make_agent(client, "buyer_cap")
+    key = _make_agent(client, "buyer_cap")
     for _ in range(25):
-        _checkout(client, "buyer_cap", 100)
+        _checkout(client, "buyer_cap", key, 100)
     r = client.post("/payments/checkout", json={"agent_id": "buyer_cap", "usd_cents": 100,
                                                 "success_url": "https://example.com/s",
-                                                "cancel_url": "https://example.com/c"})
+                                                "cancel_url": "https://example.com/c"},
+                    headers=_auth(key))
     assert r.status_code == 429, r.text
 
 
 def test_announce_broadcasts_rail_to_agents(client):
-    _make_agent(client, "buyer_announce")
+    akey = _make_agent(client, "buyer_announce")
     r = client.post("/payments/announce",
                     headers={"X-DAIL-Admin-Key": "wrong-key"})
     assert r.status_code == 403
@@ -200,22 +214,22 @@ def test_announce_broadcasts_rail_to_agents(client):
                     headers={"X-DAIL-Admin-Key": "test-admin-key"})
     assert r.status_code == 200, r.text
     assert r.json()["agents_notified"] >= 1
-    notes = client.get("/world/notifications/buyer_announce").json()["notifications"]
+    notes = _notifications(client, "buyer_announce", akey)
     assert any(n.get("type") == "payment_rail_live" for n in notes)
 
 
 def test_topup_credit_notifies_agent(client):
-    _make_agent(client, "buyer_noted")
-    co = _checkout(client, "buyer_noted", 200)
+    key = _make_agent(client, "buyer_noted")
+    co = _checkout(client, "buyer_noted", key, 200)
     _webhook(client, "checkout.session.completed", co["session_id"])
-    notes = client.get("/world/notifications/buyer_noted").json()["notifications"]
+    notes = _notifications(client, "buyer_noted", key)
     assert any(n.get("type") == "topup_credited" and n.get("amount_dail") == 2
                for n in notes)
 
 
 def test_new_agent_is_told_about_rail(client):
-    _make_agent(client, "buyer_newbie")
-    notes = client.get("/world/notifications/buyer_newbie").json()["notifications"]
+    key = _make_agent(client, "buyer_newbie")
+    notes = _notifications(client, "buyer_newbie", key)
     assert any(n.get("type") == "payment_rail_live" for n in notes)
 
 

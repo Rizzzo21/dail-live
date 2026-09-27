@@ -21,7 +21,9 @@ def test_service_and_bulletin_survive_restart(tmp_path):
     os.environ["DATABASE_URL"] = db_url
     try:
         d1 = Dail()
-        d1.create_agent(Agent(id="m1", name="m1", goal="test", balance=100))
+        _, raw_key = d1.create_agent(Agent(id="m1", name="m1", goal="test", balance=100))
+        assert raw_key.startswith("dail_sk_")
+        assert d1.keystore.verify(raw_key) == "m1"
         svc = d1.world_agents.create_service("m1", "Research brief", "desc", 25)
         assert svc["id"] == "svc_0001"
         blt = d1.world_agents.post_bulletin("m1", "title", "body", service_id="svc_0001")
@@ -32,6 +34,8 @@ def test_service_and_bulletin_survive_restart(tmp_path):
         assert "svc_0001" in d2.world_agents.services
         assert d2.world_agents.services["svc_0001"]["name"] == "Research brief"
         assert "blt_0001" in d2.world_agents.bulletins
+        # agent API keys survive the restart too (hashes in Postgres)
+        assert d2.keystore.verify(raw_key) == "m1"
         # sequence counters restored: next ids continue, no collisions
         svc2 = d2.world_agents.create_service("m1", "Second", "desc", 10)
         assert svc2["id"] == "svc_0002"

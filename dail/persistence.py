@@ -73,6 +73,9 @@ class WorldStore:
                 updated_at VARCHAR(64) NOT NULL)""",
             """CREATE TABLE IF NOT EXISTS dail_kv (
                 key VARCHAR(128) PRIMARY KEY, value TEXT NOT NULL)""",
+            """CREATE TABLE IF NOT EXISTS dail_agent_keys (
+                agent_id VARCHAR(255) PRIMARY KEY, key_hash VARCHAR(64) NOT NULL,
+                created_at VARCHAR(64) NOT NULL)""",
         ]
         for s in stmts:
             try:
@@ -157,6 +160,31 @@ class WorldStore:
                 """INSERT INTO dail_kv (key, value) VALUES (:k, :v)
                    ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value"""),
                 {"k": key, "v": json.dumps(value)})
+
+    # ---- agent API keys (hashes only; raw keys are never stored) ----
+    def save_agent_key(self, agent_id, key_hash):
+        if not self.enabled:
+            return
+        with self._lock, self.engine.begin() as c:
+            c.execute(text(
+                """INSERT INTO dail_agent_keys (agent_id, key_hash, created_at)
+                   VALUES (:aid, :kh, :now)
+                   ON CONFLICT (agent_id) DO UPDATE SET key_hash=EXCLUDED.key_hash,
+                     created_at=EXCLUDED.created_at"""),
+                {"aid": agent_id, "kh": key_hash, "now": _now()})
+
+    def load_agent_keys(self):
+        if not self.enabled:
+            return []
+        with self.engine.begin() as c:
+            return c.execute(text("SELECT agent_id, key_hash FROM dail_agent_keys")).fetchall()
+
+    def delete_agent_key(self, agent_id):
+        if not self.enabled:
+            return
+        with self._lock, self.engine.begin() as c:
+            c.execute(text("DELETE FROM dail_agent_keys WHERE agent_id=:aid"),
+                      {"aid": agent_id})
 
     # ---- reads (startup restore) ----
     def load_all(self):

@@ -53,8 +53,8 @@ class SafeWithdrawRequest(BaseModel):
     idempotency_key: str
 
 
-class SafeKeyRequest(BaseModel):
-    admin_key: str
+# NOTE: withdrawal-key operations take no request body. Admin authentication
+# arrives via the X-DAIL-Admin-Key header, never the body.
 
 
 class IdentityUpdateRequest(BaseModel):
@@ -86,6 +86,9 @@ class ServiceCreateRequest(BaseModel):
 class ServicePurchaseRequest(BaseModel):
     buyer_id: str
     service_id: str
+    # Client-supplied idempotency key: repeating the purchase with the same
+    # (buyer, key) returns the original order instead of escrowing twice.
+    idempotency_key: str | None = None
 
 class OrderDeliverRequest(BaseModel):
     agent_id: str
@@ -99,7 +102,8 @@ class OrderDisputeRequest(BaseModel):
     reason: str = ""
 
 class OrderResolveRequest(BaseModel):
-    admin_key: str = ""
+    # Admin authentication arrives via the X-DAIL-Admin-Key header, never
+    # the request body.
     winner: Literal["provider", "buyer"] = "provider"
 
 class TradeRequest(BaseModel):
