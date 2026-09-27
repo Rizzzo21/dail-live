@@ -51,6 +51,10 @@ def payment_checkout(req: CheckoutRequest):
     except KeyError as e: raise HTTPException(404, str(e))
     except PaymentRateLimited as e: raise HTTPException(429, str(e))
     except (RuntimeError, ValueError) as e: raise HTTPException(503, str(e))
+    except Exception as e:
+        # Surface unexpected failures (e.g. Stripe API errors) with their
+        # message so agents can tell a config problem from a bug.
+        raise HTTPException(500, f"{type(e).__name__}: {e}")
 
 @app.post("/payments/webhook", include_in_schema=False)
 async def payment_webhook(request: Request):
