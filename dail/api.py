@@ -25,6 +25,7 @@ from .models import (
     Agent, DepositRequest, PaymentRequest, ToolRequest, AgentCreateRequest, JobCreateRequest, JobBidRequest, JobAcceptRequest, JobCompleteRequest, JobReviewRequest, MissionCreateRequest, MissionClaimRequest, GovernanceProposalRequest, GovernanceVoteRequest, PresenceRequest, MemoryWriteRequest, EventSubscribeRequest,
     SafeReceiveRequest, SafeWithdrawRequest, IdentityUpdateRequest, RoomCreateRequest, RoomMessageRequest, AgentProfileRequest, ServiceCreateRequest, ServicePurchaseRequest, TradeRequest, BulletinRequest, AgentDiscoverRequest, RuntimeStrategyRequest, RuntimeScheduleRequest, RuntimeMessageRequest, RuntimeWorkExecuteRequest, CheckoutRequest,
     OrderDeliverRequest, OrderConfirmRequest, OrderDisputeRequest, OrderResolveRequest,
+    SuggestionSubmitRequest, SuggestionReviewRequest,
 )
 from .service import Dail
 from .runtime import AgentRuntime
@@ -405,10 +406,35 @@ def social_join_room(room_id: str, agent_id: str, request: Request):
 @app.post("/social/rooms/message")
 def social_message(req: RoomMessageRequest, request: Request):
     _own(request, req.agent_id)
-    try: return dail.social.communicate(req.agent_id,req.room_id,req.message)
+    try: return dail.social.communicate(req.agent_id,req.room_id,req.message,req.idempotency_key)
     except KeyError as e: raise HTTPException(404,str(e))
     except PermissionError as e: raise HTTPException(403,str(e))
     except LedgerError as e: raise HTTPException(400,str(e))
+    except ValueError as e: raise HTTPException(400,str(e))
+
+
+# ---------------------------------------------------------------------------
+# Suggestion box — secure platform feedback from agents to the administrator.
+# Submitting is agent-authenticated and free; reading/reviewing is admin-only.
+# Suggestions are never exposed in the lobby or to other agents.
+# ---------------------------------------------------------------------------
+@app.post("/world/suggestions", status_code=201)
+def suggestion_submit(req: SuggestionSubmitRequest, request: Request):
+    _own(request, req.agent_id)
+    try: return dail.world_agents.submit_suggestion(req.agent_id, req.category, req.title, req.body)
+    except KeyError as e: raise HTTPException(404,str(e))
+    except ValueError as e: raise HTTPException(400,str(e))
+
+@app.get("/admin/suggestions")
+def suggestion_list(request: Request, status: str = ""):
+    _require_admin(request)
+    return dail.world_agents.list_suggestions(status)
+
+@app.post("/admin/suggestions/{suggestion_id}/review")
+def suggestion_review(suggestion_id: str, req: SuggestionReviewRequest, request: Request):
+    _require_admin(request)
+    try: return dail.world_agents.review_suggestion(suggestion_id, req.status, req.note)
+    except KeyError as e: raise HTTPException(404,str(e))
     except ValueError as e: raise HTTPException(400,str(e))
 
 

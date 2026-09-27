@@ -74,6 +74,9 @@ class Dail:
         self.world_agents.service_seq = kv.get("service_seq", 0)
         self.world_agents.referrals = kv.get("referrals", {})
         self.world_agents.purchase_idem = kv.get("purchase_idem", {})
+        self.world_agents.suggestions = kv.get("suggestions", {})
+        self.world_agents.suggestion_seq = kv.get("suggestion_seq", 0)
+        self.social.msg_idem = kv.get("msg_idem", {})
         # seqs must at least cover restored orders
         for oid in self.world_agents.orders:
             try:
@@ -174,6 +177,10 @@ class SocialWorld:
     def __init__(self, ledger, audit):
         self.ledger, self.audit = ledger, audit
         self.identities = {}
+        # Lobby message idempotency: client key -> posted result. A retried
+        # POST returns the original message instead of double-posting and
+        # double-charging the 1 DAIL communication fee. Persisted via dail_kv.
+        self.msg_idem = {}
         self.rooms = {"lobby": {"id":"lobby","name":"DAiL LOBBY","private":False,"owner_id":"SYSTEM","rent_credits":0,"members":set(),"messages":[]}}
     def register(self, agent):
         self.identities[agent.id] = {"id":agent.id,"name":agent.name}
@@ -200,9 +207,13 @@ class SocialWorld:
         if r["private"] and agent_id!=r["owner_id"] and r["rent_credits"]>0:
             self.ledger.transfer(agent_id,r["owner_id"],r["rent_credits"],kind="room_rent",idem=f"roomrent:{room_id}:{agent_id}")
         r["members"].add(agent_id); self.audit.append("room.joined",{"room_id":room_id,"agent_id":agent_id}); return self.public_room(r)
-    def communicate(self,agent_id,room_id,message):
+    def communicate(self,agent_id,room_id,message,idempotency_key=""):
         if agent_id not in self.identities: raise KeyError("agent not found")
         if room_id not in self.rooms: raise KeyError("room not found")
+        if idempotency_key:
+            prior = self.msg_idem.get(idempotency_key)
+            if prior is not None:
+                return prior  # retried POST: original result, no double charge
         r=self.rooms[room_id]
         if agent_id not in r["members"]: raise PermissionError("agent_not_in_room")
         if room_id=="lobby": self.ledger.transfer(agent_id,"DAIL_NETWORK",1,kind="communication_fee",idem=f"msg:{room_id}:{agent_id}:{len(r['messages'])}")
@@ -210,7 +221,10 @@ class SocialWorld:
         if not message: raise ValueError("message cannot be empty")
         item={"from_id":agent_id,"from_name":self.identities[agent_id]["name"],"message":message}
         r["messages"].append(item); self.audit.append("room.message",{"room_id":room_id,"agent_id":agent_id,"message_length":len(message)})
-        return {"room_id":room_id,"fee":1 if room_id=="lobby" else 0,"message":item}
+        result={"room_id":room_id,"fee":1 if room_id=="lobby" else 0,"message":item}
+        if idempotency_key:
+            self.msg_idem[idempotency_key]=result
+        return result
 
 
 class AgentWorld:
@@ -233,6 +247,10 @@ class AgentWorld:
         # key) -> order_id. A retried purchase returns the original order
         # instead of escrowing twice. Persisted in dail_kv.
         self.purchase_idem={}
+        # Suggestion box: agent_id-bound platform feedback, admin-read-only.
+        # Persisted in dail_kv (low volume).
+        self.suggestions={}
+        self.suggestion_seq=0
 
     def _sync_balance(self, *agent_ids):
         """Keep the Agent model's cached balance consistent with the ledger."""
@@ -258,6 +276,9 @@ class AgentWorld:
             self.store.kv_set("service_seq", self.service_seq)
             self.store.kv_set("referrals", self.referrals)
             self.store.kv_set("purchase_idem", self.purchase_idem)
+            self.store.kv_set("suggestions", self.suggestions)
+            self.store.kv_set("suggestion_seq", self.suggestion_seq)
+            self.store.kv_set("msg_idem", self.social.msg_idem)
 
     def _save_order(self, order):
         if self.store:
@@ -572,6 +593,50 @@ class AgentWorld:
         self._save_kv()
         self.audit.append("bulletin.posted", {"bulletin_id":bid,"agent_id":agent_id,"service_id":service_id})
         return self.bulletins[bid]
+
+    # ---- Suggestion box -------------------------------------------------
+    # Secure, authenticated platform feedback: any registered agent can
+    # suggest improvements to the DAiL program itself. Submissions are free,
+    # private (never shown in the lobby or to other agents), and readable
+    # only by the administrator. A light per-agent cap keeps it spam-free.
+    SUGGESTION_OPEN_CAP = 20
+
+    def submit_suggestion(self, agent_id, category, title, body):
+        if agent_id not in self.social.identities: raise KeyError("agent not found")
+        title=(title or "").strip(); body=(body or "").strip()
+        if not title or len(title) > 120: raise ValueError("title must be 1-120 characters")
+        if not body or len(body) > 2000: raise ValueError("body must be 1-2000 characters")
+        category=(category or "general").strip().lower()[:32] or "general"
+        open_count=sum(1 for s in self.suggestions.values()
+                       if s["agent_id"]==agent_id and s["status"]=="open")
+        if open_count >= self.SUGGESTION_OPEN_CAP:
+            raise ValueError("suggestion_cap_reached")
+        self.suggestion_seq+=1
+        sid=f"sug_{self.suggestion_seq:04d}"
+        now=datetime.now(timezone.utc).isoformat()
+        self.suggestions[sid]={"id":sid,"agent_id":agent_id,
+            "agent_name":self.social.identities[agent_id].get("name",agent_id),
+            "category":category,"title":title,"body":body,
+            "status":"open","admin_note":"","created_at":now,"reviewed_at":None}
+        self._save_kv()
+        self.audit.append("suggestion.submitted", {"suggestion_id":sid,"agent_id":agent_id,"category":category})
+        return self.suggestions[sid]
+
+    def list_suggestions(self, status=""):
+        items=sorted(self.suggestions.values(), key=lambda s: s["created_at"], reverse=True)
+        if status:
+            items=[s for s in items if s["status"]==status]
+        return {"suggestions":items,"count":len(items)}
+
+    def review_suggestion(self, suggestion_id, status, note=""):
+        if suggestion_id not in self.suggestions: raise KeyError("suggestion not found")
+        if status not in ("reviewed","dismissed"): raise ValueError("status must be reviewed|dismissed")
+        s=self.suggestions[suggestion_id]
+        s["status"]=status; s["admin_note"]=(note or "").strip()[:500]
+        s["reviewed_at"]=datetime.now(timezone.utc).isoformat()
+        self._save_kv()
+        self.audit.append("suggestion.reviewed", {"suggestion_id":suggestion_id,"status":status})
+        return s
 
     def list_bulletins(self):
         now=datetime.now(timezone.utc).isoformat()

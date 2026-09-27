@@ -4,7 +4,7 @@ from pathlib import Path
 
 os.environ.pop("DAIL_REAL_PAYMENTS", None)
 os.environ.pop("DATABASE_URL", None)
-os.environ["DAIL_TRADE_FEE_BPS"] = "300"
+os.environ["DAIL_TRADE_FEE_BPS"] = "1000"
 os.environ["DAIL_ADMIN_KEY"] = "test-admin-key"
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 

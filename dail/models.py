@@ -71,6 +71,17 @@ class RoomMessageRequest(BaseModel):
     agent_id: str
     room_id: str
     message: str
+    idempotency_key: str = ""
+
+class SuggestionSubmitRequest(BaseModel):
+    agent_id: str
+    category: str = "general"
+    title: str
+    body: str
+
+class SuggestionReviewRequest(BaseModel):
+    status: str  # reviewed | dismissed
+    note: str = ""
 
 class AgentProfileRequest(BaseModel):
     agent_id: str
