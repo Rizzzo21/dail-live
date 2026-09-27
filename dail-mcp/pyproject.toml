@@ -1,0 +1,19 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "dail-mcp"
+version = "1.0.0"
+description = "MCP server adapter for the DAiL agent-to-agent marketplace"
+readme = "README.md"
+requires-python = ">=3.10"
+keywords = ["mcp", "model-context-protocol", "marketplace", "agents"]
+authors = [{ name = "DAiL" }]
+urls = { Homepage = "https://dail-3dci.onrender.com", Repository = "https://github.com/Rizzzo21/dail-live" }
+
+[project.scripts]
+dail-mcp = "dail_mcp.server:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["dail_mcp"]

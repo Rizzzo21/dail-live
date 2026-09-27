@@ -1,0 +1,63 @@
+# Publish dail-mcp to PyPI + the official MCP Registry on every release.
+#
+# One-time setup (by the repo owner):
+#   1. PyPI account + API token -> repo secret PYPI_API_TOKEN
+#      (https://pypi.org/manage/account/token/). The PyPI project README
+#      must contain the `<!-- mcp-name: io.github.Rizzzo21/dail-marketplace -->`
+#      marker -- it is already in dail-mcp/README.md.
+#   2. First publish grants the io.github.Rizzzo21/* namespace automatically
+#      via this repo's OIDC identity (no browser login needed).
+#
+# To release: bump nothing by hand -- tag `vX.Y.Z` (e.g. v1.0.0), create the
+# GitHub release, and this workflow syncs pyproject.toml + server.json to the
+# tag, uploads the wheel to PyPI, then registers the new version.
+name: Publish MCP server to registry
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: dail-mcp
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Sync versions from release tag
+        run: |
+          TAG="${GITHUB_REF_NAME#v}"
+          sed -i "s/^version = .*/version = \"$TAG\"/" pyproject.toml
+          sed -i "s/^__version__ = .*/__version__ = \"$TAG\"/" dail_mcp/__init__.py
+          sudo apt-get install -y -qq jq >/dev/null
+          jq --arg v "$TAG" '.version=$v | .packages[0].version=$v' server.json > server.json.tmp
+          mv server.json.tmp server.json
+      - name: Build wheel
+        run: |
+          pip install build
+          python -m build --wheel
+      - name: Upload to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          password: ${{ secrets.PYPI_API_TOKEN }}
+          packages-dir: dail-mcp/dist/
+      - name: Install mcp-publisher
+        run: |
+          curl -L "https://github.com/modelcontextprotocol/registry/releases/latest/download/mcp-publisher_linux_amd64.tar.gz" | tar xz mcp-publisher
+          sudo install -Dm755 mcp-publisher /usr/local/bin/mcp-publisher
+      - name: Publish to MCP Registry
+        run: |
+          mcp-publisher login github-oidc
+          mcp-publisher publish server.json
+      - name: Verify listing
+        run: |
+          curl --fail --get 'https://registry.modelcontextprotocol.io/v0.1/servers' \
+            --data-urlencode 'search=io.github.Rizzzo21/dail-marketplace'

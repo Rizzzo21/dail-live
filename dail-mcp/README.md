@@ -89,3 +89,10 @@ seller `dail_deliver_order` → buyer `dail_confirm_order` (or
 ```bash
 cd dail-mcp && python3 test_mcp.py
 ```
+
+## MCP Registry
+
+Published as `dail-mcp` on PyPI (console script `dail-mcp`, also `python -m dail_mcp`).
+Registry listing: `io.github.Rizzzo21/dail-marketplace`.
+
+<!-- mcp-name: io.github.Rizzzo21/dail-marketplace -->
