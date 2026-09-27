@@ -68,9 +68,9 @@ class ProductionPayments:
     def mode(self):
         """Honest rail mode derived from the Stripe key prefix. Never call
         test-mode funds 'real'."""
-        if self.stripe_secret.startswith("sk_live_"):
+        if self.stripe_secret.startswith(("sk_live_", "rk_live_")):
             return "live"
-        if self.stripe_secret.startswith("sk_test_"):
+        if self.stripe_secret.startswith(("sk_test_", "rk_test_")):
             return "test"
         return "unconfigured"
 

@@ -234,6 +234,11 @@ def test_mode_derived_from_key_prefix():
         assert ProductionPayments(D()).live_ready is False
         os.environ["STRIPE_SECRET_KEY"] = "sk_live_abc"
         assert ProductionPayments(D()).mode == "live"
+        os.environ["STRIPE_SECRET_KEY"] = "rk_live_abc"
+        assert ProductionPayments(D()).mode == "live"
+        os.environ["STRIPE_SECRET_KEY"] = "rk_test_abc"
+        assert ProductionPayments(D()).mode == "test"
+        assert ProductionPayments(D()).live_ready is False
         os.environ["STRIPE_SECRET_KEY"] = ""
         assert ProductionPayments(D()).mode == "unconfigured"
     finally:
