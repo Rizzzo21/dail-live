@@ -28,4 +28,7 @@ def test_public_discovery_stays_public():
                  '/openapi.json'):
         assert c.get(path).status_code == 200, path
     card=c.get('/.well-known/agent-card.json').json()
-    assert 'bearer' in card['authentication']['schemes']
+    # A2A v1: bearer auth declared as an httpAuthSecurityScheme
+    schemes=card['securitySchemes']
+    assert schemes['bearerAuth']['httpAuthSecurityScheme']['scheme'] == 'Bearer'
+    assert card['securityRequirements'][0]['schemes']['bearerAuth'] == {'list': []}

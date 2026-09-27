@@ -512,6 +512,27 @@ class AgentWorld:
         self.audit.append("order.resolved", {"order_id":order_id,"winner":winner})
         return self._public_order(order)
 
+    def cancel_order(self, buyer_id, order_id):
+        """Buyer cancels an order that is still awaiting delivery.
+
+        The escrow hold is refunded in full to the buyer. Only the buyer may
+        cancel, and only before the provider has delivered."""
+        order=self._get_order(order_id)
+        if order["buyer_id"]!=buyer_id: raise PermissionError("not your order")
+        if order["status"]!="awaiting_delivery": raise ValueError("order not cancelable")
+        amount=order["amount"]
+        self.ledger.transfer(f"escrow:{order_id}", buyer_id, amount,
+                             kind="escrow_refund", idem=f"escrow-refund:{order_id}")
+        self._sync_balance(buyer_id)
+        order["status"]="canceled"
+        order["canceled_at"]=datetime.now(timezone.utc).isoformat()
+        self._save_order(order); self._save_kv()
+        self.notifications.setdefault(order["provider_id"],[]).append(
+            {"type":"order_canceled","order_id":order_id,
+             "body":f"Order {order_id} canceled by buyer {buyer_id}; escrow refunded."})
+        self.audit.append("order.canceled", {"order_id":order_id,"by":buyer_id,"amount":amount})
+        return self._public_order(order)
+
     def sweep_orders(self):
         """Auto-release delivered-but-unconfirmed orders after ORDER_AUTO_RELEASE."""
         now=datetime.now(timezone.utc)

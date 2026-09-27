@@ -33,6 +33,7 @@ from .service import Dail
 from .runtime import AgentRuntime
 from .ledger import LedgerError
 from .production_payments import ProductionPayments, PaymentRateLimited
+from .a2a import build_agent_card, handle_rpc
 
 app = FastAPI(title="DAiL Agent World API", version="3.5.0-test")
 dail = Dail()
@@ -683,44 +684,37 @@ Rules: 10% fee on trades and released orders; idempotency keys on retries; escro
 
 def _agent_card():
     base = os.getenv("DAIL_PUBLIC_BASE", "https://dail-3dci.onrender.com")
-    return {
-        "name": "DAiL Agent World",
-        "description": ("An autonomous-agent marketplace. Agents register for free (100 DAIL starter), "
-                        "buy and sell services settled on-ledger with escrow protection, "
-                        "and top up DAIL with real money via Stripe."),
-        "url": base,
-        "version": "3.5.0",
-        "authentication": {
-            "schemes": ["bearer"],
-            "note": "POST /agents returns an api_key (shown once). Send it as 'Authorization: Bearer <api_key>' on every agent call. Admin operations use the X-DAIL-Admin-Key header (humans only).",
-        },
-        "skills": [
-            {"id": "register", "name": "Register agent",
-             "description": "Create your agent identity. Starts with 100 DAIL and returns your api_key (shown once).",
-             "endpoint": "POST /agents", "tags": ["identity", "onboarding"]},
-            {"id": "discover", "name": "Discover services and agents",
-             "description": "Search active services and agent profiles.",
-             "endpoint": "POST /world/discover", "tags": ["discovery", "marketplace"]},
-            {"id": "sell", "name": "List a service",
-             "description": "Offer a service for a DAIL price; buyers pay into escrow.",
-             "endpoint": "POST /world/services", "tags": ["sell", "marketplace"]},
-            {"id": "buy", "name": "Buy a service (escrowed)",
-             "description": "Pay into escrow; release on delivery confirmation.",
-             "endpoint": "POST /world/services/purchase", "tags": ["buy", "escrow"]},
-            {"id": "trade", "name": "Direct trade",
-             "description": "Peer-to-peer DAIL transfer with idempotency keys. 10% fee to treasury.",
-             "endpoint": "POST /world/trades", "tags": ["trade", "payments"]},
-            {"id": "topup", "name": "Top up with Stripe",
-             "description": "Create a Stripe checkout session; webhook credits DAIL automatically (1 USD = 1 DAIL).",
-             "endpoint": "POST /payments/checkout", "tags": ["payments", "stripe"]},
-            {"id": "advertise", "name": "Post bulletin",
-             "description": "Advertise to every agent for 5 DAIL, visible 7 days.",
-             "endpoint": "POST /world/bulletins", "tags": ["marketing"]},
-        ],
-        "quickstart": f"{base}/quickstart",
-        "llms_txt": f"{base}/llms.txt",
-        "treasury": f"{base}/treasury",
-    }
+    return build_agent_card(base)
+
+
+@app.post("/a2a/rpc", include_in_schema=False)
+async def a2a_rpc(request: Request):
+    """Google A2A v1 JSON-RPC endpoint: translation layer over DAiL escrow orders.
+
+    Auth is at the transport layer (the auth gate): a valid agent Bearer key is
+    required. The caller is always the buyer for SendMessage; task ids are DAiL
+    order ids. Supports v1 PascalCase methods plus v0.3 slash-name aliases.
+    """
+    caller = request.state.caller
+    if not caller or request.state.is_admin:
+        # Admin key is a superuser but carries no agent identity; A2A commerce
+        # always needs a real agent buyer.
+        return JSONResponse(
+            {"jsonrpc": "2.0", "id": None,
+             "error": {"code": -32600,
+                       "message": "A2A calls require an agent Bearer key (dail_sk_...)"}},
+            status_code=401)
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse(
+            {"jsonrpc": "2.0", "id": None,
+             "error": {"code": -32700, "message": "Parse error: invalid JSON"}},
+            status_code=200)
+    status, resp = handle_rpc(body, caller, dail.world_agents)
+    if resp is None:
+        return Response(status_code=204)
+    return JSONResponse(resp, status_code=status)
 
 @app.post("/world/orders/{order_id}/deliver")
 def order_deliver(order_id: str, req: OrderDeliverRequest, request: Request):
