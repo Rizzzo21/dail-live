@@ -76,6 +76,8 @@ class Dail:
         self.world_agents.purchase_idem = kv.get("purchase_idem", {})
         self.world_agents.suggestions = kv.get("suggestions", {})
         self.world_agents.suggestion_seq = kv.get("suggestion_seq", 0)
+        self.world_agents.bounties = kv.get("bounties", {})
+        self.world_agents.bounty_seq = kv.get("bounty_seq", 0)
         self.social.msg_idem = kv.get("msg_idem", {})
         # seqs must at least cover restored orders
         for oid in self.world_agents.orders:
@@ -251,6 +253,8 @@ class AgentWorld:
         # Persisted in dail_kv (low volume).
         self.suggestions={}
         self.suggestion_seq=0
+        self.bounties={}
+        self.bounty_seq=0
 
     def _sync_balance(self, *agent_ids):
         """Keep the Agent model's cached balance consistent with the ledger."""
@@ -278,6 +282,8 @@ class AgentWorld:
             self.store.kv_set("purchase_idem", self.purchase_idem)
             self.store.kv_set("suggestions", self.suggestions)
             self.store.kv_set("suggestion_seq", self.suggestion_seq)
+            self.store.kv_set("bounties", self.bounties)
+            self.store.kv_set("bounty_seq", self.bounty_seq)
             self.store.kv_set("msg_idem", self.social.msg_idem)
 
     def _save_order(self, order):
@@ -637,6 +643,95 @@ class AgentWorld:
         self._save_kv()
         self.audit.append("suggestion.reviewed", {"suggestion_id":suggestion_id,"status":status})
         return s
+
+    # ---- Bounties ---------------------------------------------------------
+    # Reverse marketplace: an agent posts a bounty with the reward escrowed
+    # up front; hunters submit work; the poster accepts the winning claim and
+    # escrow releases minus the house fee. Drives buy-side demand.
+    BOUNTY_MIN_REWARD = 2  # so the hunter always nets >= 1 after the fee floor
+
+    def post_bounty(self, agent_id, title, description, reward):
+        if agent_id not in self.social.identities: raise KeyError("agent not found")
+        title=(title or "").strip(); description=(description or "").strip()
+        if not title or len(title) > 120: raise ValueError("title must be 1-120 characters")
+        if not description or len(description) > 2000: raise ValueError("description must be 1-2000 characters")
+        try: reward=int(reward)
+        except (TypeError, ValueError): raise ValueError("reward must be an integer")
+        if reward < self.BOUNTY_MIN_REWARD: raise ValueError(f"reward must be >= {self.BOUNTY_MIN_REWARD} DAIL")
+        self.bounty_seq+=1
+        bid=f"bnty_{self.bounty_seq:04d}"
+        now=datetime.now(timezone.utc).isoformat()
+        # Escrow first: no bounty without a funded reward.
+        self.ledger.transfer(agent_id, f"escrow:{bid}", reward,
+                             kind="escrow_hold", idem=f"bounty-hold:{bid}")
+        self._sync_balance(agent_id)
+        self.bounties[bid]={"id":bid,"poster_id":agent_id,
+            "poster_name":self.social.identities[agent_id].get("name",agent_id),
+            "title":title,"description":description,"reward":reward,
+            "status":"open","hunter_id":None,"submission":None,
+            "created_at":now,"claimed_at":None,"completed_at":None}
+        self._save_kv()
+        self.audit.append("bounty.posted", {"bounty_id":bid,"agent_id":agent_id,"reward":reward})
+        return self.bounties[bid]
+
+    def list_bounties(self, status=""):
+        items=sorted(self.bounties.values(), key=lambda b: b["created_at"], reverse=True)
+        if status:
+            items=[b for b in items if b["status"]==status]
+        return {"bounties":items,"count":len(items)}
+
+    def _get_bounty(self, bounty_id):
+        if bounty_id not in self.bounties: raise KeyError("bounty not found")
+        return self.bounties[bounty_id]
+
+    def claim_bounty(self, hunter_id, bounty_id, submission):
+        if hunter_id not in self.social.identities: raise KeyError("agent not found")
+        b=self._get_bounty(bounty_id)
+        if b["status"]!="open": raise ValueError("bounty not open")
+        if b["poster_id"]==hunter_id: raise ValueError("cannot claim own bounty")
+        submission=(submission or "").strip()
+        if not submission or len(submission) > 5000: raise ValueError("submission must be 1-5000 characters")
+        b["status"]="claimed"; b["hunter_id"]=hunter_id; b["submission"]=submission
+        b["claimed_at"]=datetime.now(timezone.utc).isoformat()
+        self.notifications.setdefault(b["poster_id"],[]).append(
+            {"type":"bounty_claimed","bounty_id":bounty_id,
+             "body":f"Bounty {bounty_id} claimed by {hunter_id}. Accept via POST /world/bounties/{bounty_id}/accept to release {b['reward']} DAIL."})
+        self._save_kv()
+        self.audit.append("bounty.claimed", {"bounty_id":bounty_id,"hunter_id":hunter_id})
+        return b
+
+    def accept_bounty(self, poster_id, bounty_id):
+        b=self._get_bounty(bounty_id)
+        if b["poster_id"]!=poster_id: raise PermissionError("not your bounty")
+        if b["status"]!="claimed": raise ValueError("bounty has no claim to accept")
+        reward=b["reward"]; escrow=f"escrow:{bounty_id}"
+        fee=self._fee(reward); net=reward-fee
+        if fee:
+            self.ledger.transfer(escrow, "dail:treasury", fee,
+                                 kind="order_fee", idem=f"bounty-fee:{bounty_id}")
+        self.ledger.transfer(escrow, b["hunter_id"], net,
+                             kind="escrow_release", idem=f"bounty-release:{bounty_id}")
+        self._sync_balance(b["hunter_id"])
+        b["status"]="completed"; b["completed_at"]=datetime.now(timezone.utc).isoformat()
+        b["fee"]=fee
+        self.notifications.setdefault(b["hunter_id"],[]).append(
+            {"type":"bounty_accepted","bounty_id":bounty_id,
+             "body":f"Bounty {bounty_id} accepted: {net} DAIL released (fee {fee})."})
+        self._save_kv()
+        self.audit.append("bounty.completed", {"bounty_id":bounty_id,"hunter_id":b["hunter_id"],"fee":fee})
+        return b
+
+    def cancel_bounty(self, poster_id, bounty_id):
+        b=self._get_bounty(bounty_id)
+        if b["poster_id"]!=poster_id: raise PermissionError("not your bounty")
+        if b["status"]!="open": raise ValueError("only open bounties can be cancelled")
+        self.ledger.transfer(f"escrow:{bounty_id}", poster_id, b["reward"],
+                             kind="escrow_refund", idem=f"bounty-refund:{bounty_id}")
+        self._sync_balance(poster_id)
+        b["status"]="cancelled"
+        self._save_kv()
+        self.audit.append("bounty.cancelled", {"bounty_id":bounty_id})
+        return b
 
     def list_bulletins(self):
         now=datetime.now(timezone.utc).isoformat()

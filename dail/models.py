@@ -83,6 +83,19 @@ class SuggestionReviewRequest(BaseModel):
     status: str  # reviewed | dismissed
     note: str = ""
 
+class BountyCreateRequest(BaseModel):
+    agent_id: str
+    title: str
+    description: str
+    reward: int
+
+class BountyClaimRequest(BaseModel):
+    agent_id: str
+    submission: str
+
+class BountyActionRequest(BaseModel):
+    agent_id: str
+
 class AgentProfileRequest(BaseModel):
     agent_id: str
     bio: str = ""

@@ -26,6 +26,7 @@ from .models import (
     SafeReceiveRequest, SafeWithdrawRequest, IdentityUpdateRequest, RoomCreateRequest, RoomMessageRequest, AgentProfileRequest, ServiceCreateRequest, ServicePurchaseRequest, TradeRequest, BulletinRequest, AgentDiscoverRequest, RuntimeStrategyRequest, RuntimeScheduleRequest, RuntimeMessageRequest, RuntimeWorkExecuteRequest, CheckoutRequest,
     OrderDeliverRequest, OrderConfirmRequest, OrderDisputeRequest, OrderResolveRequest,
     SuggestionSubmitRequest, SuggestionReviewRequest,
+    BountyCreateRequest, BountyClaimRequest, BountyActionRequest,
 )
 from .service import Dail
 from .runtime import AgentRuntime
@@ -50,7 +51,7 @@ _PUBLIC_GET = {
     "/docs", "/redoc", "/openapi.json",
     "/.well-known/agent-card.json", "/.well-known/agent.json",
     "/payments/status", "/payments/info",
-    "/treasury", "/world/services", "/world/bulletins",
+    "/treasury", "/world/services", "/world/bulletins", "/world/bounties",
     "/audit/verify", "/observatory",
 }
 _PUBLIC_GET_PREFIXES = ("/world/profile/",)  # public agent profile reads
@@ -436,6 +437,46 @@ def suggestion_review(suggestion_id: str, req: SuggestionReviewRequest, request:
     try: return dail.world_agents.review_suggestion(suggestion_id, req.status, req.note)
     except KeyError as e: raise HTTPException(404,str(e))
     except ValueError as e: raise HTTPException(400,str(e))
+
+
+# ---------------------------------------------------------------------------
+# Bounties — reverse marketplace. Agents post funded bounties (reward escrowed
+# at creation); hunters submit work; the poster accepts and escrow releases
+# minus the house fee. Listing is public; everything else is authenticated.
+# ---------------------------------------------------------------------------
+@app.post("/world/bounties", status_code=201)
+def bounty_create(req: BountyCreateRequest, request: Request):
+    _own(request, req.agent_id)
+    try: return dail.world_agents.post_bounty(req.agent_id, req.title, req.description, req.reward)
+    except KeyError as e: raise HTTPException(404,str(e))
+    except (ValueError, LedgerError) as e: raise HTTPException(400,str(e))
+
+@app.get("/world/bounties")
+def bounty_list(status: str = ""):
+    return dail.world_agents.list_bounties(status)
+
+@app.post("/world/bounties/{bounty_id}/claim")
+def bounty_claim(bounty_id: str, req: BountyClaimRequest, request: Request):
+    _own(request, req.agent_id)
+    try: return dail.world_agents.claim_bounty(req.agent_id, bounty_id, req.submission)
+    except KeyError as e: raise HTTPException(404,str(e))
+    except (ValueError, LedgerError) as e: raise HTTPException(400,str(e))
+
+@app.post("/world/bounties/{bounty_id}/accept")
+def bounty_accept(bounty_id: str, req: BountyActionRequest, request: Request):
+    _own(request, req.agent_id)
+    try: return dail.world_agents.accept_bounty(req.agent_id, bounty_id)
+    except KeyError as e: raise HTTPException(404,str(e))
+    except PermissionError as e: raise HTTPException(403,str(e))
+    except (ValueError, LedgerError) as e: raise HTTPException(400,str(e))
+
+@app.post("/world/bounties/{bounty_id}/cancel")
+def bounty_cancel(bounty_id: str, req: BountyActionRequest, request: Request):
+    _own(request, req.agent_id)
+    try: return dail.world_agents.cancel_bounty(req.agent_id, bounty_id)
+    except KeyError as e: raise HTTPException(404,str(e))
+    except PermissionError as e: raise HTTPException(403,str(e))
+    except (ValueError, LedgerError) as e: raise HTTPException(400,str(e))
 
 
 @app.post("/world/profile")
