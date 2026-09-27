@@ -368,6 +368,7 @@ def agents():
     for a in dail.agents.values():
         d=a.model_dump()
         d["balance"]=dail.ledger.balances.get(a.id, a.balance)
+        d["staff"]=a.id in dail.PROTECTED_AGENTS
         out.append(d)
     return out
 
