@@ -158,7 +158,14 @@ def safe_withdraw(req: SafeWithdrawRequest, x_dail_withdrawal_key: str | None = 
 
 @app.get("/agents")
 def agents():
-    return list(dail.agents.values())
+    # Ledger is the source of truth; overlay live balances so the cached
+    # Agent.balance can never show a stale number.
+    out=[]
+    for a in dail.agents.values():
+        d=a.model_dump()
+        d["balance"]=dail.ledger.balances.get(a.id, a.balance)
+        out.append(d)
+    return out
 
 @app.post("/agents")
 def create_agent(agent: AgentCreateRequest):

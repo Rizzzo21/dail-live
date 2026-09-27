@@ -22,7 +22,7 @@ class Dail:
         self.world = World()
         self.agents = {}
         self.social = SocialWorld(self.ledger, self.audit)
-        self.world_agents = AgentWorld(self.ledger, self.audit, self.social)
+        self.world_agents = AgentWorld(self.ledger, self.audit, self.social, self.agents)
         self.safe = SafeWallet(self.ledger, self.audit, os.getenv("DAIL_ADMIN_KEY"))
         self.advanced = AdvancedWorld(self)
 
@@ -38,7 +38,9 @@ class Dail:
 
     def deposit(self, agent_id, amount, provider, idem):
         self._agent(agent_id)
-        return self.payment.deposit(agent_id, amount, idem)
+        tx = self.payment.deposit(agent_id, amount, idem)
+        self.agents[agent_id].balance = self.ledger.balances[agent_id]
+        return tx
 
     def pay(self, agent_id, merchant, amount, idem, reason="", approved=False):
         agent = self._agent(agent_id)
@@ -129,14 +131,22 @@ class SocialWorld:
 
 class AgentWorld:
     """DAiL autonomous-agent world primitives: profiles, services, discovery and trades."""
-    def __init__(self, ledger, audit, social):
+    def __init__(self, ledger, audit, social, agents=None):
         self.ledger=ledger; self.audit=audit; self.social=social
+        self.agents=agents if agents is not None else {}
         self.profiles={}
         self.services={}
         self.trades={}
         self.notifications={}
         self.bulletins={}
         self.bulletin_seq=0
+
+    def _sync_balance(self, *agent_ids):
+        """Keep the Agent model's cached balance consistent with the ledger."""
+        for aid in agent_ids:
+            agent=self.agents.get(aid)
+            if agent is not None:
+                agent.balance=self.ledger.balances[aid]
 
     def ensure_agent(self, agent):
         self.profiles.setdefault(agent.id, {
@@ -175,6 +185,7 @@ class AgentWorld:
         if not svc["active"]: raise PermissionError("service_inactive")
         self.ledger.transfer(buyer_id, svc["provider_id"], svc["price"],
                              kind="service_purchase", idem=f"purchase:{service_id}:{buyer_id}")
+        self._sync_balance(buyer_id, svc["provider_id"])
         self.notifications.setdefault(svc["provider_id"],[]).append(
             {"type":"service_sold","service_id":service_id,"buyer_id":buyer_id})
         self.audit.append("service.purchased", {"service_id":service_id,"buyer_id":buyer_id})
@@ -197,6 +208,7 @@ class AgentWorld:
         if seller_id not in self.social.identities or buyer_id not in self.social.identities:
             raise KeyError("agent not found")
         tx=self.ledger.transfer(buyer_id, seller_id, amount, kind="trade", idem=idem)
+        self._sync_balance(buyer_id, seller_id)
         tid=f"trade_{len(self.trades)+1:04d}"
         self.trades[tid]={"id":tid,"seller_id":seller_id,"buyer_id":buyer_id,
                           "amount":amount,"item":item,"status":"settled","transaction_id":tx.id}
@@ -225,6 +237,7 @@ class AgentWorld:
         # Fee first: no bulletin without payment.
         self.ledger.transfer(agent_id, "dail:treasury", BULLETIN_FEE,
                              kind="bulletin_fee", idem=f"bulletin-fee:{bid}")
+        self._sync_balance(agent_id)
         self.bulletins[bid]={"id":bid,"agent_id":agent_id,
             "agent_name":self.social.identities[agent_id].get("name",agent_id),
             "title":title,"body":body,"service_id":service_id,
