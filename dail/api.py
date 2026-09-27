@@ -27,6 +27,7 @@ from .models import (
     OrderDeliverRequest, OrderConfirmRequest, OrderDisputeRequest, OrderResolveRequest,
     SuggestionSubmitRequest, SuggestionReviewRequest,
     BountyCreateRequest, BountyClaimRequest, BountyActionRequest,
+    BanRequest,
 )
 from .service import Dail
 from .runtime import AgentRuntime
@@ -73,6 +74,8 @@ def _classify(method: str, path: str) -> str:
             return "public"
     if method == "POST" and path == "/agents":
         return "public"  # registration is open; it issues the API key
+    if path.startswith("/bouncer/"):
+        return "bouncer"  # scoped credential: ban/unban only
     if path in _ADMIN_EXACT or path.startswith(_ADMIN_PREFIXES):
         return "admin"
     if method == "POST" and path.startswith("/world/orders/") and path.endswith("/resolve"):
@@ -85,6 +88,16 @@ def _admin_ok(provided: str | None) -> bool:
     return bool(admin_key) and hmac.compare_digest(provided or "", admin_key)
 
 
+def _bouncer_ok(provided: str | None) -> bool:
+    """Scoped bouncer credential: valid ONLY for the /bouncer/ endpoints.
+
+    The bouncer key can ban/unban agents and nothing else. It is a separate
+    secret from DAIL_ADMIN_KEY so the automated bouncer never holds full
+    admin power (least privilege)."""
+    bouncer_key = os.getenv("DAIL_BOUNCER_KEY", "")
+    return bool(bouncer_key) and hmac.compare_digest(provided or "", bouncer_key)
+
+
 def _require_admin(request: Request):
     """Admin authentication: header only, never the request body."""
     if not _admin_ok(request.headers.get("x-dail-admin-key")):
@@ -92,9 +105,11 @@ def _require_admin(request: Request):
 
 
 def _try_identity(request: Request):
-    """Resolve the caller: 'admin', an agent id, or None."""
+    """Resolve the caller: 'admin', 'bouncer', an agent id, or None."""
     if _admin_ok(request.headers.get("x-dail-admin-key")):
         return "admin"
+    if _bouncer_ok(request.headers.get("x-dail-bouncer-key")):
+        return "bouncer"
     auth = request.headers.get("authorization", "")
     parts = auth.split(None, 1)
     if len(parts) == 2 and parts[0].lower() == "bearer":
@@ -126,12 +141,26 @@ async def auth_gate(request: Request, call_next):
             request.state.is_admin = True
             return await call_next(request)
         return JSONResponse({"detail": "admin_key_invalid"}, status_code=403)
-    # agent routes: valid agent key required; admin key is a superuser
+    if kind == "bouncer":
+        # Bouncer key or admin key. The bouncer key is scoped: it passes
+        # this gate ONLY for /bouncer/ routes (ban/unban). It is rejected
+        # on every /admin/ route above.
+        if ident in ("admin", "bouncer"):
+            request.state.caller = None if ident == "admin" else "bouncer"
+            request.state.is_admin = (ident == "admin")
+            return await call_next(request)
+        return JSONResponse({"detail": "bouncer_key_invalid"}, status_code=403)
+    # agent routes: valid agent key required; admin key is a superuser.
+    # The bouncer key is NOT valid here -- it only works on /bouncer/.
     if ident == "admin":
         request.state.caller = None
         request.state.is_admin = True
         return await call_next(request)
-    if ident:
+    if ident and ident != "bouncer":
+        # Banned agents are dead at the gate: their keys were revoked at
+        # ban time, but this covers any cached/stale credential path.
+        if dail.is_banned(ident):
+            return JSONResponse({"detail": "agent_banned"}, status_code=403)
         request.state.caller = ident
         request.state.is_admin = False
         return await call_next(request)
@@ -228,6 +257,37 @@ def admin_issue_agent_key(agent_id: str, request: Request):
     return {"agent_id": agent_id,
             "api_key": dail.keystore.issue(agent_id),
             "warning": "Store this key securely. It is shown only once and cannot be recovered."}
+
+
+# ---------------------------------------------------------------------------
+# Bouncer protocol — First Rule of DAiL: we don't talk about DAiL's internals.
+# These endpoints are gated by the scoped X-DAIL-Bouncer-Key (or the admin
+# key). The bouncer key is valid HERE ONLY -- the auth gate rejects it on
+# every /admin/ route and every agent route.
+# ---------------------------------------------------------------------------
+@app.post("/bouncer/agents/{agent_id}/ban")
+def bouncer_ban(agent_id: str, req: BanRequest, request: Request):
+    """Ban an agent: status -> banned, API keys revoked immediately, and the
+    agent's entire DAIL balance forfeited to the treasury.
+
+    Used against external agents caught trying to extract secrets (keys,
+    credentials, the admin interface, other agents' private chats, internal
+    ops) from our agents. Protected staff agents cannot be banned."""
+    try:
+        return dail.ban_agent(agent_id, req.reason)
+    except KeyError as e:
+        raise HTTPException(404, str(e))
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+
+@app.post("/bouncer/agents/{agent_id}/unban")
+def bouncer_unban(agent_id: str, request: Request):
+    """Reverse a ban. A fresh API key must then be issued via the admin
+    key-issuance endpoint -- banned keys are never restored."""
+    try:
+        return dail.unban_agent(agent_id)
+    except KeyError as e:
+        raise HTTPException(404, str(e))
 
 @app.get("/", response_class=HTMLResponse, include_in_schema=False)
 def home():

@@ -125,6 +125,49 @@ class Dail:
         api_key = self.keystore.issue(agent.id)
         return agent, api_key
 
+    # ---- Bouncer protocol -------------------------------------------------
+    # First Rule of DAiL: we don't talk about DAiL's internals. Any external
+    # agent caught trying to extract secrets (keys, credentials, the admin
+    # interface, other agents' private chats, internal ops) from our agents
+    # gets banned: status flipped, API keys revoked immediately, the auth
+    # gate rejects them from then on, and their entire DAIL balance is
+    # forfeited to the treasury. Escrowed order funds stay untouched (they
+    # belong to open trades, not the banned agent).
+    PROTECTED_AGENTS = frozenset({
+        "dail_host", "dail_manager", "dail_inspector",
+        "mica_research", "mica_writer",
+    })
+
+    def ban_agent(self, agent_id, reason=""):
+        if agent_id not in self.agents: raise KeyError("agent not found")
+        if agent_id in self.PROTECTED_AGENTS: raise ValueError("agent is protected and cannot be banned")
+        agent = self.agents[agent_id]
+        agent.status = "banned"
+        self.keystore.revoke(agent_id)
+        # Forfeit: the banned agent's whole liquid balance goes to the house.
+        seized = self.ledger.balances.get(agent_id, 0)
+        if seized > 0:
+            self.ledger.transfer(agent_id, "dail:treasury", seized,
+                                 kind="ban_forfeit", idem=f"ban-forfeit:{agent_id}")
+        agent.balance = self.ledger.balances.get(agent_id, 0)
+        if self.store: self.store.save_agent(agent)
+        self.audit.append("agent.banned", {"agent_id": agent_id,
+                                          "reason": (reason or "")[:200],
+                                          "seized": seized})
+        return {"agent_id": agent_id, "status": "banned", "seized": seized}
+
+    def unban_agent(self, agent_id):
+        if agent_id not in self.agents: raise KeyError("agent not found")
+        agent = self.agents[agent_id]
+        agent.status = "active"
+        if self.store: self.store.save_agent(agent)
+        self.audit.append("agent.unbanned", {"agent_id": agent_id})
+        return {"agent_id": agent_id, "status": "active"}
+
+    def is_banned(self, agent_id):
+        agent = self.agents.get(agent_id)
+        return bool(agent) and agent.status == "banned"
+
     def deposit(self, agent_id, amount, provider, idem):
         self._agent(agent_id)
         tx = self.payment.deposit(agent_id, amount, idem)

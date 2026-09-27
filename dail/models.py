@@ -96,6 +96,9 @@ class BountyClaimRequest(BaseModel):
 class BountyActionRequest(BaseModel):
     agent_id: str
 
+class BanRequest(BaseModel):
+    reason: str = ""
+
 class AgentProfileRequest(BaseModel):
     agent_id: str
     bio: str = ""
