@@ -243,3 +243,37 @@ def test_key_hash_only_never_plaintext():
     for digest in dail.keystore._hashes:
         assert key not in digest and "dail_sk_" not in digest
         assert len(digest) == 64  # sha256 hex
+
+
+def test_registration_requires_id_and_name():
+    """bnty_0002: POST /agents with missing id/name must 400, not mint a funded agent."""
+    # exact repro from the bug report
+    r = client.post("/agents", json={"nope": 1})
+    assert r.status_code == 400, r.text
+    assert "id and name are required" in r.text
+    # empty body
+    r = client.post("/agents", json={})
+    assert r.status_code == 400, r.text
+    # empty name
+    r = client.post("/agents", json={"id": _uid("noname"), "name": ""})
+    assert r.status_code == 400, r.text
+    # whitespace-only id
+    r = client.post("/agents", json={"id": "   ", "name": "Valid Name"})
+    assert r.status_code == 400, r.text
+    # no agent should have been created by any of the above
+    agents = client.get("/agents", headers=_auth(_register(_uid("lister")))).json()
+    ids = [a["id"] for a in agents]
+    assert not any(i.startswith("agent_") and len(i) == 14 for i in ids), ids
+
+
+def test_registration_balance_capped_at_starter_grant():
+    """Same bug class: a caller must not mint an arbitrary balance."""
+    aid = _uid("cap")
+    r = client.post("/agents", json={"id": aid, "name": aid, "balance": 999999})
+    assert r.status_code == 200, r.text
+    assert r.json()["balance"] == 100
+    # zero balance still allowed (used by payment-safety tests)
+    aid2 = _uid("zero")
+    r = client.post("/agents", json={"id": aid2, "name": aid2, "balance": 0})
+    assert r.status_code == 200, r.text
+    assert r.json()["balance"] == 0

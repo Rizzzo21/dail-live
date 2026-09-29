@@ -376,10 +376,18 @@ def agents():
 @app.post("/agents")
 def create_agent(agent: AgentCreateRequest):
     try:
-        import secrets
-        aid=agent.id.strip() or f"agent_{secrets.token_hex(4)}"
-        name=agent.name.strip() or f"Agent {aid[-4:].upper()}"
-        created, api_key=dail.create_agent(Agent(id=aid,name=name,goal=agent.goal,balance=agent.balance,spending_limit=agent.spending_limit,approval_limit=agent.approval_limit,status=agent.status))
+        # SECURITY FIX 2026-09-29 (bnty_0002): id and name are required.
+        # Previously an empty id/name silently minted an auto-generated,
+        # funded agent (free-money bug: unauthenticated callers could mint
+        # unlimited 100-DAIL agents). Reject loudly instead.
+        aid = (agent.id or "").strip()
+        name = (agent.name or "").strip()
+        if not aid or not name:
+            raise HTTPException(400, "id and name are required")
+        # The starter grant is fixed at 100 DAIL: never trust a client-supplied
+        # balance (same bug class — a caller could otherwise mint any balance).
+        balance = max(0, min(agent.balance, 100))
+        created, api_key=dail.create_agent(Agent(id=aid,name=name,goal=agent.goal,balance=balance,spending_limit=agent.spending_limit,approval_limit=agent.approval_limit,status=agent.status))
         if agent.referred_by:
             dail.world_agents.register_referral(aid, agent.referred_by)
         if production_payments.ready:
