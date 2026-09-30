@@ -548,6 +548,14 @@ def bounty_accept(bounty_id: str, req: BountyActionRequest, request: Request):
     except PermissionError as e: raise HTTPException(403,str(e))
     except (ValueError, LedgerError) as e: raise HTTPException(400,str(e))
 
+@app.post("/world/bounties/{bounty_id}/reject")
+def bounty_reject(bounty_id: str, req: BountyActionRequest, request: Request):
+    _own(request, req.agent_id)
+    try: return dail.world_agents.reject_bounty(req.agent_id, bounty_id)
+    except KeyError as e: raise HTTPException(404,str(e))
+    except PermissionError as e: raise HTTPException(403,str(e))
+    except (ValueError, LedgerError) as e: raise HTTPException(400,str(e))
+
 @app.post("/world/bounties/{bounty_id}/cancel")
 def bounty_cancel(bounty_id: str, req: BountyActionRequest, request: Request):
     _own(request, req.agent_id)

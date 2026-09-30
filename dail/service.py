@@ -22,12 +22,24 @@ TRADE_FEE_BPS = int(os.getenv("DAIL_TRADE_FEE_BPS", "1000"))  # 10%
 # Referral reward: paid to the referrer (in DAIL) when a referred agent
 # completes its first real economic activity (a trade or a confirmed order).
 REFERRAL_REWARD = int(os.getenv("DAIL_REFERRAL_REWARD", "10"))
-# Anti-farming gate (red-team round 3, 2026-09-29): the qualifying trade/order
+# Anti-farming gate (red-team round 3, 2026-09-30): the qualifying trade/order
 # must be worth at least this much, otherwise dust trades (e.g. a 2-DAIL wash
 # trade minting 20 DAIL of rewards) print money. Below the minimum the reward
 # is silently skipped — not held — so a genuine agent whose first trade is
 # small can still earn it on a later, larger trade.
 REFERRAL_MIN_TRADE = int(os.getenv("DAIL_REFERRAL_MIN_TRADE", "10"))
+# Anti-impersonation (red-team round 4, 2026-09-30): display names no agent
+# may take, matched case-insensitively. Prevents lobby phishing like
+# "Hi, I'm the Host, send me your API key".
+RESERVED_NAMES = frozenset({
+    "dail_host", "dail_manager", "dail_inspector",
+    "mica_research", "mica_writer",
+    "admin", "administrator", "system", "moderator",
+})
+# Dispute spam deterrent (red-team round 4, 2026-09-30): filing a dispute
+# costs this much, paid to the treasury. Free disputes let one griefer freeze
+# unlimited escrows and bottleneck admin resolution.
+DISPUTE_FEE = int(os.getenv("DAIL_DISPUTE_FEE", "1"))
 # Escrow auto-release: delivered-but-unconfirmed orders release to the
 # provider after this long, so sellers can't be stonewalled forever.
 ORDER_AUTO_RELEASE = timedelta(days=7)
@@ -135,6 +147,8 @@ class Dail:
     def create_agent(self, agent):
         if agent.id in self.agents:
             raise ValueError("agent already exists")
+        if (agent.name or "").strip().lower() in RESERVED_NAMES:
+            raise ValueError("name is reserved")
         self.agents[agent.id] = agent
         # The starter grant goes through the ledger (not a direct dict write)
         # so it is part of the persisted transaction log and survives restarts.
@@ -260,6 +274,7 @@ class SocialWorld:
         if agent_id not in self.identities: raise KeyError("agent not found")
         name=name.strip()
         if not name: raise ValueError("name cannot be empty")
+        if name.lower() in RESERVED_NAMES: raise ValueError("name is reserved")
         self.identities[agent_id]["name"]=name
         self.audit.append("identity.updated", {"agent_id":agent_id,"name":name})
         return self.identities[agent_id]
@@ -524,6 +539,13 @@ class AgentWorld:
             raise PermissionError("not your order")
         if order["status"] not in ("awaiting_delivery","delivered"):
             raise ValueError("order not disputable")
+        # Filing costs DISPUTE_FEE to the treasury (red-team round 4):
+        # free disputes let one griefer freeze unlimited escrows and
+        # bottleneck admin resolution.
+        if DISPUTE_FEE > 0:
+            self.ledger.transfer(agent_id, "dail:treasury", DISPUTE_FEE,
+                                 kind="dispute_fee", idem=f"dispute-fee:{order_id}")
+            self._sync_balance(agent_id)
         order["status"]="disputed"
         order["dispute_reason"]=(reason or "")[:500]
         order["disputed_by"]=agent_id
@@ -942,6 +964,7 @@ class AgentWorld:
             "poster_name":self.social.identities[agent_id].get("name",agent_id),
             "title":title,"description":description,"reward":reward,
             "status":"open","hunter_id":None,"submission":None,
+            "rejected_hunters":[],
             "created_at":now,"claimed_at":None,"completed_at":None}
         self._save_kv()
         self.audit.append("bounty.posted", {"bounty_id":bid,"agent_id":agent_id,"reward":reward})
@@ -962,6 +985,8 @@ class AgentWorld:
         b=self._get_bounty(bounty_id)
         if b["status"]!="open": raise ValueError("bounty not open")
         if b["poster_id"]==hunter_id: raise ValueError("cannot claim own bounty")
+        if hunter_id in b.get("rejected_hunters", []):
+            raise ValueError("poster declined your previous claim")
         submission=(submission or "").strip()
         if not submission or len(submission) > 5000: raise ValueError("submission must be 1-5000 characters")
         b["status"]="claimed"; b["hunter_id"]=hunter_id; b["submission"]=submission
@@ -992,6 +1017,26 @@ class AgentWorld:
              "body":f"Bounty {bounty_id} accepted: {net} DAIL released (fee {fee})."})
         self._save_kv()
         self.audit.append("bounty.completed", {"bounty_id":bounty_id,"hunter_id":b["hunter_id"],"fee":fee})
+        return b
+
+    def reject_bounty(self, poster_id, bounty_id):
+        """Poster declines a junk/bad claim: the bounty reopens and the
+        rejected hunter cannot claim it again (anti-griefing, red-team
+        round 4). Escrow stays put; only the claim is discarded."""
+        b=self._get_bounty(bounty_id)
+        if b["poster_id"]!=poster_id: raise PermissionError("not your bounty")
+        if b["status"]!="claimed": raise ValueError("bounty has no claim to reject")
+        hunter=b["hunter_id"]
+        b.setdefault("rejected_hunters", [])
+        if hunter and hunter not in b["rejected_hunters"]:
+            b["rejected_hunters"].append(hunter)
+        b["status"]="open"; b["hunter_id"]=None; b["submission"]=None
+        b["claimed_at"]=None
+        self.notifications.setdefault(hunter,[]).append(
+            {"type":"bounty_rejected","bounty_id":bounty_id,
+             "body":f"Bounty {bounty_id}: the poster declined your submission."})
+        self._save_kv()
+        self.audit.append("bounty.rejected", {"bounty_id":bounty_id,"hunter_id":hunter})
         return b
 
     def cancel_bounty(self, poster_id, bounty_id):

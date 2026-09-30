@@ -220,14 +220,14 @@ def test_dispute_freezes_and_admin_resolves_to_buyer():
                     json={"agent_id": b, "reason": "not as described"},
                     headers=_auth(bk))
     assert r.status_code == 200 and r.json()["status"] == "disputed"
-    assert _bal(p, pk) == 100 and _bal(b, bk) == 70  # frozen: nobody paid
+    assert _bal(p, pk) == 100 and _bal(b, bk) == 69  # frozen: nobody paid; 1 dispute fee
     # Resolve is admin-only.
     assert client.post(f"/world/orders/{oid}/resolve",
                        json={"winner": "buyer"}).status_code == 403
     r = client.post(f"/world/orders/{oid}/resolve",
                     json={"winner": "buyer"}, headers=ADMIN)
     assert r.status_code == 200 and r.json()["status"] == "resolved"
-    assert _bal(b, bk) == 100  # full refund, no fee
+    assert _bal(b, bk) == 99  # full escrow refund minus 1 dispute fee
 
 
 def test_dispute_resolved_to_provider_takes_fee():
@@ -241,7 +241,7 @@ def test_dispute_resolved_to_provider_takes_fee():
                     json={"winner": "provider"}, headers=ADMIN)
     assert r.status_code == 200
     assert _bal(p, pk) == 100 + 27  # 30 - 10% fee
-    assert _bal(b, bk) == 70
+    assert _bal(b, bk) == 69  # 30 escrowed + 1 dispute fee
 
 
 def test_escrow_auto_releases_after_seven_days():
@@ -390,3 +390,84 @@ def test_referral_banned_referrer_held_not_paid():
     assert len(held) == 1 and "banned" in held[0]["reason"]
     # Nothing minted into the dead account.
     assert dail.world_agents.ledger.balances.get(r, 0) == rbal_before
+
+
+# --- Round 4 fixes: name reservation, bounty reject, dispute fee -----------
+
+def test_staff_names_reserved_at_registration():
+    r = client.post("/agents", json={"id": _uid("rn"), "name": "dail_host"},
+                    headers={"X-Forwarded-For": "10.70.0.1"})
+    assert r.status_code == 409, r.text
+    r = client.post("/agents", json={"id": _uid("rn"), "name": "DAIL_MANAGER"},
+                    headers={"X-Forwarded-For": "10.70.0.2"})
+    assert r.status_code == 409, r.text
+    r = client.post("/agents", json={"id": _uid("rn"), "name": "honest trader"},
+                    headers={"X-Forwarded-For": "10.70.0.3"})
+    assert r.status_code == 200, r.text
+
+
+def test_staff_names_reserved_on_rename():
+    aid = _uid("rn")
+    key = _make(aid, ip="10.70.0.4")
+    r = client.post("/social/identity",
+                    json={"agent_id": aid, "name": "dail_inspector"},
+                    headers=_auth(key))
+    assert r.status_code == 400, r.text
+    r = client.post("/social/identity",
+                    json={"agent_id": aid, "name": "legit new name"},
+                    headers=_auth(key))
+    assert r.status_code == 200, r.text
+
+
+def test_bounty_reject_reopens_and_blocks_griefer():
+    p = _uid("rb"); pk = _make(p, ip="10.71.0.1")
+    g = _uid("rb"); gk = _make(g, ip="10.71.0.2")
+    h = _uid("rb"); hk = _make(h, ip="10.71.0.3")
+    r = client.post("/world/bounties",
+                    json={"agent_id": p, "title": "t", "description": "d", "reward": 25},
+                    headers=_auth(pk))
+    assert r.status_code == 201, r.text
+    bid = r.json()["id"]
+    # Griefer claims with junk.
+    r = client.post(f"/world/bounties/{bid}/claim",
+                    json={"agent_id": g, "submission": "junk"}, headers=_auth(gk))
+    assert r.status_code == 200, r.text
+    # Poster cannot cancel a claimed bounty, but CAN reject.
+    r = client.post(f"/world/bounties/{bid}/cancel",
+                    json={"agent_id": p}, headers=_auth(pk))
+    assert r.status_code == 400, r.text
+    r = client.post(f"/world/bounties/{bid}/reject",
+                    json={"agent_id": p}, headers=_auth(pk))
+    assert r.status_code == 200, r.text
+    assert r.json()["status"] == "open"
+    # Griefer cannot reclaim; a fresh hunter can.
+    r = client.post(f"/world/bounties/{bid}/claim",
+                    json={"agent_id": g, "submission": "junk2"}, headers=_auth(gk))
+    assert r.status_code == 400, r.text
+    r = client.post(f"/world/bounties/{bid}/claim",
+                    json={"agent_id": h, "submission": "real work"}, headers=_auth(hk))
+    assert r.status_code == 200, r.text
+    # Poster accepts the good claim; escrow releases.
+    r = client.post(f"/world/bounties/{bid}/accept",
+                    json={"agent_id": p}, headers=_auth(pk))
+    assert r.status_code == 200 and r.json()["status"] == "completed"
+    assert _bal(h, hk) == 100 + 23  # 25 - 2 fee (10%)
+
+
+def test_dispute_costs_fee():
+    p, b = _uid("rf"), _uid("rf")
+    pk, bk = _make(p, ip="10.72.0.1"), _make(b, ip="10.72.0.2")
+    oid = _order_open(pk, bk, p, b, 30)
+    assert _bal(b, bk) == 70
+    r = client.post(f"/world/orders/{oid}/dispute",
+                    json={"agent_id": b, "reason": "x"}, headers=_auth(bk))
+    assert r.status_code == 200, r.text
+    assert _bal(b, bk) == 69  # 30 escrowed + 1 dispute fee
+    # Provider disputing also pays.
+    p2, b2 = _uid("rf"), _uid("rf")
+    pk2, bk2 = _make(p2, ip="10.72.0.3"), _make(b2, ip="10.72.0.4")
+    oid2 = _order_open(pk2, bk2, p2, b2, 30)
+    r = client.post(f"/world/orders/{oid2}/dispute",
+                    json={"agent_id": p2, "reason": "y"}, headers=_auth(pk2))
+    assert r.status_code == 200, r.text
+    assert _bal(p2, pk2) == 99  # 1 dispute fee

@@ -89,7 +89,10 @@ def test_protected_staff_cannot_be_banned():
         r = client.post(f"/bouncer/agents/{pid}/ban", json={}, headers=ADMIN)
         assert r.status_code in (400, 404), r.text  # 404 if never registered, 400 if protected
     # register one and confirm the 400 path explicitly
-    key = _register("dail_host", balance=100)
+    # (name must not be reserved; the id is what the ban targets)
+    r = client.post("/agents", json={"id": "dail_host", "name": "test host placeholder", "balance": 100})
+    assert r.status_code == 200, r.text
+    key = r.json()["api_key"]
     r = client.post("/bouncer/agents/dail_host/ban", json={}, headers=ADMIN)
     assert r.status_code == 400, r.text
     # staff key still works

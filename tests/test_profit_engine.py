@@ -141,7 +141,7 @@ def test_order_dispute_and_buyer_refund():
                     json={"winner": "buyer"}, headers=_admin())
     assert r.status_code == 200, r.text
     assert r.json()["status"] == "resolved"
-    assert _bal(b) == 100 and _bal(s) == 100  # full refund, no fee on refunds
+    assert _bal(b) == 99 and _bal(s) == 100  # full refund minus 1 DAIL dispute fee
 
 
 def test_referral_reward_on_first_trade():
