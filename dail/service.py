@@ -22,6 +22,12 @@ TRADE_FEE_BPS = int(os.getenv("DAIL_TRADE_FEE_BPS", "1000"))  # 10%
 # Referral reward: paid to the referrer (in DAIL) when a referred agent
 # completes its first real economic activity (a trade or a confirmed order).
 REFERRAL_REWARD = int(os.getenv("DAIL_REFERRAL_REWARD", "10"))
+# Anti-farming gate (red-team round 3, 2026-09-29): the qualifying trade/order
+# must be worth at least this much, otherwise dust trades (e.g. a 2-DAIL wash
+# trade minting 20 DAIL of rewards) print money. Below the minimum the reward
+# is silently skipped — not held — so a genuine agent whose first trade is
+# small can still earn it on a later, larger trade.
+REFERRAL_MIN_TRADE = int(os.getenv("DAIL_REFERRAL_MIN_TRADE", "10"))
 # Escrow auto-release: delivered-but-unconfirmed orders release to the
 # provider after this long, so sellers can't be stonewalled forever.
 ORDER_AUTO_RELEASE = timedelta(days=7)
@@ -689,6 +695,35 @@ class AgentWorld:
                     f"counterparty shares registration IP and registered within 1h ({tag})")
         return reasons
 
+    def _qualifying_trade_value(self, agent_id):
+        """Largest settled trade/order value for the agent. Used to gate the
+        referral reward: dust trades must not mint rewards."""
+        best = 0
+        for o in self.orders.values():
+            if o.get("status") not in ("completed", "resolved"):
+                continue
+            if agent_id not in (o.get("buyer_id"), o.get("provider_id")):
+                continue
+            best = max(best, o.get("amount", 0) or 0)
+        for t in self.trades.values():
+            if t.get("status") != "settled":
+                continue
+            if agent_id not in (t.get("buyer_id"), t.get("seller_id")):
+                continue
+            best = max(best, t.get("amount", 0) or 0)
+        return best
+
+    def _hold_referral(self, agent_id, referrer, ref, reason):
+        ref["held"] = True
+        ref["hold_reason"] = reason
+        ref["held_at"] = datetime.now(timezone.utc).isoformat()
+        self._save_kv()
+        self.audit.append("referral.held", {
+            "referred": agent_id, "referrer": referrer, "reasons": [reason]})
+        self.notifications.setdefault(referrer, []).append(
+            {"type": "referral_held", "referred_id": agent_id,
+             "body": f"Referral reward for {agent_id} held for manual review: {reason}."})
+
     def _maybe_pay_referral(self, agent_id):
         """Pay the referrer when a referred agent completes real economic activity.
 
@@ -696,6 +731,9 @@ class AgentWorld:
         looks circular, the reward is HELD for manual admin review instead of
         auto-paying. Held rewards are listed at GET /admin/referrals/held and
         resolved at POST /admin/referrals/release.
+        Anti-farming gate (red-team round 3): dust trades below
+        REFERRAL_MIN_TRADE earn nothing (silently skipped, not held, so a
+        genuine small first trade doesn't poison the referral).
         """
         ref = self.referrals.get(agent_id)
         if not ref or ref.get("paid") or ref.get("held"):
@@ -703,17 +741,18 @@ class AgentWorld:
         referrer = ref["referrer"]
         if referrer not in self.social.identities:
             return False
+        # Never mint into a dead account: a banned referrer's reward is held
+        # for admin review instead of being credited to a frozen balance.
+        ra = self.agents.get(referrer)
+        if ra is not None and getattr(ra, "status", "active") == "banned":
+            self._hold_referral(agent_id, referrer, ref,
+                                "referrer is banned")
+            return False
         risks = self._referral_risk(agent_id, referrer)
         if risks:
-            ref["held"] = True
-            ref["hold_reason"] = "; ".join(risks)
-            ref["held_at"] = datetime.now(timezone.utc).isoformat()
-            self._save_kv()
-            self.audit.append("referral.held", {
-                "referred": agent_id, "referrer": referrer, "reasons": risks})
-            self.notifications.setdefault(referrer, []).append(
-                {"type": "referral_held", "referred_id": agent_id,
-                 "body": f"Referral reward for {agent_id} held for manual review: {ref['hold_reason']}."})
+            self._hold_referral(agent_id, referrer, ref, "; ".join(risks))
+            return False
+        if self._qualifying_trade_value(agent_id) < REFERRAL_MIN_TRADE:
             return False
         return self._pay_referral(agent_id, referrer, ref)
 

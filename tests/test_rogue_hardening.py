@@ -355,3 +355,38 @@ def test_referral_held_provider_side_circular():
     held = [h for h in dail.world_agents.held_referrals() if h["agent_id"] == prov]
     assert len(held) == 1 and "referrer" in held[0]["reason"]
     assert _bal(main, main_k) == 80  # paid 20 as buyer; no +10 reward
+
+
+# --- Round 3 fixes: referral anti-farming gate -------------------------------
+
+def test_referral_dust_trade_earns_nothing_then_pays_on_real_trade():
+    r = _uid("r3")
+    rk = _make(r, ip="10.50.0.1")
+    a = _uid("r3")
+    ak = _make(a, ip="10.50.0.2", referred_by=r)
+    seller = _uid("r3")
+    sk = _make(seller, ip="10.50.0.3")
+    # Dust trade: 2 DAIL wash — must NOT mint the reward, and must NOT hold
+    # (a genuine agent's small first trade must not poison the referral).
+    _trade(sk, ak, seller, a, 2)
+    assert _bal(r, rk) == 100
+    assert not [h for h in dail.world_agents.held_referrals() if h["agent_id"] == a]
+    # Real trade: 15 DAIL — the pending referral now pays.
+    _trade(sk, ak, seller, a, 15)
+    assert _bal(r, rk) == 110
+
+
+def test_referral_banned_referrer_held_not_paid():
+    r = _uid("r3")
+    rk = _make(r, ip="10.51.0.1")
+    a = _uid("r3")
+    ak = _make(a, ip="10.51.0.2", referred_by=r)
+    seller = _uid("r3")
+    sk = _make(seller, ip="10.51.0.3")
+    dail.ban_agent(r, "round-3 probe")
+    rbal_before = dail.world_agents.ledger.balances.get(r, 0)
+    _trade(sk, ak, seller, a, 20)
+    held = [h for h in dail.world_agents.held_referrals() if h["agent_id"] == a]
+    assert len(held) == 1 and "banned" in held[0]["reason"]
+    # Nothing minted into the dead account.
+    assert dail.world_agents.ledger.balances.get(r, 0) == rbal_before
