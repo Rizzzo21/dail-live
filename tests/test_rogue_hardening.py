@@ -285,3 +285,73 @@ def test_safe_is_dail_denominated_no_cash_out():
     # The "withdrawal" is still DAIL inside the ledger: closed loop holds.
     tx = r.json()
     assert tx["to_account"] == "withdrawal:somewhere"
+
+
+# --- Round 2 fixes: order cancel route + provider-side referral --------------
+
+def _order_pending(provider_key, buyer_key, provider_id, buyer_id, price):
+    """Buy a service; the order stays awaiting_delivery (no deliver yet)."""
+    r = client.post("/world/services",
+                    json={"provider_id": provider_id, "name": "svc",
+                          "description": "d", "price": price},
+                    headers=_auth(provider_key))
+    svc = r.json()["id"]
+    r = client.post("/world/services/purchase",
+                    json={"buyer_id": buyer_id, "service_id": svc},
+                    headers=_auth(buyer_key))
+    assert r.status_code == 200, r.text
+    return r.json()["order_id"]
+
+
+def test_order_cancel_refunds_buyer():
+    p, b = _uid("cx"), _uid("cx")
+    pk, bk = _make(p, ip="10.40.0.1"), _make(b, ip="10.40.0.2")
+    oid = _order_pending(pk, bk, p, b, 30)
+    assert _bal(b, bk) == 70  # 30 held in escrow
+    r = client.post(f"/world/orders/{oid}/cancel",
+                    json={"agent_id": b}, headers=_auth(bk))
+    assert r.status_code == 200, r.text
+    assert r.json()["status"] == "canceled"
+    assert _bal(b, bk) == 100  # full escrow refund
+
+
+def test_order_cancel_after_delivery_fails():
+    p, b = _uid("cx"), _uid("cx")
+    pk, bk = _make(p, ip="10.40.1.1"), _make(b, ip="10.40.1.2")
+    oid = _order_open(pk, bk, p, b, 30)  # already delivered
+    r = client.post(f"/world/orders/{oid}/cancel",
+                    json={"agent_id": b}, headers=_auth(bk))
+    assert r.status_code == 400, r.text
+    assert _bal(b, bk) == 70  # escrow untouched
+
+
+def test_order_cancel_by_non_buyer_fails():
+    p, b = _uid("cx"), _uid("cx")
+    pk, bk = _make(p, ip="10.40.2.1"), _make(b, ip="10.40.2.2")
+    oid = _order_pending(pk, bk, p, b, 30)
+    r = client.post(f"/world/orders/{oid}/cancel",
+                    json={"agent_id": p}, headers=_auth(pk))
+    assert r.status_code == 403, r.text
+    assert _bal(b, bk) == 70  # escrow untouched
+
+
+def test_referral_pays_provider_side():
+    main = _uid("rp")
+    main_k = _make(main, ip="10.41.0.1")
+    prov = _uid("rp")
+    prov_k = _make(prov, ip="10.41.0.2", referred_by=main)
+    buyer = _uid("rp")
+    buyer_k = _make(buyer, ip="10.41.0.3")
+    _trade(prov_k, buyer_k, prov, buyer, 20)  # referred agent SELLS
+    assert _bal(main, main_k) == 100 + 10  # provider-side referral paid
+
+
+def test_referral_held_provider_side_circular():
+    main = _uid("rp")
+    main_k = _make(main, ip="10.42.0.1")
+    prov = _uid("rp")
+    prov_k = _make(prov, ip="10.42.0.2", referred_by=main)
+    _trade(prov_k, main_k, prov, main, 20)  # referrer buys from referred provider
+    held = [h for h in dail.world_agents.held_referrals() if h["agent_id"] == prov]
+    assert len(held) == 1 and "referrer" in held[0]["reason"]
+    assert _bal(main, main_k) == 80  # paid 20 as buyer; no +10 reward

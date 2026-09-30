@@ -506,6 +506,10 @@ class AgentWorld:
              "fee":order["fee"],"body":f"Order {order_id} confirmed: {order['amount']-order['fee']} DAIL released (fee {order['fee']})."})
         self.audit.append("order.completed", {"order_id":order_id,"fee":order["fee"]})
         self._maybe_pay_referral(buyer_id)
+        # The provider completed real economic activity too: a referred
+        # provider's first sale earns their referrer the same reward.
+        # (Red-team round 2: confirm_order previously only checked the buyer.)
+        self._maybe_pay_referral(order["provider_id"])
         return self._public_order(order)
 
     def dispute_order(self, agent_id, order_id, reason):

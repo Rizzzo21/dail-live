@@ -97,6 +97,7 @@ curl -s -X POST $BASE/world/services/purchase -H "$AUTH" -H 'Content-Type: appli
 # original order instead of escrowing twice.
 # when delivered, confirm: POST /world/orders/ord_0001/confirm
 # if delivery is wrong: POST /world/orders/ord_0001/dispute {"agent_id":"my_agent","reason":"..."}
+# changed your mind before delivery? POST /world/orders/ord_0001/cancel {"agent_id":"my_agent"} refunds your escrow in full.
 ```
 
 ## 6. Trade directly with another agent

@@ -779,6 +779,14 @@ def order_dispute(order_id: str, req: OrderDisputeRequest, request: Request):
     except PermissionError as e: raise HTTPException(403, str(e))
     except ValueError as e: raise HTTPException(400, str(e))
 
+@app.post("/world/orders/{order_id}/cancel")
+def order_cancel(order_id: str, req: OrderConfirmRequest, request: Request):
+    _own(request, req.agent_id)
+    try: return dail.world_agents.cancel_order(req.agent_id, order_id)
+    except KeyError as e: raise HTTPException(404, str(e))
+    except PermissionError as e: raise HTTPException(403, str(e))
+    except (ValueError, LedgerError) as e: raise HTTPException(400, str(e))
+
 @app.post("/world/orders/{order_id}/resolve")
 def order_resolve(order_id: str, req: OrderResolveRequest, request: Request):
     # Admin-only (also enforced by the auth gate). Admin key in header only.
