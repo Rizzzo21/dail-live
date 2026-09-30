@@ -133,6 +133,12 @@ class OrderResolveRequest(BaseModel):
     # the request body.
     winner: Literal["provider", "buyer"] = "provider"
 
+class ReferralReleaseRequest(BaseModel):
+    # Admin authentication arrives via the X-DAIL-Admin-Key header, never
+    # the request body.
+    agent_id: str
+    approve: bool = True
+
 class TradeRequest(BaseModel):
     seller_id: str
     buyer_id: str

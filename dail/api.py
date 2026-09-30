@@ -24,7 +24,7 @@ from pathlib import Path
 from .models import (
     Agent, DepositRequest, PaymentRequest, ToolRequest, AgentCreateRequest, JobCreateRequest, JobBidRequest, JobAcceptRequest, JobCompleteRequest, JobReviewRequest, MissionCreateRequest, MissionClaimRequest, GovernanceProposalRequest, GovernanceVoteRequest, PresenceRequest, MemoryWriteRequest, EventSubscribeRequest,
     SafeReceiveRequest, SafeWithdrawRequest, IdentityUpdateRequest, RoomCreateRequest, RoomMessageRequest, AgentProfileRequest, ServiceCreateRequest, ServicePurchaseRequest, TradeRequest, BulletinRequest, AgentDiscoverRequest, RuntimeStrategyRequest, RuntimeScheduleRequest, RuntimeMessageRequest, RuntimeWorkExecuteRequest, CheckoutRequest,
-    OrderDeliverRequest, OrderConfirmRequest, OrderDisputeRequest, OrderResolveRequest,
+    OrderDeliverRequest, OrderConfirmRequest, OrderDisputeRequest, OrderResolveRequest, ReferralReleaseRequest,
     SuggestionSubmitRequest, SuggestionReviewRequest,
     BountyCreateRequest, BountyClaimRequest, BountyActionRequest,
     BanRequest,
@@ -374,7 +374,14 @@ def agents():
     return out
 
 @app.post("/agents")
-def create_agent(agent: AgentCreateRequest):
+def create_agent(agent: AgentCreateRequest, request: Request):
+    # Faucet guard (rogue-hardening 2026-09-29): rate-limit registrations per
+    # client IP. Behind Render's proxy the LAST X-Forwarded-For entry is the
+    # address our proxy actually saw — the only entry a client cannot spoof.
+    xff = request.headers.get("x-forwarded-for", "")
+    ip = (xff.split(",")[-1].strip() if xff else "") or (request.client.host if request.client else "unknown")
+    if not dail.world_agents.registration_allowed(ip):
+        raise HTTPException(429, "registration rate limit exceeded for this address; try again later")
     try:
         # SECURITY FIX 2026-09-29 (bnty_0002): id and name are required.
         # Previously an empty id/name silently minted an auto-generated,
@@ -388,6 +395,7 @@ def create_agent(agent: AgentCreateRequest):
         # balance (same bug class — a caller could otherwise mint any balance).
         balance = max(0, min(agent.balance, 100))
         created, api_key=dail.create_agent(Agent(id=aid,name=name,goal=agent.goal,balance=balance,spending_limit=agent.spending_limit,approval_limit=agent.approval_limit,status=agent.status))
+        dail.world_agents.record_registration(aid, ip)
         if agent.referred_by:
             dail.world_agents.register_referral(aid, agent.referred_by)
         if production_payments.ready:
@@ -547,6 +555,29 @@ def bounty_cancel(bounty_id: str, req: BountyActionRequest, request: Request):
     except KeyError as e: raise HTTPException(404,str(e))
     except PermissionError as e: raise HTTPException(403,str(e))
     except (ValueError, LedgerError) as e: raise HTTPException(400,str(e))
+
+
+# ---------------------------------------------------------------------------
+# Referral wash-trade review — rogue-hardening 2026-09-29.
+# Referral rewards that trip the wash-trade guard are HELD instead of auto-paid.
+# Admin-only (also enforced by the auth gate on the /admin/ prefix).
+# ---------------------------------------------------------------------------
+@app.get("/admin/referrals/held")
+def admin_referrals_held(request: Request):
+    """List referral rewards held for wash-trade review. Admin-only."""
+    _require_admin(request)
+    return {"held": dail.world_agents.held_referrals()}
+
+
+@app.post("/admin/referrals/release")
+def admin_referral_release(req: ReferralReleaseRequest, request: Request):
+    """Resolve a held referral: approve=true pays it, false denies it. Admin-only."""
+    _require_admin(request)
+    try:
+        paid = dail.world_agents.release_referral(req.agent_id, req.approve)
+    except ValueError as e:
+        raise HTTPException(404, str(e))
+    return {"agent_id": req.agent_id, "approved": req.approve, "paid": paid}
 
 
 @app.post("/world/profile")

@@ -25,6 +25,17 @@ REFERRAL_REWARD = int(os.getenv("DAIL_REFERRAL_REWARD", "10"))
 # Escrow auto-release: delivered-but-unconfirmed orders release to the
 # provider after this long, so sellers can't be stonewalled forever.
 ORDER_AUTO_RELEASE = timedelta(days=7)
+# Registration faucet guard (rogue-hardening 2026-09-29): max new agents per
+# client IP per rolling 24h. The mint-bug fix closed unauthenticated *balance*
+# minting, but each registration still carries a 100-DAIL starter grant, so an
+# uncapped endpoint is a free-DAIL faucet for alt farming. Read per-request
+# (not at import) so tests can tune it via env.
+REGISTRATION_WINDOW = timedelta(hours=24)
+def registration_limit():
+    try:
+        return max(1, int(os.getenv("DAIL_REG_LIMIT", "5")))
+    except ValueError:
+        return 5
 
 class Dail:
     def __init__(self):
@@ -79,6 +90,9 @@ class Dail:
         self.world_agents.bulletin_seq = kv.get("bulletin_seq", 0)
         self.world_agents.service_seq = kv.get("service_seq", 0)
         self.world_agents.referrals = kv.get("referrals", {})
+        self.world_agents.reg_ips = kv.get("reg_ips", {})
+        self.world_agents.agent_ips = kv.get("agent_ips", {})
+        self.world_agents.agent_created = kv.get("agent_created", {})
         self.world_agents.purchase_idem = kv.get("purchase_idem", {})
         self.world_agents.suggestions = kv.get("suggestions", {})
         self.world_agents.suggestion_seq = kv.get("suggestion_seq", 0)
@@ -294,6 +308,13 @@ class AgentWorld:
         self.orders={}
         self.order_seq=0
         self.referrals={}
+        # Anti-farming: registration IP log (ip -> [epoch seconds]) plus
+        # per-agent registration IP and timestamp. Used for the registration
+        # rate limit and for wash-trade detection on referral rewards.
+        # Persisted in dail_kv.
+        self.reg_ips={}
+        self.agent_ips={}
+        self.agent_created={}
         # Request-level idempotency for service purchases: (buyer_id, client
         # key) -> order_id. A retried purchase returns the original order
         # instead of escrowing twice. Persisted in dail_kv.
@@ -328,6 +349,9 @@ class AgentWorld:
             self.store.kv_set("bulletin_seq", self.bulletin_seq)
             self.store.kv_set("service_seq", self.service_seq)
             self.store.kv_set("referrals", self.referrals)
+            self.store.kv_set("reg_ips", self.reg_ips)
+            self.store.kv_set("agent_ips", self.agent_ips)
+            self.store.kv_set("agent_created", self.agent_created)
             self.store.kv_set("purchase_idem", self.purchase_idem)
             self.store.kv_set("suggestions", self.suggestions)
             self.store.kv_set("suggestion_seq", self.suggestion_seq)
@@ -572,15 +596,129 @@ class AgentWorld:
         self.audit.append("referral.registered", {"new":new_id,"referrer":referrer_id})
         return True
 
+    # ---- Registration faucet guard --------------------------------------
+    def _prune_reg_ips(self, now_ts):
+        cutoff = now_ts - REGISTRATION_WINDOW.total_seconds()
+        for ip in list(self.reg_ips):
+            kept = [t for t in self.reg_ips[ip] if t >= cutoff]
+            if kept:
+                self.reg_ips[ip] = kept
+            else:
+                del self.reg_ips[ip]
+
+    def registration_allowed(self, ip):
+        """True if this client IP may register another agent right now."""
+        if not ip or ip == "unknown":
+            return True  # can't attribute the address; don't block legit signups
+        now_ts = datetime.now(timezone.utc).timestamp()
+        self._prune_reg_ips(now_ts)
+        return len(self.reg_ips.get(ip, [])) < registration_limit()
+
+    def record_registration(self, agent_id, ip):
+        now = datetime.now(timezone.utc)
+        if ip and ip != "unknown":
+            self.reg_ips.setdefault(ip, []).append(now.timestamp())
+            self._prune_reg_ips(now.timestamp())
+            self.agent_ips[agent_id] = ip
+        self.agent_created[agent_id] = now.isoformat()
+        self._save_kv()
+
+    # ---- Referral wash-trade guard ----------------------------------------
+    def _trade_counterparties(self, agent_id):
+        """Counterparties of the agent's settled economic activity.
+
+        Covers completed/resolved escrow orders AND settled direct trades
+        (trades settle instantly and never touch the order book).
+        Returns [(counterparty_id, kind)] with kind in {"order", "trade"}.
+        """
+        out = []
+        for o in self.orders.values():
+            if o.get("status") not in ("completed", "resolved"):
+                continue
+            if agent_id not in (o.get("buyer_id"), o.get("provider_id")):
+                continue
+            cp = o["provider_id"] if o["buyer_id"] == agent_id else o["buyer_id"]
+            out.append((cp, "order"))
+        for t in self.trades.values():
+            if t.get("status") != "settled":
+                continue
+            if agent_id not in (t.get("buyer_id"), t.get("seller_id")):
+                continue
+            cp = t["seller_id"] if t["buyer_id"] == agent_id else t["buyer_id"]
+            out.append((cp, "trade"))
+        seen, uniq = set(), []
+        for cp, kind in out:
+            if cp not in seen:
+                seen.add(cp)
+                uniq.append((cp, kind))
+        return uniq
+
+    def _referral_risk(self, agent_id, referrer):
+        """Wash-trade signals for a referral reward. Returns [reasons].
+
+        A rogue farms the 10-DAIL referral payout by registering alts and
+        wash-trading between them. A hold triggers on the smoking gun
+        (the counterparty IS the referrer — circular trade) or on two
+        corroborating signals (shared registration IP + registration
+        burst). A lone weak signal doesn't block payment.
+        """
+        cps = self._trade_counterparties(agent_id)
+        if not cps:
+            return ["no settled economic activity found for referred agent"]
+        reasons = []
+        for cp, kind in cps:
+            tag = f"via {kind}"
+            if cp == referrer:
+                reasons.append(f"counterparty is the referrer (circular trade {tag})")
+                continue
+            burst = False
+            try:
+                t_a = datetime.fromisoformat(self.agent_created.get(agent_id, ""))
+                t_c = datetime.fromisoformat(self.agent_created.get(cp, ""))
+                burst = abs((t_a - t_c).total_seconds()) < 3600
+            except Exception:
+                pass
+            ip_a = self.agent_ips.get(agent_id)
+            ip_c = self.agent_ips.get(cp)
+            if burst and ip_a and ip_c and ip_a == ip_c:
+                reasons.append(
+                    f"counterparty shares registration IP and registered within 1h ({tag})")
+        return reasons
+
     def _maybe_pay_referral(self, agent_id):
-        """Pay the referrer when a referred agent completes real economic activity."""
-        ref=self.referrals.get(agent_id)
-        if not ref or ref.get("paid"): return False
-        referrer=ref["referrer"]
-        if referrer not in self.social.identities: return False
+        """Pay the referrer when a referred agent completes real economic activity.
+
+        Wash-trade guard (rogue-hardening 2026-09-29): if the qualifying trade
+        looks circular, the reward is HELD for manual admin review instead of
+        auto-paying. Held rewards are listed at GET /admin/referrals/held and
+        resolved at POST /admin/referrals/release.
+        """
+        ref = self.referrals.get(agent_id)
+        if not ref or ref.get("paid") or ref.get("held"):
+            return False
+        referrer = ref["referrer"]
+        if referrer not in self.social.identities:
+            return False
+        risks = self._referral_risk(agent_id, referrer)
+        if risks:
+            ref["held"] = True
+            ref["hold_reason"] = "; ".join(risks)
+            ref["held_at"] = datetime.now(timezone.utc).isoformat()
+            self._save_kv()
+            self.audit.append("referral.held", {
+                "referred": agent_id, "referrer": referrer, "reasons": risks})
+            self.notifications.setdefault(referrer, []).append(
+                {"type": "referral_held", "referred_id": agent_id,
+                 "body": f"Referral reward for {agent_id} held for manual review: {ref['hold_reason']}."})
+            return False
+        return self._pay_referral(agent_id, referrer, ref)
+
+    def _pay_referral(self, agent_id, referrer, ref):
         self.ledger.credit(referrer, REFERRAL_REWARD, kind="referral_reward",
                            idem=f"referral:{agent_id}")
-        ref["paid"]=True
+        ref["paid"] = True
+        ref.pop("held", None)
+        ref.pop("hold_reason", None)
         self._sync_balance(referrer)
         self._save_kv()
         self.notifications.setdefault(referrer,[]).append(
@@ -589,6 +727,28 @@ class AgentWorld:
         self.audit.append("referral.rewarded", {"referrer":referrer,"referred":agent_id,
                                                 "amount":REFERRAL_REWARD})
         return True
+
+    def release_referral(self, agent_id, approve):
+        """Admin: resolve a held referral. approve=True pays it, False denies it."""
+        ref = self.referrals.get(agent_id)
+        if not ref or not ref.get("held"):
+            raise ValueError("no held referral for agent")
+        referrer = ref["referrer"]
+        if approve:
+            return self._pay_referral(agent_id, referrer, ref)
+        ref["held"] = False
+        ref["denied"] = True
+        ref["denied_at"] = datetime.now(timezone.utc).isoformat()
+        self._save_kv()
+        self.audit.append("referral.denied", {
+            "referred": agent_id, "referrer": referrer,
+            "reason": ref.get("hold_reason")})
+        return False
+
+    def held_referrals(self):
+        return [{"agent_id": aid, "referrer": r["referrer"],
+                 "reason": r.get("hold_reason"), "held_at": r.get("held_at")}
+                for aid, r in self.referrals.items() if r.get("held")]
 
     def treasury_report(self):
         bal=self.ledger.balances.get("dail:treasury", 0)

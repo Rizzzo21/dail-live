@@ -9,7 +9,7 @@ os.environ["DAIL_ADMIN_KEY"] = "test-admin-key"
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from fastapi.testclient import TestClient
-from dail.api import app
+from dail.api import app, dail
 
 client = TestClient(app)
 _seq = [0]
@@ -145,23 +145,34 @@ def test_order_dispute_and_buyer_refund():
 
 
 def test_referral_reward_on_first_trade():
-    inviter, new = _uid("inv"), _uid("new")
+    inviter, new, buyer = _uid("inv"), _uid("new"), _uid("buy")
     _make(inviter)                       # 100
     _make(new, referred_by=inviter)      # 100
-    # trade 1: new sells 20 to inviter. fee = max(1, 20*1000//10000) = 2.
-    # inviter: 100 - 20 = 80, then +10 referral reward. new: 100 + 18 = 118.
+    _make(buyer)                         # 100, unrelated third party
+    # Backdate buyer so the burst guard doesn't fire: genuinely distinct agent.
+    # NOTE: dail is imported at module level (not inside this test), because
+    # test_payment_safety.py evicts dail.* from sys.modules mid-suite — a
+    # function-level re-import would bind a fresh, disconnected Dail object.
+    from datetime import datetime, timedelta, timezone
+    dail.world_agents.agent_created[buyer] = (
+        datetime.now(timezone.utc) - timedelta(days=2)).isoformat()
+    # trade 1: new sells 20 to buyer (a real third party, not the referrer).
+    # fee = max(1, 20*1000//10000) = 2.
+    # buyer: 100 - 20 = 80; new: 100 + 18 = 118; inviter: 100 + 10 reward = 110.
     r = client.post("/world/trades", json={
-        "seller_id": new, "buyer_id": inviter, "amount": 20,
+        "seller_id": new, "buyer_id": buyer, "amount": 20,
         "item": "y", "idempotency_key": f"ref-{new}"}, headers=_auth(new))
     assert r.status_code == 200, r.text
-    assert _bal(inviter) == 90, _bal(inviter)
+    assert _bal(buyer) == 80, _bal(buyer)
     assert _bal(new) == 118, _bal(new)
-    # trade 2: reward must not pay twice. inviter: 90 - 20 = 70.
+    assert _bal(inviter) == 110, _bal(inviter)
+    # trade 2: reward must not pay twice. buyer: 80 - 20 = 60.
     r = client.post("/world/trades", json={
-        "seller_id": new, "buyer_id": inviter, "amount": 20,
+        "seller_id": new, "buyer_id": buyer, "amount": 20,
         "item": "y2", "idempotency_key": f"ref2-{new}"}, headers=_auth(new))
     assert r.status_code == 200, r.text
-    assert _bal(inviter) == 70, _bal(inviter)
+    assert _bal(buyer) == 60, _bal(buyer)
+    assert _bal(inviter) == 110, _bal(inviter)
     # reward recorded: inviter got a referral_reward notification, exactly once
     notifs = client.get(f"/world/notifications/{inviter}",
                         headers=_auth(inviter)).json()["notifications"]
