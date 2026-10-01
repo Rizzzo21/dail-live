@@ -143,6 +143,22 @@ class Dail:
             "agents": len(agent_rows), "transactions": len(tx_rows),
             "orders": len(order_rows), "services": len(service_rows),
             "bulletins": len(self.world_agents.bulletins)})
+        # Treasury loans: prefer the persisted registry; otherwise rebuild
+        # from the ledger (migration for pre-persistence loans). The registry
+        # lives on world_agents (AgentWorld owns the loan book).
+        wa = self.world_agents
+        saved_loans = kv.get("treasury_loans")
+        if saved_loans:
+            wa.treasury_loans = {l["id"]: l for l in saved_loans.get("loans", [])}
+            wa.treasury_loan_seq = int(saved_loans.get("seq") or 0) or len(wa.treasury_loans)
+            self.audit.append("world.loans_restored",
+                              {"loans": len(wa.treasury_loans)})
+        else:
+            wa._rebuild_loans_from_ledger(tx_rows)
+            if wa.treasury_loans:
+                wa._persist_loans()
+                self.audit.append("world.loans_rebuilt_from_ledger",
+                                  {"loans": len(wa.treasury_loans)})
 
     def create_agent(self, agent):
         if agent.id in self.agents:
@@ -866,6 +882,7 @@ class AgentWorld:
               "status":"open","transaction_id":tx.id,"idempotency_key":key}
         self.treasury_loans[loan_id]=loan
         self.audit.append("treasury.loan_disbursed", loan)
+        self._persist_loans()
         return loan
 
     def treasury_loan_repay(self, loan_id, amount, idem=None):
@@ -893,7 +910,44 @@ class AgentWorld:
                           {"id":loan_id,"agent_id":agent_id,"amount":amount,
                            "outstanding":loan["outstanding"],
                            "transaction_id":tx.id})
+        self._persist_loans()
         return loan
+
+    def _persist_loans(self):
+        """Write-through: the loan registry must survive restarts, otherwise
+        a redeploy would lose the receivable bookkeeping (the underlying
+        ledger movements survive via the tx log, but repay() needs the
+        registry to find the loan)."""
+        self.store.kv_set("treasury_loans",
+                          {"loans": sorted(self.treasury_loans.values(),
+                                           key=lambda l: l["id"]),
+                           "seq": self.treasury_loan_seq})
+
+    def _rebuild_loans_from_ledger(self, tx_rows):
+        """Migration path: rebuild the loan registry from the persisted
+        ledger for loans disbursed before registry persistence existed.
+        Event-sourced: a disbursed tx opens a loan, a repaid tx pays the
+        agent's earliest open loan. tx_rows must be chronological."""
+        open_by_agent={}
+        for t in tx_rows:
+            kind, frm, to, amount, txid, idem = t[1], t[2], t[3], t[4], t[0], t[5]
+            if kind=="treasury_loan_disbursed":
+                self.treasury_loan_seq+=1
+                loan_id=f"tloan_{self.treasury_loan_seq:04d}"
+                loan={"id":loan_id,"agent_id":to,"principal":amount,
+                      "repaid":0,"outstanding":amount,"memo":"",
+                      "status":"open","transaction_id":txid,
+                      "idempotency_key":idem}
+                self.treasury_loans[loan_id]=loan
+                open_by_agent.setdefault(to, []).append(loan)
+            elif kind=="treasury_loan_repaid":
+                for loan in open_by_agent.get(frm, []):
+                    if loan["status"]=="open":
+                        loan["repaid"]+=amount
+                        loan["outstanding"]=max(0, loan["outstanding"]-amount)
+                        if loan["outstanding"]==0:
+                            loan["status"]="repaid"
+                        break
 
     def treasury_loans_list(self):
         loans=sorted(self.treasury_loans.values(), key=lambda l: l["id"])

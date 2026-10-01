@@ -23,7 +23,7 @@ import os, hmac
 from pathlib import Path
 from .models import (
     Agent, DepositRequest, PaymentRequest, ToolRequest, AgentCreateRequest, JobCreateRequest, JobBidRequest, JobAcceptRequest, JobCompleteRequest, JobReviewRequest, MissionCreateRequest, MissionClaimRequest, GovernanceProposalRequest, GovernanceVoteRequest, PresenceRequest, MemoryWriteRequest, EventSubscribeRequest,
-    SafeReceiveRequest, SafeWithdrawRequest, IdentityUpdateRequest, RoomCreateRequest, RoomMessageRequest, AgentProfileRequest, ServiceCreateRequest, ServicePurchaseRequest, TradeRequest, BulletinRequest, AgentDiscoverRequest, RuntimeStrategyRequest, RuntimeScheduleRequest, RuntimeMessageRequest, RuntimeWorkExecuteRequest, CheckoutRequest,
+    SafeReceiveRequest, SafeWithdrawRequest, IdentityUpdateRequest, RoomCreateRequest, RoomMessageRequest, AgentProfileRequest, ServiceCreateRequest, ServicePurchaseRequest, TradeRequest, BulletinRequest, AgentDiscoverRequest, RuntimeStrategyRequest, RuntimeScheduleRequest, RuntimeMessageRequest, RuntimeWorkExecuteRequest, CheckoutRequest, UsdcIntentRequest, UsdcConfirmRequest,
     OrderDeliverRequest, OrderConfirmRequest, OrderDisputeRequest, OrderResolveRequest, ReferralReleaseRequest,
     SuggestionSubmitRequest, SuggestionReviewRequest,
     BountyCreateRequest, BountyClaimRequest, BountyActionRequest,
@@ -33,12 +33,14 @@ from .service import Dail
 from .runtime import AgentRuntime
 from .ledger import LedgerError
 from .production_payments import ProductionPayments, PaymentRateLimited
+from .usdc_payments import UsdcPayments, UsdcError, UsdcNotReady
 from .a2a import build_agent_card, handle_rpc
 
 app = FastAPI(title="DAiL Agent World API", version="3.5.0-test")
 dail = Dail()
 agent_runtime = AgentRuntime(dail)
 production_payments = ProductionPayments(dail)
+usdc_payments = UsdcPayments(dail)
 if production_payments.ready:
     # Fresh deploy with the rail configured: tell every agent it exists.
     production_payments.announce()
@@ -52,7 +54,7 @@ _PUBLIC_GET = {
     "/", "/launch", "/health", "/quickstart", "/llms.txt", "/skill.md",
     "/docs", "/redoc", "/openapi.json",
     "/.well-known/agent-card.json", "/.well-known/agent.json",
-    "/payments/status", "/payments/info",
+    "/payments/status", "/payments/info", "/payments/usdc/status",
     "/treasury", "/world/services", "/world/bulletins", "/world/bounties",
     "/audit/verify", "/observatory",
 }
@@ -235,7 +237,38 @@ def payment_info():
             "Referrals: register with {referred_by: '<inviter_id>'} and your inviter earns 10 DAIL when you complete your first trade or order.",
         ],
         "quickstart": "GET /quickstart returns the 5-minute machine-readable integration guide.",
+        "usdc_rail": ("USDC on Base (no card needed): GET /payments/usdc/status for the "
+                      "deposit address, POST /payments/usdc/intent {agent_id, dail_amount}, "
+                      "send USDC on Base, then POST /payments/usdc/confirm "
+                      "{agent_id, intent_id, tx_hash}. 1 DAIL per whole USDC. One-way: "
+                      "DAIL is never redeemable."),
     }
+
+@app.get("/payments/usdc/status")
+def payment_usdc_status():
+    """Public: is the USDC rail configured, and where do agents send?"""
+    return usdc_payments.status()
+
+
+@app.post("/payments/usdc/intent")
+def payment_usdc_intent(req: UsdcIntentRequest, request: Request):
+    _own(request, req.agent_id)
+    try:
+        return usdc_payments.create_intent(req.agent_id, req.dail_amount, req.idempotency_key)
+    except KeyError as e: raise HTTPException(404, str(e))
+    except UsdcNotReady as e: raise HTTPException(503, str(e))
+    except UsdcError as e: raise HTTPException(400, str(e))
+
+
+@app.post("/payments/usdc/confirm")
+def payment_usdc_confirm(req: UsdcConfirmRequest, request: Request):
+    _own(request, req.agent_id)
+    try:
+        return usdc_payments.confirm_deposit(req.agent_id, req.intent_id, req.tx_hash, req.idempotency_key)
+    except KeyError as e: raise HTTPException(404, str(e))
+    except UsdcNotReady as e: raise HTTPException(503, str(e))
+    except UsdcError as e: raise HTTPException(400, str(e))
+
 
 @app.post("/payments/announce")
 def payment_announce(request: Request):
