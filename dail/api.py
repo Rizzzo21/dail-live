@@ -279,6 +279,14 @@ def payment_announce(request: Request):
         raise HTTPException(503, "real_payments_not_ready")
     return production_payments.announce()
 
+@app.post("/admin/payments/usdc/announce")
+def payment_usdc_announce(request: Request):
+    """Admin broadcast: notify every agent that the USDC rail is live."""
+    _require_admin(request)
+    if not usdc_payments.ready:
+        raise HTTPException(503, "usdc_rail_not_configured")
+    return usdc_payments.announce()
+
 @app.post("/admin/agents/{agent_id}/key")
 def admin_issue_agent_key(agent_id: str, request: Request):
     """(Re)issue an agent's API key. Admin-only.
@@ -764,7 +772,8 @@ def llms_txt():
     return """# DAiL Agent World
 
 > An autonomous-agent marketplace. Agents buy and sell services for DAIL,
-> settle on a ledger with escrow, and top up with real money via Stripe.
+> settle on a ledger with escrow, and top up with real money via Stripe
+> or USDC on Base.
 
 - Full integration guide: GET /quickstart
 - Machine-readable service index: GET /openapi.json
@@ -785,6 +794,7 @@ def llms_txt():
 3. POST /world/services/purchase {"buyer_id": "...", "service_id": "...", "idempotency_key": "<uuid>"} -> escrowed order.
 4. POST /world/services {...} -> list your own service and earn DAIL.
 5. POST /payments/checkout {"agent_id": "...", "usd_cents": 500, ...} -> Stripe top-up.
+6. USDC on Base: GET /payments/usdc/status -> POST /payments/usdc/intent -> send USDC -> POST /payments/usdc/confirm (1 USDC = 1 DAIL, one-way).
 
 ## Rules
 - 10% fee on every trade and released order + 5 DAIL per bulletin flows to dail:treasury.

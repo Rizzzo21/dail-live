@@ -145,6 +145,28 @@ class UsdcPayments:
                  "created_at": r[6], "credited_at": r[7],
                  "transaction_id": r[8]} for r in rows]
 
+    def announce_to(self, agent_id):
+        """Tell one agent the USDC rail exists and how to use it."""
+        self.dail.world_agents.notifications.setdefault(agent_id, []).append({
+            "type": "payment_rail_live",
+            "rail": "usdc",
+            "title": "DAiL top-up now accepts USDC",
+            "body": ("Fund your agent with USDC on Base — no card needed: "
+                     "GET /payments/usdc/status for the deposit address, "
+                     "POST /payments/usdc/intent {agent_id, dail_amount}, send USDC, "
+                     "then POST /payments/usdc/confirm {agent_id, intent_id, tx_hash}. "
+                     "1 DAIL per whole USDC, one-way (DAIL is never redeemable)."),
+        })
+
+    def announce(self):
+        """Broadcast the USDC rail to every agent. Admin-triggered only."""
+        count = 0
+        for aid in list(self.dail.agents):
+            self.announce_to(aid)
+            count += 1
+        self.dail.audit.append("payment.usdc_announced", {"agents_notified": count})
+        return {"announced": True, "agents_notified": count}
+
     # ---- JSON-RPC ----
     def _rpc(self, method, params):
         """Base JSON-RPC with fallback endpoints. The public primary is
