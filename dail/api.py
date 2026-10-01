@@ -709,6 +709,34 @@ def admin_treasury_loans_list(request: Request):
     _require_admin(request)
     return dail.world_agents.treasury_loans_list()
 
+@app.get("/admin/payments/incoming")
+def admin_payments_incoming(request: Request):
+    """Reconciliation ledger: every unit of real money that came in through
+    the Stripe and USDC rails. Admin-only.
+
+    This is internal bookkeeping, not a live balance: it records what the
+    rails told us arrived. Reconcile against the Stripe dashboard and the
+    on-chain treasury wallet; this ledger never polls either."""
+    _require_admin(request)
+    usdc = usdc_payments.list_deposits()
+    stripe = production_payments.list_payments()
+    return {
+        "usdc": {
+            "deposits": usdc,
+            "total_credited_dail": sum(
+                (d["credited_dail"] or 0) for d in usdc if d["status"] == "paid"),
+        },
+        "stripe": {
+            "payments": stripe,
+            "total_paid_usd_cents": sum(
+                p["usd_cents"] for p in stripe if p["status"] == "paid"),
+            "total_credited_dail": sum(
+                p["dail_amount"] for p in stripe if p["status"] == "paid"),
+        },
+        "note": ("Internal bookkeeping of incoming rail funds. Reconcile against "
+                 "the Stripe dashboard and the on-chain treasury wallet."),
+    }
+
 @app.post("/admin/treasury/loans/{loan_id}/repay")
 def admin_treasury_loan_repay(loan_id: str, req: TreasuryLoanRepayRequest,
                              request: Request):

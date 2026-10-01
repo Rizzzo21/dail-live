@@ -128,6 +128,23 @@ class UsdcPayments:
             except Exception:
                 pass  # column exists (SQLite predates IF NOT EXISTS support)
 
+    def list_deposits(self, limit=100):
+        """Admin reconciliation view: newest USDC deposits first. Returns []
+        when the rail is not configured (no engine)."""
+        if not self.engine:
+            return []
+        self._init_db()  # self-healing: ensure the table exists
+        with self.engine.begin() as c:
+            rows = c.execute(
+                text("SELECT id, agent_id, expected_dail, status, tx_hash, credited_dail,"
+                     " created_at, credited_at, transaction_id FROM dail_usdc_deposits"
+                     " ORDER BY created_at DESC LIMIT :lim"),
+                {"lim": limit}).fetchall()
+        return [{"intent_id": r[0], "agent_id": r[1], "expected_dail": r[2],
+                 "status": r[3], "tx_hash": r[4], "credited_dail": r[5],
+                 "created_at": r[6], "credited_at": r[7],
+                 "transaction_id": r[8]} for r in rows]
+
     # ---- JSON-RPC ----
     def _rpc(self, method, params):
         """Base JSON-RPC with fallback endpoints. The public primary is

@@ -101,6 +101,23 @@ class ProductionPayments:
         except Exception:
             pass
 
+    def list_payments(self, limit=100):
+        """Admin reconciliation view: newest payments first. Returns [] when
+        the rail is not configured (no engine)."""
+        if not self.engine:
+            return []
+        self._init_db()  # self-healing: ensure the payments table exists
+        with self.engine.begin() as c:
+            rows = c.execute(
+                text("SELECT id, agent_id, session_id, usd_cents, dail_amount, status,"
+                     " created_at, paid_at, transaction_id FROM dail_payments"
+                     " ORDER BY created_at DESC LIMIT :lim"),
+                {"lim": limit}).fetchall()
+        return [{"id": r[0], "agent_id": r[1], "session_id": r[2],
+                 "usd_cents": r[3], "dail_amount": r[4], "status": r[5],
+                 "created_at": r[6], "paid_at": r[7],
+                 "transaction_id": r[8]} for r in rows]
+
     def _require_ready(self):
         if not self.ready:
             raise RuntimeError("real_payments_not_ready: configure DAIL_REAL_PAYMENTS, Stripe secrets, DATABASE_URL, and dependencies")
