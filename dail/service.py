@@ -315,20 +315,23 @@ class Dail:
         # persisted ledger tx log. Bounty payout txs are covered by (1) and
         # skipped in (2) to avoid double-counting. If nothing happened
         # recently, the feed is simply empty — never invented.
-        events = []
+        bounty_events = []
         for b in wa.bounties.values():
             if b.get("created_at"):
-                events.append({
+                bounty_events.append({
                     "type": "bounty_posted", "at": b["created_at"],
                     "text": f"{b.get('poster_name', b['poster_id'])} posted bounty "
                             f"'{b['title']}' — {b['reward']} DAIL",
                     "bounty_id": b["id"]})
             if b["status"] == "completed" and b.get("completed_at"):
-                events.append({
+                _hid = b.get("hunter_id", "")
+                bounty_events.append({
                     "type": "bounty_completed", "at": b["completed_at"],
-                    "text": f"{_name(b.get('hunter_id', ''))} completed "
+                    "text": f"{_name(_hid)} completed "
                             f"'{b['title']}' — {b['reward']} DAIL paid · RECEIPT VERIFIED",
-                    "bounty_id": b["id"], "verified": True})
+                    "bounty_id": b["id"], "verified": True,
+                    "title": b["title"], "reward": b["reward"],
+                    "hunter_id": _hid, "hunter": _name(_hid)})
         _PUBLIC_TX = {"trade": "trade",
                       "order_release": "service delivery",
                       "stripe_deposit": "Stripe", "usdc_deposit": "USDC"}
@@ -336,6 +339,7 @@ class Dail:
             _txs = self.store.recent_ledger_txs(80) if self.store else []
         except Exception:
             _txs = []
+        ledger_events = []
         for t in _txs:
             kind = t["kind"]
             idem = t.get("idempotency_key") or ""
@@ -347,7 +351,7 @@ class Dail:
             if kind.endswith("_deposit"):
                 if frm != "SYSTEM" or to not in ext_ids:
                     continue
-                events.append({
+                ledger_events.append({
                     "type": "topup", "at": t["created_at"],
                     "text": f"{_name(to)} topped up {t['amount']} DAIL "
                             f"via {_PUBLIC_TX[kind]}",
@@ -355,12 +359,14 @@ class Dail:
             else:
                 if frm not in ext_ids or to not in ext_ids:
                     continue
-                events.append({
+                ledger_events.append({
                     "type": kind, "at": t["created_at"],
                     "text": f"{_name(frm)} → {_name(to)} — {t['amount']} DAIL "
                             f"({_PUBLIC_TX[kind]})",
                     "txid": t["txid"]})
-        events.sort(key=lambda e: e["at"] or "", reverse=True)
+        ledger_events.sort(key=lambda e: e["at"] or "", reverse=True)
+        activity = sorted(bounty_events + ledger_events,
+                          key=lambda e: e["at"] or "", reverse=True)
 
         return {
             "stats": {
@@ -384,7 +390,8 @@ class Dail:
                          for b in sorted(open_bounties,
                                          key=lambda b: b["id"], reverse=True)[:20]],
             "spotlight": spotlight,
-            "activity": events[:30],
+            "activity": activity[:30],
+            "economic_activity": ledger_events[:15],
             "verify": "Every completed bounty carries a ledger receipt. "
                       "Verify the tamper-evident chain: GET /audit/verify",
         }

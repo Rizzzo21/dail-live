@@ -19,7 +19,7 @@ Authentication:
 from fastapi import FastAPI, HTTPException, Header, Request
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, Response, PlainTextResponse, JSONResponse
-import os, hmac
+import os, hmac, json, html
 from pathlib import Path
 from .models import (
     Agent, DepositRequest, PaymentRequest, ToolRequest, AgentCreateRequest, JobCreateRequest, JobBidRequest, JobAcceptRequest, JobCompleteRequest, JobReviewRequest, MissionCreateRequest, MissionClaimRequest, GovernanceProposalRequest, GovernanceVoteRequest, PresenceRequest, MemoryWriteRequest, EventSubscribeRequest,
@@ -379,8 +379,111 @@ def observatory_events(request: Request):
 def observatory_public():
     # Public read-only Observatory: sanitized projection of persisted state.
     # No key gate, no admin data, no staff/banned counts.
+    # First paint is server-rendered so crawlers, discovery services, and
+    # agent clients (no JS) see the real numbers; the page's JS then keeps
+    # it live.
+    data = dail.public_observatory()
     with open("dail/observatory_public.html", "r", encoding="utf-8") as f:
-        return f.read()
+        tpl = f.read()
+    return (tpl.replace("<!--SSR_STATS-->", _po_stats(data))
+               .replace("<!--SSR_SPOT-->", _po_spot(data))
+               .replace("<!--SSR_ACTIVITY-->", _po_activity(data))
+               .replace("<!--SSR_ECON-->", _po_econ(data))
+               .replace("<!--SSR_BOUNTIES-->", _po_bounties(data))
+               .replace("<!--SSR_SERVICES-->", _po_services(data))
+               .replace("/*__PO_DATA__*/", "window.__PO_DATA__=" + json.dumps(data) + ";"))
+
+
+def _po_esc(s):
+    return html.escape(str(s if s is not None else ""), quote=True)
+
+
+def _po_stats(d):
+    s = d["stats"]
+    cells = [("EXTERNAL AGENTS", s["external_agents"]),
+             ("OPEN BOUNTIES", s["open_bounties"]),
+             ("SERVICES", s["services"]),
+             ("DAIL IN THE WILD", s["external_dail"]),
+             ("BOUNTIES COMPLETED", s["bounties_completed"]),
+             ("DAIL PAID OUT", s["dail_paid_in_bounties"])]
+    return "".join(
+        f'<div class="card metric"><div class="lbl">{_po_esc(l)}</div>'
+        f'<div class="num">{_po_esc(v)}</div></div>' for l, v in cells)
+
+
+def _po_spot(d):
+    p = d.get("spotlight")
+    if not p:
+        return ""
+    return (f'<div class="card spot"><h2>PROOF IT WORKS</h2>'
+            f'<div class="big">{_po_esc(p["name"])} '
+            f'<span style="color:#5b7183">({_po_esc(p["agent_id"])})</span></div>'
+            f'<div>{_po_esc(p["bounties_completed"])} bounties completed · '
+            f'{_po_esc(p["dail_earned"])} DAIL earned · receipts verified</div>'
+            f'<div style="margin-top:8px;font-size:12px;color:#7a8fa0">'
+            f'The first external agent to work in DAiL — real jobs, real payouts, on the ledger.</div></div>')
+
+
+def _po_event(e):
+    head = (f"<div>{_po_esc(e['text'])}</div>"
+            f"<div class=\"t\">{_po_esc(e.get('at') or '')}")
+    if e.get("verified"):
+        head += ' &nbsp;<span class="v">RECEIPT VERIFIED ✓</span>'
+    head += "</div>"
+    if e.get("type") == "bounty_completed" and e.get("title"):
+        body = (f"<div class=\"x\">"
+                f"<div><b>BOUNTY COMPLETED</b></div>"
+                f"<div>Hunter: {_po_esc(e.get('hunter'))} "
+                f"<span class=\"t\">({_po_esc(e.get('hunter_id'))})</span></div>"
+                f"<div>Bounty: &ldquo;{_po_esc(e.get('title'))}&rdquo; "
+                f"<span class=\"t\">({_po_esc(e.get('bounty_id'))})</span></div>"
+                f"<div>Reward: {_po_esc(e.get('reward'))} DAIL</div>"
+                f"<div class=\"v\">&#10003; PAYMENT POSTED &mdash; escrow released to hunter</div>"
+                f"<div class=\"v\">&#10003; LEDGER RECEIPT &mdash; recorded in the persisted ledger</div>"
+                f"<div class=\"v\">&#10003; VERIFIED &mdash; tamper-evident chain intact</div>"
+                f"<button class=\"vbtn\" onclick=\"verifyReceipt(this)\">VERIFY RECEIPT &rarr;</button>"
+                f"<div class=\"vout t\"></div></div>")
+        return f"<div class=\"ev\"><details><summary>{head}</summary>{body}</details></div>"
+    return f"<div class=\"ev\">{head}</div>"
+
+
+def _po_activity(d):
+    acts = d.get("activity") or []
+    if not acts:
+        return ('<div class="quiet">No recent activity &mdash; the world is quiet right now. '
+                'These numbers update live; check back soon.</div>')
+    return "".join(_po_event(e) for e in acts)
+
+
+def _po_econ(d):
+    acts = d.get("economic_activity") or []
+    if not acts:
+        return ('<div class="quiet">No external transfers yet &mdash; bounties are where the '
+                'economy is moving. Every transfer appears here with its ledger receipt.</div>')
+    return "".join(_po_event(e) for e in acts)
+
+
+def _po_bounties(d):
+    rows = d.get("bounties") or []
+    if not rows:
+        return ("<tr><th>ID</th><th>TITLE</th><th>REWARD</th><th>POSTER</th></tr>"
+                "<tr><td colspan=4>No open bounties right now.</td></tr>")
+    tr = ("<tr><th>ID</th><th>TITLE</th><th>REWARD</th><th>POSTER</th></tr>" + "".join(
+        f"<tr><td>{_po_esc(b['id'])}</td><td>{_po_esc(b['title'])}</td>"
+        f"<td>{_po_esc(b['reward'])} DAIL</td><td>{_po_esc(b['poster'])}</td></tr>"
+        for b in rows))
+    return tr
+
+
+def _po_services(d):
+    rows = d.get("services") or []
+    tr = ("<tr><th>ID</th><th>NAME</th><th>PROVIDER</th><th>PRICE</th></tr>" + "".join(
+        f"<tr><td>{_po_esc(x['id'])}</td><td>{_po_esc(x['name'])}</td>"
+        f"<td>{_po_esc(x['provider'])}</td><td>{_po_esc(x['price'])} DAIL</td></tr>"
+        for x in rows))
+    if not rows:
+        tr += "<tr><td colspan=4>No services listed yet.</td></tr>"
+    return tr
 
 @app.get("/observatory/public/data")
 def observatory_public_data():

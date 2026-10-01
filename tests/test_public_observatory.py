@@ -122,3 +122,58 @@ def test_recent_ledger_txs_empty_without_persistence():
     # DATABASE_URL is unset in tests: the projection degrades gracefully.
     assert dail.store.enabled is False
     assert dail.store.recent_ledger_txs(10) == []
+
+
+def test_public_data_has_economic_activity_key():
+    body = client.get("/observatory/public/data").json()
+    assert "economic_activity" in body
+    assert isinstance(body["economic_activity"], list)
+
+
+def test_public_page_server_renders_content_no_js_needed():
+    # Crawlers, discovery services, and agent clients don't run JS: the
+    # first paint must carry the real numbers and listings in the HTML.
+    r = client.get("/observatory/public")
+    assert r.status_code == 200, r.text
+    html = r.text
+    assert "Loading…" not in html
+    body = client.get("/observatory/public/data").json()
+    s = body["stats"]
+    assert str(s["external_dail"]) in html  # headline counters present
+    assert str(s["open_bounties"]) in html
+    # Real listings baked in, not fetched later.
+    if body["bounties"]:
+        assert body["bounties"][0]["id"] in html
+        assert body["bounties"][0]["title"][:20] in html
+    if body["services"]:
+        assert body["services"][0]["id"] in html
+    # Activity feed baked in.
+    if body["activity"]:
+        assert "RECEIPT VERIFIED" in html or "posted bounty" in html
+    # Economic activity section exists with an honest empty state.
+    assert "RECENT ECONOMIC ACTIVITY" in html
+
+
+def test_completed_bounty_expander_has_receipt_details():
+    poster, hunter = _uid("p2"), _uid("h2")
+    _make(poster)
+    _make(hunter)
+    bid = client.post("/world/bounties", headers=_auth(poster),
+                      json={"agent_id": poster, "title": "SSR expander bounty",
+                            "description": "d", "reward": 12}).json()["id"]
+    client.post(f"/world/bounties/{bid}/claim", headers=_auth(hunter),
+                json={"agent_id": hunter, "submission": "done"})
+    client.post(f"/world/bounties/{bid}/accept", headers=_auth(poster),
+                json={"agent_id": poster})
+    html = client.get("/observatory/public").text
+    assert "SSR expander bounty" in html
+    assert "PAYMENT POSTED" in html
+    assert "LEDGER RECEIPT" in html
+    assert "VERIFY RECEIPT" in html
+
+
+def test_launch_page_payment_language_is_factual():
+    html = client.get("/launch").text
+    assert "Checking payment readiness" not in html
+    assert "ECONOMY LIVE" in html
+    assert "REAL PAYMENTS ENABLED" in html or "PAYMENT RAIL" in html
