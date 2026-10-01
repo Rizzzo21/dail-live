@@ -42,6 +42,7 @@ BASE_USDC_CONTRACT = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA4a1309"  # native USD
 USDC_DECIMALS = 6
 TRANSFER_TOPIC = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"  # Transfer(address,address,uint256)
 DEFAULT_RPC_URL = "https://mainnet.base.org"
+FALLBACK_RPC_URLS = ["https://base.llamarpc.com", "https://1rpc.io/base"]
 DEFAULT_TREASURY = "0xCd787bCf82279c121835EaaB37b34A502A6b8dBC"
 INTENT_TTL_SECONDS = 24 * 3600
 MIN_DAIL, MAX_DAIL = 1, 100000
@@ -65,7 +66,12 @@ class UsdcPayments:
     def __init__(self, dail):
         self.dail = dail
         self.treasury = (os.getenv("DAIL_USDC_TREASURY", DEFAULT_TREASURY) or "").strip()
-        self.rpc_url = (os.getenv("BASE_RPC_URL", DEFAULT_RPC_URL) or "").strip()
+        primary_rpc = (os.getenv("BASE_RPC_URL", DEFAULT_RPC_URL) or "").strip()
+        self.rpc_urls = []
+        for u in [primary_rpc] + FALLBACK_RPC_URLS:
+            if u and u not in self.rpc_urls:
+                self.rpc_urls.append(u)
+        self.rpc_url = self.rpc_urls[0] if self.rpc_urls else ""
         try:
             self.min_confirmations = max(1, int(os.getenv("DAIL_USDC_MIN_CONF", "2")))
         except ValueError:
@@ -124,18 +130,26 @@ class UsdcPayments:
 
     # ---- JSON-RPC ----
     def _rpc(self, method, params):
+        """Base JSON-RPC with fallback endpoints. The public primary is
+        rate-limited and flakes; a flaky RPC must never block a legitimate
+        deposit, so we try each URL in order and only fail when all do."""
         body = json.dumps({"jsonrpc": "2.0", "id": 1,
                            "method": method, "params": params}).encode()
-        req = urllib.request.Request(self.rpc_url, data=body,
-                                     headers={"Content-Type": "application/json"})
-        try:
-            with urllib.request.urlopen(req, timeout=20) as r:
-                resp = json.loads(r.read().decode())
-        except Exception as e:
-            raise UsdcError(f"base_rpc_unreachable: {type(e).__name__}")
-        if not isinstance(resp, dict) or "error" in resp:
-            raise UsdcError(f"base_rpc_error: {resp.get('error') if isinstance(resp, dict) else 'bad_response'}")
-        return resp.get("result")
+        last_err = None
+        for url in self.rpc_urls:
+            req = urllib.request.Request(url, data=body,
+                                         headers={"Content-Type": "application/json"})
+            try:
+                with urllib.request.urlopen(req, timeout=15) as r:
+                    resp = json.loads(r.read().decode())
+            except Exception as e:
+                last_err = e
+                continue
+            if not isinstance(resp, dict) or "error" in resp:
+                last_err = resp.get("error") if isinstance(resp, dict) else "bad_response"
+                continue
+            return resp.get("result")
+        raise UsdcError(f"base_rpc_unreachable: {last_err!r}"[:200])
 
     def _verify_onchain(self, tx_hash):
         """Returns (usdc_base_units_to_treasury, confirmations).

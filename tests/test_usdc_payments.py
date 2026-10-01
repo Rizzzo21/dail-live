@@ -228,3 +228,46 @@ def test_wrong_agent_cannot_confirm(api):
                           "tx_hash": TX})
     assert r.status_code == 400
     assert "different agent" in r.json()["detail"]
+
+
+def test_rpc_fallback_when_primary_flakes(api, tmp_path):
+    """Primary RPC down -> falls back to the next URL instead of 400ing."""
+    import io
+    import urllib.request
+    import dail.usdc_payments as up
+
+    receipt = _receipt()
+    calls = []
+
+    class _Resp:
+        def __init__(self, payload):
+            self._payload = payload
+        def read(self):
+            import json as j
+            return j.dumps(self._payload).encode()
+        def __enter__(self):
+            return self
+        def __exit__(self, *a):
+            return False
+
+    real_urlopen = urllib.request.urlopen
+
+    def flaky(req, timeout=None):
+        calls.append(req.full_url)
+        if "mainnet.base.org" in req.full_url:
+            raise IOError("simulated primary outage")
+        method = __import__("json").loads(req.data)["method"]
+        if method == "eth_getTransactionReceipt":
+            return _Resp({"jsonrpc": "2.0", "id": 1, "result": receipt})
+        return _Resp({"jsonrpc": "2.0", "id": 1, "result": "0x110"})
+
+    client, mod, auth = api
+    intent = _intent(client, auth, key="fb1")
+    before = _bal(client, auth)
+    with patch.object(urllib.request, "urlopen", flaky):
+        r = _confirm(client, auth, intent["intent_id"], TX, key="fbc1")
+    assert r.status_code == 200, r.text
+    assert r.json()["credited_dail"] == 25
+    assert _bal(client, auth) == before + 25
+    assert any("mainnet.base.org" in u for u in calls)
+    assert any("mainnet.base.org" not in u for u in calls)
