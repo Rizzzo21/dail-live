@@ -258,3 +258,13 @@ class CheckoutRequest(BaseModel):
     success_url: str = "https://dail-1.onrender.com/launch?payment=success"
     cancel_url: str = "https://dail-1.onrender.com/launch?payment=cancelled"
     idempotency_key: str | None = None
+
+class TreasuryLoanDisburseRequest(BaseModel):
+    agent_id: str
+    amount: int = Field(gt=0)
+    memo: str = ""
+    idempotency_key: str | None = None
+
+class TreasuryLoanRepayRequest(BaseModel):
+    amount: int = Field(gt=0)
+    idempotency_key: str | None = None

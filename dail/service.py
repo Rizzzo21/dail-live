@@ -346,6 +346,12 @@ class AgentWorld:
         self.suggestion_seq=0
         self.bounties={}
         self.bounty_seq=0
+        # Treasury loans: house operating credit to staff agents, disbursed
+        # from dail:treasury (no new supply is minted). One open loan per
+        # agent; repaid from future operating income. In-memory like the
+        # rest of the ledger state.
+        self.treasury_loans={}
+        self.treasury_loan_seq=0
 
     def _sync_balance(self, *agent_ids):
         """Keep the Agent model's cached balance consistent with the ledger."""
@@ -822,11 +828,78 @@ class AgentWorld:
         by_kind={}
         for t in revs:
             by_kind[t.kind]=by_kind.get(t.kind, 0)+t.amount
+        loans_receivable=sum(l["outstanding"] for l in self.treasury_loans.values()
+                             if l["status"]=="open")
         return {"treasury":"dail:treasury","balance":bal,"currency":"DAIL",
                 "lifetime_revenue":sum(by_kind.values()),"by_kind":by_kind,
                 "fee_bps":TRADE_FEE_BPS,"bulletin_fee":BULLETIN_FEE,
+                "loans_receivable":loans_receivable,
+                "open_loans":sum(1 for l in self.treasury_loans.values()
+                                 if l["status"]=="open"),
                 "events":[{"id":t.id,"kind":t.kind,"from":t.from_account,"amount":t.amount}
                           for t in revs[-25:]]}
+
+    # ---- Treasury loans -------------------------------------------------
+    # Operating credit: the house lends existing treasury DAIL to a staff
+    # agent. No DAIL is minted; the loan is a receivable on the treasury's
+    # books until repaid. Admin-only; one open loan per agent.
+
+    def treasury_loan_disburse(self, agent_id, amount, memo="", idem=None):
+        if agent_id not in self.agents:
+            raise KeyError("agent not found")
+        if amount <= 0:
+            raise ValueError("amount must be positive")
+        key=idem or f"treasury_loan:{agent_id}:{amount}:{memo}"
+        for loan in self.treasury_loans.values():
+            if loan.get("idempotency_key")==key:
+                return loan  # replay: return the original loan
+        for loan in self.treasury_loans.values():
+            if loan["agent_id"]==agent_id and loan["status"]=="open":
+                raise ValueError("agent already has an open treasury loan")
+        self.treasury_loan_seq+=1
+        loan_id=f"tloan_{self.treasury_loan_seq:04d}"
+        tx=self.ledger.transfer("dail:treasury", agent_id, amount,
+                                kind="treasury_loan_disbursed", idem=key)
+        self._sync_balance(agent_id)
+        loan={"id":loan_id,"agent_id":agent_id,"principal":amount,
+              "repaid":0,"outstanding":amount,"memo":memo[:200],
+              "status":"open","transaction_id":tx.id,"idempotency_key":key}
+        self.treasury_loans[loan_id]=loan
+        self.audit.append("treasury.loan_disbursed", loan)
+        return loan
+
+    def treasury_loan_repay(self, loan_id, amount, idem=None):
+        loan=self.treasury_loans.get(loan_id)
+        if loan is None:
+            raise KeyError("loan not found")
+        if loan["status"]!="open":
+            raise ValueError("loan is already repaid")
+        if amount <= 0:
+            raise ValueError("amount must be positive")
+        if amount > loan["outstanding"]:
+            raise ValueError("repayment exceeds outstanding balance")
+        key=idem or f"treasury_loan_repay:{loan_id}:{loan['repaid']+amount}"
+        if key in self.ledger.idempotency:
+            return loan  # replay: ledger already applied it
+        agent_id=loan["agent_id"]
+        tx=self.ledger.transfer(agent_id, "dail:treasury", amount,
+                                kind="treasury_loan_repaid", idem=key)
+        self._sync_balance(agent_id)
+        loan["repaid"]+=amount
+        loan["outstanding"]-=amount
+        if loan["outstanding"]==0:
+            loan["status"]="repaid"
+        self.audit.append("treasury.loan_repaid",
+                          {"id":loan_id,"agent_id":agent_id,"amount":amount,
+                           "outstanding":loan["outstanding"],
+                           "transaction_id":tx.id})
+        return loan
+
+    def treasury_loans_list(self):
+        loans=sorted(self.treasury_loans.values(), key=lambda l: l["id"])
+        return {"loans":loans,
+                "loans_receivable":sum(l["outstanding"] for l in loans
+                                       if l["status"]=="open")}
 
     def discover(self, agent_id, query):
         if agent_id not in self.social.identities: raise KeyError("agent not found")

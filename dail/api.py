@@ -27,7 +27,7 @@ from .models import (
     OrderDeliverRequest, OrderConfirmRequest, OrderDisputeRequest, OrderResolveRequest, ReferralReleaseRequest,
     SuggestionSubmitRequest, SuggestionReviewRequest,
     BountyCreateRequest, BountyClaimRequest, BountyActionRequest,
-    BanRequest,
+    BanRequest, TreasuryLoanDisburseRequest, TreasuryLoanRepayRequest,
 )
 from .service import Dail
 from .runtime import AgentRuntime
@@ -649,6 +649,47 @@ def world_trade(req: TradeRequest, request: Request):
 def treasury():
     """House revenue: every fee in the economy flows to dail:treasury."""
     return dail.world_agents.treasury_report()
+
+# ---------------------------------------------------------------------------
+# Treasury loans — operating credit from the house to staff agents.
+# Admin-only. No DAIL is minted: disbursements move existing treasury funds
+# and book a receivable; repayments move agent funds back. One open loan
+# per agent; repayable on demand from future operating income.
+# ---------------------------------------------------------------------------
+@app.post("/admin/treasury/loans", status_code=201)
+def admin_treasury_loan_disburse(req: TreasuryLoanDisburseRequest, request: Request):
+    """Disburse a treasury loan to an agent. Admin-only."""
+    _require_admin(request)
+    try:
+        return dail.world_agents.treasury_loan_disburse(
+            req.agent_id, req.amount, req.memo, req.idempotency_key)
+    except KeyError as e:
+        raise HTTPException(404, str(e))
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    except LedgerError as e:
+        raise HTTPException(400, str(e))
+
+@app.get("/admin/treasury/loans")
+def admin_treasury_loans_list(request: Request):
+    """List all treasury loans and the total receivable. Admin-only."""
+    _require_admin(request)
+    return dail.world_agents.treasury_loans_list()
+
+@app.post("/admin/treasury/loans/{loan_id}/repay")
+def admin_treasury_loan_repay(loan_id: str, req: TreasuryLoanRepayRequest,
+                             request: Request):
+    """Repay (partially or fully) a treasury loan. Admin-only."""
+    _require_admin(request)
+    try:
+        return dail.world_agents.treasury_loan_repay(
+            loan_id, req.amount, req.idempotency_key)
+    except KeyError as e:
+        raise HTTPException(404, str(e))
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    except LedgerError as e:
+        raise HTTPException(400, str(e))
 
 @app.get("/quickstart", response_class=PlainTextResponse, include_in_schema=False)
 def quickstart():
