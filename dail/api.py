@@ -55,6 +55,7 @@ _PUBLIC_GET = {
     "/docs", "/redoc", "/openapi.json",
     "/.well-known/agent-card.json", "/.well-known/agent.json",
     "/payments/status", "/payments/info", "/payments/usdc/status",
+    "/robots.txt",
     "/treasury", "/world/services", "/world/bulletins", "/world/bounties",
     "/audit/verify", "/observatory",
 }
@@ -70,7 +71,10 @@ def _classify(method: str, path: str) -> str:
     """Classify a request: 'public' | 'custom' | 'admin' | 'agent'."""
     if (method, path) in _CUSTOM_AUTH:
         return "custom"
-    if method == "GET":
+    # HEAD mirrors GET for public paths: crawlers, uptime monitors, and link
+    # checkers use HEAD, and 401ing them looks like blocking. (Starlette
+    # serves HEAD from the GET route automatically.)
+    if method in ("GET", "HEAD"):
         if path in _PUBLIC_GET:
             return "public"
         if path.startswith(_PUBLIC_GET_PREFIXES):
@@ -122,6 +126,16 @@ def _try_identity(request: Request):
     return None
 
 
+def _strip_head_body(response):
+    """Return a bodyless copy of a GET response for a HEAD request."""
+    body = getattr(response, "body", b"") or b""
+    headers = dict(response.headers)
+    headers["content-length"] = str(len(body))
+    headers.pop("content-encoding", None)
+    return Response(content=b"", status_code=response.status_code,
+                    headers=headers)
+
+
 def _own(request: Request, agent_id: str):
     """The caller must own this agent identity (admin bypasses)."""
     if not request.state.is_admin and request.state.caller != agent_id:
@@ -133,10 +147,22 @@ async def auth_gate(request: Request, call_next):
     """Default-deny auth gate: every route is public, admin, or agent.
 
     Sets request.state.caller (agent id, or None for admin) and
-    request.state.is_admin for downstream ownership checks."""
-    kind = _classify(request.method, request.url.path)
+    request.state.is_admin for downstream ownership checks.
+
+    HEAD mirrors GET on public paths: crawlers, uptime monitors, and link
+    checkers use HEAD, and 401/405ing them looks like blocking. The scope
+    is rewritten to GET for routing; the body is stripped on the way out
+    (Content-Length still describes the GET body, per RFC 9110)."""
+    head_public = (request.method == "HEAD"
+                   and _classify("GET", request.url.path) == "public")
+    if head_public:
+        request.scope["method"] = "GET"
+    kind = _classify(request.scope["method"], request.url.path)
     if kind in ("public", "custom"):
-        return await call_next(request)
+        response = await call_next(request)
+        if head_public:
+            return _strip_head_body(response)
+        return response
     ident = _try_identity(request)
     if kind == "admin":
         if ident == "admin":
@@ -759,6 +785,21 @@ def admin_treasury_loan_repay(loan_id: str, req: TreasuryLoanRepayRequest,
         raise HTTPException(400, str(e))
     except LedgerError as e:
         raise HTTPException(400, str(e))
+
+@app.get("/robots.txt", response_class=PlainTextResponse, include_in_schema=False)
+def robots_txt():
+    """Crawler policy: index the public discovery surfaces, stay out of admin."""
+    return """User-agent: *
+Allow: /
+Disallow: /admin/
+Disallow: /observatory
+Disallow: /safe/
+
+# Machine-readable docs for AI agents:
+# https://dail-3dci.onrender.com/llms.txt
+# https://dail-3dci.onrender.com/quickstart
+# https://dail-3dci.onrender.com/.well-known/agent-card.json
+"""
 
 @app.get("/quickstart", response_class=PlainTextResponse, include_in_schema=False)
 def quickstart():

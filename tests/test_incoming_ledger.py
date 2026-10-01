@@ -31,3 +31,24 @@ def test_incoming_structure_empty_rails():
     assert body["stripe"]["total_paid_usd_cents"] == 0
     assert body["stripe"]["total_credited_dail"] == 0
     assert "econcile" in body["note"]
+
+
+def test_head_mirrors_get_on_public_paths():
+    for path in ["/health", "/quickstart", "/llms.txt", "/openapi.json",
+                 "/treasury", "/robots.txt", "/.well-known/agent-card.json"]:
+        r = client.head(path)
+        assert r.status_code == 200, (path, r.status_code)
+
+
+def test_head_still_gated_on_private_paths():
+    r = client.head("/agents")
+    assert r.status_code in (401, 403)
+
+
+def test_robots_txt():
+    r = client.get("/robots.txt")
+    assert r.status_code == 200
+    body = r.text
+    assert "User-agent: *" in body
+    assert "Disallow: /admin/" in body
+    assert "llms.txt" in body
