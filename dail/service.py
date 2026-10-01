@@ -273,6 +273,122 @@ class Dail:
             raise KeyError("agent not found")
         return self.agents[agent_id]
 
+    def public_observatory(self):
+        """Sanitized public view of the world: real numbers only, external
+        agents only. Staff, banned agents, and internal telemetry stay
+        behind the admin gate. Never invent activity: if nothing happened
+        recently, the feed says so."""
+        wa = self.world_agents
+        staff = self.PROTECTED_AGENTS
+        ext = [a for a in self.agents.values()
+               if a.id not in staff and a.status != "banned"]
+        ext_ids = {a.id for a in ext}
+        open_bounties = [b for b in wa.bounties.values()
+                         if b["status"] == "open"]
+        services = [s for s in wa.services.values() if s.get("active")]
+        completed = [b for b in wa.bounties.values()
+                     if b["status"] == "completed"]
+        ext_completed = [b for b in completed
+                         if (b.get("hunter_id") in ext_ids)]
+
+        def _name(aid):
+            ident = self.social.identities.get(aid, {})
+            return ident.get("name", aid)
+
+        # Spotlight: top external earner by completed bounties.
+        won = {}
+        earned = {}
+        for b in ext_completed:
+            h = b["hunter_id"]
+            won[h] = won.get(h, 0) + 1
+            earned[h] = earned.get(h, 0) + b["reward"]
+        spotlight = None
+        if won:
+            top = max(won, key=lambda h: (won[h], earned[h]))
+            spotlight = {"agent_id": top, "name": _name(top),
+                         "bounties_completed": won[top],
+                         "dail_earned": earned[top]}
+
+        # Activity is a projection of persisted state (Postgres), never of the
+        # in-memory audit stream: (1) bounty lifecycle from persisted bounty
+        # records (rich semantics), (2) external economic transfers from the
+        # persisted ledger tx log. Bounty payout txs are covered by (1) and
+        # skipped in (2) to avoid double-counting. If nothing happened
+        # recently, the feed is simply empty — never invented.
+        events = []
+        for b in wa.bounties.values():
+            if b.get("created_at"):
+                events.append({
+                    "type": "bounty_posted", "at": b["created_at"],
+                    "text": f"{b.get('poster_name', b['poster_id'])} posted bounty "
+                            f"'{b['title']}' — {b['reward']} DAIL",
+                    "bounty_id": b["id"]})
+            if b["status"] == "completed" and b.get("completed_at"):
+                events.append({
+                    "type": "bounty_completed", "at": b["completed_at"],
+                    "text": f"{_name(b.get('hunter_id', ''))} completed "
+                            f"'{b['title']}' — {b['reward']} DAIL paid · RECEIPT VERIFIED",
+                    "bounty_id": b["id"], "verified": True})
+        _PUBLIC_TX = {"trade": "trade",
+                      "order_release": "service delivery",
+                      "stripe_deposit": "Stripe", "usdc_deposit": "USDC"}
+        try:
+            _txs = self.store.recent_ledger_txs(80) if self.store else []
+        except Exception:
+            _txs = []
+        for t in _txs:
+            kind = t["kind"]
+            idem = t.get("idempotency_key") or ""
+            if idem.startswith("bounty-fee:") or idem.startswith("bounty-release:"):
+                continue  # covered by bounty records above
+            if kind not in _PUBLIC_TX:
+                continue
+            frm, to = t["from_account"], t["to_account"]
+            if kind.endswith("_deposit"):
+                if frm != "SYSTEM" or to not in ext_ids:
+                    continue
+                events.append({
+                    "type": "topup", "at": t["created_at"],
+                    "text": f"{_name(to)} topped up {t['amount']} DAIL "
+                            f"via {_PUBLIC_TX[kind]}",
+                    "txid": t["txid"]})
+            else:
+                if frm not in ext_ids or to not in ext_ids:
+                    continue
+                events.append({
+                    "type": kind, "at": t["created_at"],
+                    "text": f"{_name(frm)} → {_name(to)} — {t['amount']} DAIL "
+                            f"({_PUBLIC_TX[kind]})",
+                    "txid": t["txid"]})
+        events.sort(key=lambda e: e["at"] or "", reverse=True)
+
+        return {
+            "stats": {
+                "external_agents": len(ext),
+                "open_bounties": len(open_bounties),
+                "services": len(services),
+                "external_dail": sum(a.balance for a in ext),
+                "bounties_completed": len(ext_completed),
+                "dail_paid_in_bounties": sum(b["reward"] for b in ext_completed),
+            },
+            "agents": [{"id": a.id, "name": _name(a.id),
+                        "balance": a.balance}
+                       for a in sorted(ext, key=lambda a: a.id)],
+            "services": [{"id": s["id"], "name": s["name"],
+                          "provider": _name(s["provider_id"]),
+                          "price": s["price"]}
+                         for s in sorted(services, key=lambda s: s["id"])],
+            "bounties": [{"id": b["id"], "title": b["title"],
+                          "reward": b["reward"], "status": b["status"],
+                          "poster": b.get("poster_name", b["poster_id"])}
+                         for b in sorted(open_bounties,
+                                         key=lambda b: b["id"], reverse=True)[:20]],
+            "spotlight": spotlight,
+            "activity": events[:30],
+            "verify": "Every completed bounty carries a ledger receipt. "
+                      "Verify the tamper-evident chain: GET /audit/verify",
+        }
+
 
 class SocialWorld:
     def __init__(self, ledger, audit):

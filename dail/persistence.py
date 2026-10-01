@@ -113,6 +113,23 @@ class WorldStore:
                  "to": tx.to_account, "amt": tx.amount,
                  "idem": tx.idempotency_key, "status": tx.status, "now": _now()})
 
+    def recent_ledger_txs(self, limit=60):
+        """Newest ledger transactions for the public activity feed.
+        Projection of persisted state; returns [] when persistence is off."""
+        if not self.enabled:
+            return []
+        with self._lock, self.engine.begin() as c:
+            rows = c.execute(text(
+                """SELECT txid, kind, from_account, to_account, amount,
+                          idempotency_key, created_at
+                   FROM dail_ledger_tx
+                   ORDER BY created_at DESC, txid DESC
+                   LIMIT :lim"""), {"lim": int(limit)}).fetchall()
+        return [{"txid": r[0], "kind": r[1], "from_account": r[2],
+                 "to_account": r[3], "amount": r[4],
+                 "idempotency_key": r[5], "created_at": r[6]}
+                for r in rows]
+
     def save_order(self, order):
         if not self.enabled:
             return

@@ -51,4 +51,5 @@ def test_robots_txt():
     body = r.text
     assert "User-agent: *" in body
     assert "Disallow: /admin/" in body
+    assert "Allow: /observatory/public" in body
     assert "llms.txt" in body

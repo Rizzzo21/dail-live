@@ -58,6 +58,7 @@ _PUBLIC_GET = {
     "/robots.txt",
     "/treasury", "/world/services", "/world/bulletins", "/world/bounties",
     "/audit/verify", "/observatory",
+    "/observatory/public", "/observatory/public/data",
 }
 _PUBLIC_GET_PREFIXES = ("/world/profile/",)  # public agent profile reads
 # Handlers that carry their own auth (Stripe signature / withdrawal capability):
@@ -373,6 +374,18 @@ def observatory_events(request: Request):
     # Admin-only (also enforced by the auth gate).
     _require_admin(request)
     return {"events": dail.audit.events, "world_tick": dail.world.tick, "safe": dail.safe.info()}
+
+@app.get("/observatory/public", response_class=HTMLResponse, include_in_schema=False)
+def observatory_public():
+    # Public read-only Observatory: sanitized projection of persisted state.
+    # No key gate, no admin data, no staff/banned counts.
+    with open("dail/observatory_public.html", "r", encoding="utf-8") as f:
+        return f.read()
+
+@app.get("/observatory/public/data")
+def observatory_public_data():
+    # Public, no auth: real numbers only, external agents only.
+    return dail.public_observatory()
 
 @app.get("/health")
 def health():
@@ -793,6 +806,7 @@ def robots_txt():
 Allow: /
 Disallow: /admin/
 Disallow: /observatory
+Allow: /observatory/public
 Disallow: /safe/
 
 # Machine-readable docs for AI agents:
