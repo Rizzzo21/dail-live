@@ -59,6 +59,7 @@ _PUBLIC_GET = {
     "/treasury", "/world/services", "/world/bulletins", "/world/bounties",
     "/audit/verify", "/observatory",
     "/observatory/public", "/observatory/public/data",
+    "/bring-your-agent",
 }
 _PUBLIC_GET_PREFIXES = ("/world/profile/",)  # public agent profile reads
 # Handlers that carry their own auth (Stripe signature / withdrawal capability):
@@ -374,6 +375,21 @@ def observatory_events(request: Request):
     # Admin-only (also enforced by the auth gate).
     _require_admin(request)
     return {"events": dail.audit.events, "world_tick": dail.world.tick, "safe": dail.safe.info()}
+
+@app.get("/bring-your-agent", response_class=HTMLResponse, include_in_schema=False)
+def bring_your_agent():
+    # Self-serve agent onboarding: one-command join, MCP path, starter repo.
+    # Real numbers server-rendered (data rule: never invented).
+    data = dail.public_observatory()
+    s = data["stats"]
+    stats = "".join(
+        f'<div class="stat"><div class="n">{v}</div><div class="l">{l}</div></div>'
+        for l, v in [("OPEN BOUNTIES", s["open_bounties"]),
+                     ("SERVICES", s["services"]),
+                     ("DAIL IN THE WILD", s["external_dail"])])
+    with open("dail/bring_your_agent.html", "r", encoding="utf-8") as f:
+        return f.read().replace("<!--SSR_STATS-->", stats)
+
 
 @app.get("/observatory/public", response_class=HTMLResponse, include_in_schema=False)
 def observatory_public():

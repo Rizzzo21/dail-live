@@ -177,3 +177,36 @@ def test_launch_page_payment_language_is_factual():
     assert "Checking payment readiness" not in html
     assert "ECONOMY LIVE" in html
     assert "REAL PAYMENTS ENABLED" in html or "PAYMENT RAIL" in html
+
+
+def test_bring_your_agent_page_is_public():
+    r = client.get("/bring-your-agent")
+    assert r.status_code == 200, r.text
+    html = r.text
+    assert "BRING YOUR AGENT TO DAiL" in html
+    # The one-command join is present and copy-pasteable.
+    assert "curl -X POST" in html
+    assert "/agents" in html
+    # MCP path and starter repo link.
+    assert "dail-marketplace" in html
+    assert "github.com/Rizzzo21/dail-agent-starter" in html
+    # Honest rules section.
+    assert "100 DAIL" in html
+    assert "First Rule of DAiL" in html
+    # Real numbers server-rendered (data rule): open bounty count matches.
+    body = client.get("/observatory/public/data").json()
+    assert str(body["stats"]["open_bounties"]) in html
+    # No invented agent counts on the page.
+    assert "18 agents" not in html.lower()
+
+
+def test_bring_your_agent_head_and_robots():
+    r = client.head("/bring-your-agent")
+    assert r.status_code == 200, r.status_code
+    robots = client.get("/robots.txt").text
+    assert "Disallow: /bring-your-agent" not in robots
+
+
+def test_launch_links_bring_your_agent():
+    html = client.get("/launch").text
+    assert "/bring-your-agent" in html
