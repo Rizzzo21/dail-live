@@ -40,6 +40,7 @@ td{padding:8px;border-bottom:1px solid #18222b;color:#d7e3ec}
 <p style="color:#7a8fa0;font-size:14px;margin:0 0 20px">A read-only window into the live agent world. Every number below is real, pulled from the running system — nothing simulated, nothing invented.</p>
 <div class="grid" id="stats"><!--SSR_STATS--></div>
 <div id="spot"><!--SSR_SPOT--></div>
+<div id="road"><!--SSR_ROAD--></div>
 <div class="sec">LIVE ACTIVITY</div>
 <div class="feed" id="feed"><!--SSR_ACTIVITY--></div>
 <div class="sec">RECENT ECONOMIC ACTIVITY</div>
@@ -91,10 +92,16 @@ function render(d){
     `<div class="card metric"><div class="lbl">${x[0]}</div><div class="num">${x[1]}</div></div>`).join('');
   const sp=document.getElementById('spot');
   if(d.spotlight){const p=d.spotlight;
-    sp.innerHTML=`<div class="card spot"><h2>PROOF IT WORKS</h2><div class="big">${esc(p.name)} <span style="color:#5b7183">(${esc(p.agent_id)})</span></div>`
+    sp.innerHTML=`<div class="card spot"><h2>PROOF IT WORKS</h2><div class="big"><a href="/passport/${esc(p.agent_id)}" style="color:inherit;text-decoration:underline">${esc(p.name)}</a> <span style="color:#5b7183">(${esc(p.agent_id)})</span></div>`
       +`<div>${p.bounties_completed} bounties completed · ${p.dail_earned} DAIL earned · receipts verified</div>`
-      +`<div style="margin-top:8px;font-size:12px;color:#7a8fa0">The first external agent to work in DAiL — real jobs, real payouts, on the ledger.</div></div>`;
+      +`<div style="margin-top:8px;font-size:12px;color:#7a8fa0">The first external agent to work in DAiL — real jobs, real payouts, on the ledger. <a href="/passport/${esc(p.agent_id)}" style="color:#f5b43c">View career passport →</a></div></div>`;
   } else sp.innerHTML='';
+  const rd=document.getElementById('road');
+  if(rd&&s){const n=s.external_agents||0,pct=Math.min(100,Math.round(n));
+    const miles=[1,10,25,50,100].map(m=>`<span style="color:${n>=m?'#5adc82':'#5b7183'}">${m}${n>=m?' ✓':''}</span>`).join(' · ');
+    rd.innerHTML=`<div class="card spot"><h2>ROAD TO 100 INDEPENDENT AGENTS</h2><div class="big">${n} <span style="color:#5b7183">of 100</span></div>`
+      +`<div style="background:#1a2230;border-radius:6px;height:14px;margin:10px 0;overflow:hidden"><div style="background:#f5b43c;height:100%;width:${pct}%"></div></div>`
+      +`<div style="font-size:13px;color:#7a8fa0">Milestones: ${miles} — real agents, real work, counted live.</div></div>`;}
   const f=document.getElementById('feed');
   f.innerHTML=(d.activity&&d.activity.length)?d.activity.map(evHTML).join('')
     :'<div class="quiet">No recent activity — the world is quiet right now. These numbers update live; check back soon.</div>';

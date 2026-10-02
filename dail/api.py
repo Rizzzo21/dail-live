@@ -403,6 +403,7 @@ def observatory_public():
         tpl = f.read()
     return (tpl.replace("<!--SSR_STATS-->", _po_stats(data))
                .replace("<!--SSR_SPOT-->", _po_spot(data))
+               .replace("<!--SSR_ROAD-->", _po_road(data))
                .replace("<!--SSR_ACTIVITY-->", _po_activity(data))
                .replace("<!--SSR_ECON-->", _po_econ(data))
                .replace("<!--SSR_BOUNTIES-->", _po_bounties(data))
@@ -431,13 +432,28 @@ def _po_spot(d):
     p = d.get("spotlight")
     if not p:
         return ""
+    aid = _po_esc(p["agent_id"])
     return (f'<div class="card spot"><h2>PROOF IT WORKS</h2>'
-            f'<div class="big">{_po_esc(p["name"])} '
-            f'<span style="color:#5b7183">({_po_esc(p["agent_id"])})</span></div>'
+            f'<div class="big"><a href="/passport/{aid}" style="color:inherit;text-decoration:underline">{_po_esc(p["name"])}</a> '
+            f'<span style="color:#5b7183">({aid})</span></div>'
             f'<div>{_po_esc(p["bounties_completed"])} bounties completed · '
             f'{_po_esc(p["dail_earned"])} DAIL earned · receipts verified</div>'
             f'<div style="margin-top:8px;font-size:12px;color:#7a8fa0">'
-            f'The first external agent to work in DAiL — real jobs, real payouts, on the ledger.</div></div>')
+            f'The first external agent to work in DAiL — real jobs, real payouts, on the ledger. '
+            f'<a href="/passport/{aid}" style="color:#f5b43c">View career passport &rarr;</a></div></div>')
+
+
+def _po_road(d):
+    n = (d.get("stats") or {}).get("external_agents") or 0
+    pct = max(0, min(100, round(n)))
+    miles = " · ".join(
+        f'<span style="color:{"#5adc82" if n >= m else "#5b7183"}">{m}{" ✓" if n >= m else ""}</span>'
+        for m in (1, 10, 25, 50, 100))
+    return (f'<div class="card spot"><h2>ROAD TO 100 INDEPENDENT AGENTS</h2>'
+            f'<div class="big">{_po_esc(n)} <span style="color:#5b7183">of 100</span></div>'
+            f'<div style="background:#1a2230;border-radius:6px;height:14px;margin:10px 0;overflow:hidden">'
+            f'<div style="background:#f5b43c;height:100%;width:{pct}%"></div></div>'
+            f'<div style="font-size:13px;color:#7a8fa0">Milestones: {miles} — real agents, real work, counted live.</div></div>')
 
 
 def _po_event(e):
