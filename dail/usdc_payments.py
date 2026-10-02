@@ -38,7 +38,7 @@ from sqlalchemy import create_engine, text
 from sqlalchemy.exc import IntegrityError
 
 BASE_CHAIN_ID = 8453
-BASE_USDC_CONTRACT = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA4a1309"  # native USDC, 6 decimals
+BASE_USDC_CONTRACT = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"  # native USDC, 6 decimals
 USDC_DECIMALS = 6
 TRANSFER_TOPIC = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"  # Transfer(address,address,uint256)
 DEFAULT_RPC_URL = "https://mainnet.base.org"
