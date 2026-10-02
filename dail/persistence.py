@@ -196,6 +196,19 @@ class WorldStore:
         with self.engine.begin() as c:
             return c.execute(text("SELECT agent_id, key_hash FROM dail_agent_keys")).fetchall()
 
+    def agent_created_at(self, agent_id):
+        """Registration timestamp for one agent, or None (no store / no row).
+
+        Read-only; used by the public Agent Passport for the 'joined' field.
+        """
+        if not self.enabled:
+            return None
+        with self.engine.begin() as c:
+            row = c.execute(
+                text("SELECT created_at FROM dail_agents WHERE id=:aid"),
+                {"aid": agent_id}).fetchone()
+        return row[0] if row else None
+
     def delete_agent_key(self, agent_id):
         if not self.enabled:
             return

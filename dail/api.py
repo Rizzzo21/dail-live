@@ -61,7 +61,7 @@ _PUBLIC_GET = {
     "/observatory/public", "/observatory/public/data",
     "/bring-your-agent",
 }
-_PUBLIC_GET_PREFIXES = ("/world/profile/",)  # public agent profile reads
+_PUBLIC_GET_PREFIXES = ("/world/profile/", "/passport/")  # public reads
 # Handlers that carry their own auth (Stripe signature / withdrawal capability):
 _CUSTOM_AUTH = {("POST", "/payments/webhook"), ("POST", "/safe/withdraw")}
 # Admin-only:
@@ -506,6 +506,105 @@ def observatory_public_data():
     # Public, no auth: real numbers only, external agents only.
     return dail.public_observatory()
 
+
+@app.get("/passport/{agent_id}/data")
+def passport_data(agent_id: str):
+    # Public, no auth: one agent's career record. Unknown or banned -> 404.
+    try:
+        return dail.agent_passport(agent_id)
+    except KeyError as e:
+        raise HTTPException(404, str(e))
+
+
+@app.get("/passport/{agent_id}", response_class=HTMLResponse, include_in_schema=False)
+def passport_page(agent_id: str):
+    # Agent Passport: server-rendered first paint so crawlers, discovery
+    # services, and agent clients (no JS) see the real record; the page's
+    # JS then keeps the verify button alive.
+    try:
+        p = dail.agent_passport(agent_id)
+    except KeyError as e:
+        raise HTTPException(404, str(e))
+    with open("dail/passport.html", "r", encoding="utf-8") as f:
+        tpl = f.read()
+    return (tpl.replace("<!--SSR_TITLE-->", _po_esc(_pp_title(p)))
+               .replace("<!--SSR_IDENT-->", _pp_ident(p))
+               .replace("<!--SSR_CAREER-->", _pp_career(p))
+               .replace("<!--SSR_WORK-->", _pp_work(p))
+               .replace("<!--SSR_SERVICES-->", _pp_services(p))
+               .replace("/*__PP_DATA__*/", "window.__PP_DATA__=" + json.dumps(p) + ";"))
+
+
+def _pp_title(p):
+    # Escaped again by _po_esc at the call site; kept separate for clarity.
+    return f"{p.get('display_name', 'Agent')} — DAiL Agent Passport"
+
+
+def _pp_ident(p):
+    if p.get("staff"):
+        return ('<div class="card staff"><h2>DAiL STAFF</h2>'
+                '<div class="big">DAiL staff</div>'
+                f'<div class="t">{_po_esc(p.get("note", ""))}</div></div>')
+    joined = p.get("joined_at") or "no record yet"
+    prof = p.get("profile") or {}
+    bio = (f'<div class="bio">{_po_esc(prof["bio"])}</div>'
+           if prof.get("bio") else "")
+    caps = (f'<div class="t">CAPABILITIES: {_po_esc(", ".join(prof["capabilities"]))}</div>'
+            if prof.get("capabilities") else "")
+    return (f'<div class="card ident"><div class="lbl">AGENT PASSPORT</div>'
+            f'<div class="big">{_po_esc(p["display_name"])} '
+            f'<span class="t">({_po_esc(p["agent_id"])})</span></div>'
+            f'{bio}{caps}'
+            f'<div class="t" style="margin-top:8px">ORIGIN: {_po_esc(p["origin"]).upper()} '
+            f'· JOINED: {_po_esc(joined)}</div></div>')
+
+
+def _pp_career(p):
+    if p.get("staff"):
+        return ""
+    cells = [("CURRENT BALANCE", f'{p["balance"]} DAIL'),
+             ("BOUNTIES COMPLETED", p["bounties_completed"]),
+             ("DAIL EARNED", f'{p["dail_earned"]} DAIL'),
+             ("SERVICES LISTED", p["services_listed"])]
+    return "".join(
+        f'<div class="card metric"><div class="lbl">{_po_esc(l)}</div>'
+        f'<div class="num">{_po_esc(v)}</div></div>' for l, v in cells)
+
+
+def _pp_work(p):
+    work = p.get("work") or []
+    if p.get("staff") or not work:
+        return ('<div class="quiet">No completed bounties on record yet. '
+                'Work this agent completes in DAiL appears here with its '
+                'ledger receipt.</div>')
+    cards = []
+    for b in work:
+        cards.append(
+            f'<div class="ev"><details><summary>'
+            f'<div>&ldquo;{_po_esc(b["title"])}&rdquo;</div>'
+            f'<div class="t">{_po_esc(b["id"])} · {_po_esc(b.get("completed_at") or "")} '
+            f'· <span class="v">RECEIPT VERIFIED ✓</span></div>'
+            f'</summary><div class="x">'
+            f'<div>Reward: <b>{_po_esc(b["reward"])} DAIL</b> — escrow released to this agent</div>'
+            f'<div class="v">&#10003; PAYMENT POSTED</div>'
+            f'<div class="v">&#10003; LEDGER RECEIPT — recorded in the persisted ledger</div>'
+            f'<button class="vbtn" onclick="verifyReceipt(this)">VERIFY RECEIPT &rarr;</button>'
+            f'<div class="vout t"></div></div></details></div>')
+    return "".join(cards)
+
+
+def _pp_services(p):
+    rows = p.get("services") or []
+    if p.get("staff"):
+        return ""
+    if not rows:
+        return ('<div class="quiet">No services listed yet. When this agent '
+                'lists a service in the marketplace, it appears here.</div>')
+    tr = ("<tr><th>ID</th><th>NAME</th><th>PRICE</th></tr>" + "".join(
+        f"<tr><td>{_po_esc(x['id'])}</td><td>{_po_esc(x['name'])}</td>"
+        f"<td>{_po_esc(x['price'])} DAIL</td></tr>" for x in rows))
+    return f'<div class="card" style="padding:4px 16px"><table>{tr}</table></div>'
+
 @app.get("/health")
 def health():
     pp = production_payments
@@ -926,6 +1025,7 @@ Allow: /
 Disallow: /admin/
 Disallow: /observatory
 Allow: /observatory/public
+Allow: /passport/
 Disallow: /safe/
 
 # Machine-readable docs for AI agents:

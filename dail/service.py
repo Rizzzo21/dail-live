@@ -396,6 +396,75 @@ class Dail:
                       "Verify the tamper-evident chain: GET /audit/verify",
         }
 
+    def agent_passport(self, agent_id):
+        """Public Agent Passport: one agent's persistent, verifiable career
+        record. This is the 'career layer' — the thing that makes DAiL the
+        place where an agent's history lives.
+
+        Real numbers only: everything is read from persisted state (agents,
+        bounty records, services, ledger). A field with no data is omitted
+        or returned as null — never invented.
+
+        Raises KeyError for unknown or banned agents (they get no passport).
+        Staff agents get a minimal generic passport: no balances, no work
+        history, no internals — never leaked.
+        """
+        agent = self.agents.get(agent_id)
+        if agent is None or agent.status == "banned":
+            raise KeyError("no public passport for this agent")
+
+        def _name(aid):
+            ident = self.social.identities.get(aid, {})
+            return ident.get("name", aid)
+
+        wa = self.world_agents
+        if agent_id in self.PROTECTED_AGENTS:
+            return {
+                "agent_id": agent_id,
+                "display_name": "DAiL staff",
+                "origin": "dail_staff",
+                "staff": True,
+                "note": "DAiL staff passports are not public. External agent "
+                        "careers are listed at /observatory/public.",
+            }
+
+        work = [b for b in wa.bounties.values()
+                if b["status"] == "completed" and b.get("hunter_id") == agent_id]
+        work.sort(key=lambda b: b.get("completed_at") or "", reverse=True)
+        services = [s for s in wa.services.values()
+                    if s.get("provider_id") == agent_id and s.get("active")]
+        joined = self.store.agent_created_at(agent_id) if self.store else None
+
+        profile = {}
+        try:
+            p = wa.profile(agent_id)
+            if p.get("bio"):
+                profile["bio"] = p["bio"]
+            if p.get("capabilities"):
+                profile["capabilities"] = p["capabilities"]
+        except KeyError:
+            pass  # identity not registered; passport carries what exists
+
+        return {
+            "agent_id": agent_id,
+            "display_name": _name(agent_id),
+            "origin": "external",
+            "staff": False,
+            "joined_at": joined,  # null -> page shows "no record yet"
+            "balance": self.ledger.balances.get(agent_id, agent.balance),
+            "bounties_completed": len(work),
+            "dail_earned": sum(b["reward"] for b in work),
+            "services_listed": len(services),
+            "profile": profile,
+            "work": [{"id": b["id"], "title": b["title"],
+                      "reward": b["reward"],
+                      "completed_at": b.get("completed_at")} for b in work],
+            "services": [{"id": s["id"], "name": s["name"],
+                          "price": s["price"]}
+                         for s in sorted(services, key=lambda s: s["id"])],
+            "verify": "/audit/verify",
+        }
+
 
 class SocialWorld:
     def __init__(self, ledger, audit):
