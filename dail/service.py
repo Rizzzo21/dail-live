@@ -1,5 +1,5 @@
 from .audit import AuditLog
-from .ledger import Ledger
+from .ledger import Ledger, LedgerError
 from .models import Agent, Transaction
 from .payment import MockPaymentGateway
 from .policy import PolicyEngine
@@ -63,6 +63,24 @@ def registration_limit():
     except ValueError:
         return 5
 
+# ---- Petty-cash vault constants ------------------------------------------
+# The vault (dail:vault) is the ONLY authorized source of new DAIL.
+VAULT_ACCOUNT = "dail:vault"
+# Starter grant per registration, drawn from the vault (never minted ad hoc).
+VAULT_STARTER_GRANT = 100
+# Staff allowed to disburse from the vault.
+VAULT_STAFF = {"dail_host", "dail_manager"}
+def vault_max_supply():
+    try:
+        return max(1, int(os.getenv("DAIL_VAULT_MAX_SUPPLY", "10000")))
+    except ValueError:
+        return 10000
+def vault_disburse_daily_cap():
+    try:
+        return max(1, int(os.getenv("DAIL_VAULT_DISBURSE_DAILY_CAP", "500")))
+    except ValueError:
+        return 500
+
 class Dail:
     def __init__(self):
         self.audit = AuditLog()
@@ -77,6 +95,10 @@ class Dail:
         self.world_agents = AgentWorld(self.ledger, self.audit, self.social, self.agents, self.store)
         self.safe = SafeWallet(self.ledger, self.audit, os.getenv("DAIL_ADMIN_KEY"))
         self.advanced = AdvancedWorld(self)
+        # Petty-cash vault state (overridden by _restore_world when persistence
+        # is enabled).
+        self._vault_minted_total = 0
+        self._vault_disbursed_day = {}
         self._restore_world()
 
     def _restore_world(self):
@@ -170,6 +192,71 @@ class Dail:
                 wa._persist_loans()
                 self.audit.append("world.loans_rebuilt_from_ledger",
                                   {"loans": len(wa.treasury_loans)})
+        # Petty-cash vault: total minted persists so the supply cap survives
+        # restarts. The vault balance itself is a ledger account (in-memory
+        # like all balances — see the known durability limitation).
+        self._vault_minted_total = int(kv.get("vault_minted_total") or 0)
+        self._vault_disbursed_day = kv.get("vault_disbursed_day") or {}
+
+    # ---- Petty-cash vault -------------------------------------------------
+    # The vault is the single authorized source of NEW DAIL. Admin mints into
+    # dail:vault up to a hard cap; starter grants and staff top-ups draw from
+    # it. No other path creates DAIL. Every movement is a ledger tx.
+    def vault_mint(self, amount, reason, idem=None):
+        """Admin-only: create new DAIL into the vault. Enforces the supply cap."""
+        if amount <= 0:
+            raise LedgerError("amount must be positive")
+        cap = vault_max_supply()
+        key = idem or f"vault_mint:{reason}:{amount}"
+        # Idempotent replay: an already-seen key returns the original tx and
+        # must NOT count toward the cap again.
+        if key in self.ledger.idempotency:
+            return self.ledger.transactions[self.ledger.idempotency[key]]
+        if self._vault_minted_total + amount > cap:
+            raise LedgerError(f"vault cap exceeded: {self._vault_minted_total}+{amount} > {cap}")
+        tx = self.ledger.credit(VAULT_ACCOUNT, amount, kind="vault_mint", idem=key)
+        self._vault_minted_total += amount
+        self._persist_vault()
+        self.audit.append("vault.mint", {"amount": amount, "reason": reason,
+                                         "total_minted": self._vault_minted_total})
+        return tx
+
+    def vault_disburse(self, staff_id, to_id, amount, purpose, idem=None):
+        """Staff draw from the vault (welcomes, bounty funding, top-ups)."""
+        if staff_id not in VAULT_STAFF:
+            raise LedgerError("not authorized for vault disbursement")
+        if to_id not in self.agents and to_id != VAULT_ACCOUNT:
+            raise KeyError(f"unknown agent {to_id}")
+        if amount <= 0:
+            raise LedgerError("amount must be positive")
+        today = datetime.now(timezone.utc).date().isoformat()
+        used = self._vault_disbursed_day.get(today, {}).get(staff_id, 0)
+        cap = vault_disburse_daily_cap()
+        if used + amount > cap:
+            raise LedgerError(f"daily disburse cap exceeded for {staff_id}: {used}+{amount} > {cap}")
+        tx = self.ledger.transfer(VAULT_ACCOUNT, to_id, amount,
+                                  kind="vault_disburse",
+                                  idem=idem or f"vault_disburse:{today}:{staff_id}:{to_id}:{amount}")
+        self._vault_disbursed_day.setdefault(today, {})[staff_id] = used + amount
+        self._persist_vault()
+        self.audit.append("vault.disburse", {"staff": staff_id, "to": to_id,
+                                            "amount": amount, "purpose": purpose})
+        return tx
+
+    def vault_status(self):
+        grants = [t for t in self.ledger.transactions.values() if t.kind == "grant"]
+        return {"vault": VAULT_ACCOUNT,
+                "balance": self.ledger.balances.get(VAULT_ACCOUNT, 0),
+                "currency": "DAIL",
+                "total_minted": self._vault_minted_total,
+                "max_supply": vault_max_supply(),
+                "grants_issued": len(grants),
+                "grants_total": sum(t.amount for t in grants)}
+
+    def _persist_vault(self):
+        if self.store.enabled:
+            self.store.kv_set("vault_minted_total", self._vault_minted_total)
+            self.store.kv_set("vault_disbursed_day", self._vault_disbursed_day)
 
     def create_agent(self, agent):
         if agent.id in self.agents:
@@ -177,11 +264,15 @@ class Dail:
         if (agent.name or "").strip().lower() in RESERVED_NAMES:
             raise ValueError("name is reserved")
         self.agents[agent.id] = agent
-        # The starter grant goes through the ledger (not a direct dict write)
-        # so it is part of the persisted transaction log and survives restarts.
+        # The starter grant is drawn from the petty-cash vault (the single
+        # authorized source of new DAIL) — never minted ad hoc. If the vault
+        # cannot cover it, registration fails safe and an admin must mint.
         if agent.balance > 0:
-            self.ledger.credit(agent.id, agent.balance, kind="grant",
-                               idem=f"grant:{agent.id}")
+            if self.ledger.balances.get(VAULT_ACCOUNT, 0) < agent.balance:
+                del self.agents[agent.id]
+                raise LedgerError("vault_empty: petty cash exhausted, admin must mint")
+            self.ledger.transfer(VAULT_ACCOUNT, agent.id, agent.balance,
+                                 kind="grant", idem=f"grant:{agent.id}")
         agent.balance = self.ledger.balances[agent.id]
         self.audit.append("agent.created", agent.model_dump())
         self.social.register(agent)

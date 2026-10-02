@@ -29,6 +29,7 @@ from .models import (
     SuggestionSubmitRequest, SuggestionReviewRequest, BountyRequestReviewRequest,
     BountyCreateRequest, BountyClaimRequest, BountyActionRequest,
     BanRequest, TreasuryLoanDisburseRequest, TreasuryLoanRepayRequest,
+    VaultMintRequest, VaultDisburseRequest,
 )
 from .service import Dail
 from .runtime import AgentRuntime
@@ -75,6 +76,7 @@ _PUBLIC_GET = {
     "/audit/verify", "/observatory",
     "/observatory/public", "/observatory/public/data",
     "/bring-your-agent", "/request-bounty", "/status", "/status/data",
+    "/vault/status",
 }
 _PUBLIC_GET_PREFIXES = ("/world/profile/", "/passport/", "/receipts/")  # public reads
 # Handlers that carry their own auth (Stripe signature / withdrawal capability):
@@ -876,6 +878,12 @@ def create_agent(agent: AgentCreateRequest, request: Request):
         return resp
     except ValueError as e:
         raise HTTPException(409, str(e))
+    except LedgerError as e:
+        # Vault empty: the world is out of petty cash. Fail safe (no ad-hoc
+        # minting, ever) and tell the human exactly what to do.
+        if "vault_empty" in str(e):
+            raise HTTPException(503, "vault_empty: no petty cash left — admin must mint via POST /admin/vault/mint")
+        raise HTTPException(400, str(e))
 
 @app.post("/deposits")
 def deposit(req: DepositRequest, request: Request):
@@ -1156,6 +1164,41 @@ def admin_treasury_loans_list(request: Request):
     """List all treasury loans and the total receivable. Admin-only."""
     _require_admin(request)
     return dail.world_agents.treasury_loans_list()
+
+
+@app.post("/admin/vault/mint", status_code=201)
+def admin_vault_mint(req: VaultMintRequest, request: Request):
+    """Create new DAIL into the petty-cash vault. Admin-only. Enforces the
+    hard supply cap — the ONLY authorized mint in the system."""
+    _require_admin(request)
+    try:
+        tx = dail.vault_mint(req.amount, req.reason, req.idempotency_key)
+        return {"tx": tx.id, "vault": dail.vault_status()}
+    except LedgerError as e:
+        raise HTTPException(400, str(e))
+
+
+@app.post("/vault/disburse", status_code=201)
+def vault_disburse(req: VaultDisburseRequest, request: Request):
+    """Staff draw from the vault (welcomes, bounty funding, top-ups).
+    Caller must be dail_host or dail_manager (Bearer). Daily caps apply."""
+    caller = _try_identity(request)
+    if caller not in ("dail_host", "dail_manager") and not request.state.is_admin:
+        raise HTTPException(403, "vault_disburse_forbidden")
+    try:
+        tx = dail.vault_disburse(caller if caller in ("dail_host", "dail_manager") else "dail_manager",
+                                 req.agent_id, req.amount, req.purpose, req.idempotency_key)
+        return {"tx": tx.id, "vault": dail.vault_status()}
+    except KeyError as e:
+        raise HTTPException(404, str(e))
+    except LedgerError as e:
+        raise HTTPException(400, str(e))
+
+
+@app.get("/vault/status")
+def vault_status():
+    """Public read-only vault status: balance, minted, cap. Real numbers."""
+    return dail.vault_status()
 
 @app.get("/admin/payments/incoming")
 def admin_payments_incoming(request: Request):
