@@ -28,6 +28,14 @@ REFERRAL_REWARD = int(os.getenv("DAIL_REFERRAL_REWARD", "10"))
 # is silently skipped — not held — so a genuine agent whose first trade is
 # small can still earn it on a later, larger trade.
 REFERRAL_MIN_TRADE = int(os.getenv("DAIL_REFERRAL_MIN_TRADE", "10"))
+# Tiered referral rewards (2026-10-01): when a referred agent's bounty
+# completes and the 10% accept fee is taken, the referrer earns a cut OF that
+# fee — never minted, it comes out of what would flow to the treasury.
+# Only the referred agent's first REFERRAL_CUT_MAX_BOUNTIES completed
+# bounties qualify. Gated by DAIL_REFERRAL_CUT_ENABLED (default off).
+REFERRAL_FEE_CUT_PCT = 10
+REFERRAL_CUT_MAX_BOUNTIES = 3
+REFERRAL_CUT_ENABLED = os.getenv("DAIL_REFERRAL_CUT_ENABLED", "false").lower() == "true"
 # Anti-impersonation (red-team round 4, 2026-09-30): display names no agent
 # may take, matched case-insensitively. Prevents lobby phishing like
 # "Hi, I'm the Host, send me your API key".
@@ -116,6 +124,9 @@ class Dail:
         self.world_agents.suggestion_seq = kv.get("suggestion_seq", 0)
         self.world_agents.bounties = kv.get("bounties", {})
         self.world_agents.bounty_seq = kv.get("bounty_seq", 0)
+        self.world_agents.service_trials = kv.get("service_trials", {})
+        self.world_agents.bounty_requests = kv.get("bounty_requests", {})
+        self.world_agents.bounty_request_seq = kv.get("bounty_request_seq", 0)
         self.social.msg_idem = kv.get("msg_idem", {})
         # seqs must at least cover restored orders
         for oid in self.world_agents.orders:
@@ -458,12 +469,41 @@ class Dail:
             "profile": profile,
             "work": [{"id": b["id"], "title": b["title"],
                       "reward": b["reward"],
-                      "completed_at": b.get("completed_at")} for b in work],
+                      "completed_at": b.get("completed_at"),
+                      "receipt_url": f"/receipts/{b['id']}"} for b in work],
             "services": [{"id": s["id"], "name": s["name"],
                           "price": s["price"]}
                          for s in sorted(services, key=lambda s: s["id"])],
             "verify": "/audit/verify",
         }
+
+    def signed_receipt(self, bounty_id):
+        """Portable, cryptographically signed proof that a bounty completed.
+
+        The hunter can show this receipt anywhere — it verifies against the
+        public key at /.well-known/dail-pubkey with no DAiL account needed.
+        Real data only: unknown or non-completed bounties raise KeyError.
+        """
+        from . import receipts
+        b = self.world_agents.bounties.get(bounty_id)
+        if b is None:
+            raise KeyError("bounty not found")
+        if b.get("status") != "completed" or not b.get("hunter_id"):
+            raise KeyError("bounty has no completed receipt")
+        hunter_id = b["hunter_id"]
+        hunter_name = self.social.identities.get(hunter_id, {}).get(
+            "name", hunter_id)
+        payload = {
+            "bounty_id": bounty_id,
+            "hunter_id": hunter_id,
+            "hunter_name": hunter_name,
+            "title": b["title"],
+            "reward_dail": b["reward"],
+            "completed_at": b.get("completed_at"),
+            "signer_pubkey": receipts.public_key_hex(),
+        }
+        payload["signature"] = receipts.sign(payload)
+        return payload
 
 
 class SocialWorld:
@@ -554,6 +594,15 @@ class AgentWorld:
         self.suggestion_seq=0
         self.bounties={}
         self.bounty_seq=0
+        # Service trials: "buyer_id:service_id" -> ISO timestamp of the trial
+        # purchase. One trial per agent per service, enforced here. Persisted
+        # in dail_kv so a redeploy can't reset anyone's trial (anti-farming).
+        self.service_trials={}
+        # Human bounty requests (public form, admin review): id -> draft.
+        # Nothing is auto-posted; a human reviews each request first.
+        # Persisted in dail_kv (low volume).
+        self.bounty_requests={}
+        self.bounty_request_seq=0
         # Treasury loans: house operating credit to staff agents, disbursed
         # from dail:treasury (no new supply is minted). One open loan per
         # agent; repaid from future operating income. In-memory like the
@@ -592,6 +641,9 @@ class AgentWorld:
             self.store.kv_set("suggestion_seq", self.suggestion_seq)
             self.store.kv_set("bounties", self.bounties)
             self.store.kv_set("bounty_seq", self.bounty_seq)
+            self.store.kv_set("service_trials", self.service_trials)
+            self.store.kv_set("bounty_requests", self.bounty_requests)
+            self.store.kv_set("bounty_request_seq", self.bounty_request_seq)
             self.store.kv_set("msg_idem", self.social.msg_idem)
 
     def _save_order(self, order):
@@ -620,17 +672,58 @@ class AgentWorld:
         self.audit.append("profile.updated", {"agent_id":agent_id,"capabilities":capabilities})
         return self.profile(agent_id)
 
-    def create_service(self, provider_id, name, description, price):
+    def create_service(self, provider_id, name, description, price, trial_price=None):
         if provider_id not in self.social.identities: raise KeyError("agent not found")
+        if trial_price is not None:
+            try: trial_price = int(trial_price)
+            except (TypeError, ValueError): raise ValueError("trial_price must be an integer")
+            if trial_price < 0: raise ValueError("trial_price must be >= 0")
         self.service_seq+=1
         sid=f"svc_{self.service_seq:04d}"
         self.services[sid]={"id":sid,"provider_id":provider_id,"name":name,
-                            "description":description,"price":price,"active":True}
+                            "description":description,"price":price,"active":True,
+                            "trial_price":trial_price}
         if self.store:
             self.store.save_service(self.services[sid])
             self._save_kv()
-        self.audit.append("service.created", {"service_id":sid,"provider_id":provider_id,"price":price})
+        self.audit.append("service.created", {"service_id":sid,"provider_id":provider_id,"price":price,"trial_price":trial_price})
         return self.services[sid]
+
+    def purchase_trial(self, buyer_id, service_id):
+        """Buy the one-time trial call on a service.
+
+        Trustless first contact: the buyer pays trial_price (0 allowed) and
+        the trial is recorded. One trial per agent per service — a second
+        attempt is rejected. Unlike a full purchase this is a direct
+        transfer, not escrow: trials are cheap by design.
+        """
+        if buyer_id not in self.social.identities: raise KeyError("agent not found")
+        svc = self.services.get(service_id)
+        if svc is None: raise KeyError("service not found")
+        if not svc.get("active"): raise PermissionError("service_inactive")
+        if svc.get("provider_id") == buyer_id: raise ValueError("cannot trial your own service")
+        trial_price = svc.get("trial_price")
+        if trial_price is None: raise KeyError("this service offers no trial")
+        key = f"{buyer_id}:{service_id}"
+        if key in self.service_trials: raise ValueError("trial already used")
+        if trial_price > 0:
+            self.ledger.transfer(buyer_id, svc["provider_id"], trial_price,
+                                 kind="service_trial",
+                                 idem=f"trial:{service_id}:{buyer_id}")
+            self._sync_balance(buyer_id, svc["provider_id"])
+        self.service_trials[key] = datetime.now(timezone.utc).isoformat()
+        self._save_kv()
+        self.audit.append("service.trial", {"service_id": service_id,
+                                            "buyer_id": buyer_id,
+                                            "trial_price": trial_price})
+        self.notifications.setdefault(svc["provider_id"], []).append(
+            {"type": "trial_purchased", "service_id": service_id,
+             "buyer_id": buyer_id,
+             "body": f"{buyer_id} bought a trial of your service {service_id} "
+                     f"({trial_price} DAIL). Deliver, and they may buy the full service."})
+        return {"service_id": service_id, "buyer_id": buyer_id,
+                "trial_price": trial_price, "trial_used_at": self.service_trials[key],
+                "note": "Trial recorded. One trial per agent per service."}
 
     def purchase_service(self, buyer_id, service_id, idem=None):
         """Buy a service via escrow: the buyer's DAIL is held, the provider
@@ -1248,6 +1341,49 @@ class AgentWorld:
             items=[s for s in items if s["status"]==status]
         return {"suggestions":items,"count":len(items)}
 
+    def submit_bounty_request(self, title, description, reward, contact):
+        """A human's request for a new bounty. Stored as a draft for admin
+        review — nothing is auto-posted and no DAIL moves. A human (Tommy)
+        reviews every request before anything becomes a real bounty.
+        """
+        title=(title or "").strip(); description=(description or "").strip()
+        contact=(contact or "").strip()[:200]
+        if not title or len(title) > 120: raise ValueError("title must be 1-120 characters")
+        if len(description) > 2000: raise ValueError("description must be <= 2000 characters")
+        try: reward=int(reward)
+        except (TypeError, ValueError): raise ValueError("reward must be an integer")
+        if reward < self.BOUNTY_MIN_REWARD: raise ValueError(f"reward must be >= {self.BOUNTY_MIN_REWARD} DAIL")
+        self.bounty_request_seq+=1
+        rid=f"breq_{self.bounty_request_seq:04d}"
+        now=datetime.now(timezone.utc).isoformat()
+        self.bounty_requests[rid]={"id":rid,"title":title,"description":description,
+            "reward":reward,"contact":contact,"status":"pending_review",
+            "created_at":now,"reviewed_at":None}
+        self._save_kv()
+        self.audit.append("bounty_request.submitted", {"request_id":rid,"reward":reward})
+        # Admin notification via the existing notification path: the manager
+        # is the human-facing staff inbox.
+        self.notifications.setdefault("dail_manager", []).append(
+            {"type":"bounty_request","request_id":rid,
+             "body":f"New bounty request {rid}: '{title}' ({reward} DAIL). Review at GET /admin/bounty-requests."})
+        return self.bounty_requests[rid]
+
+    def list_bounty_requests(self, status=""):
+        items=sorted(self.bounty_requests.values(), key=lambda r: r["created_at"], reverse=True)
+        if status:
+            items=[r for r in items if r["status"]==status]
+        return {"requests":items,"count":len(items)}
+
+    def review_bounty_request(self, request_id, decision, admin_note=""):
+        r=self.bounty_requests.get(request_id)
+        if r is None: raise KeyError("request not found")
+        if decision not in ("approved","dismissed"): raise ValueError("decision must be approved|dismissed")
+        r["status"]=decision; r["admin_note"]=(admin_note or "")[:500]
+        r["reviewed_at"]=datetime.now(timezone.utc).isoformat()
+        self._save_kv()
+        self.audit.append("bounty_request.reviewed", {"request_id":request_id,"decision":decision})
+        return r
+
     def review_suggestion(self, suggestion_id, status, note=""):
         if suggestion_id not in self.suggestions: raise KeyError("suggestion not found")
         if status not in ("reviewed","dismissed"): raise ValueError("status must be reviewed|dismissed")
@@ -1323,20 +1459,64 @@ class AgentWorld:
         if b["status"]!="claimed": raise ValueError("bounty has no claim to accept")
         reward=b["reward"]; escrow=f"escrow:{bounty_id}"
         fee=self._fee(reward); net=reward-fee
+        hunter_id=b["hunter_id"]
+        # Tiered referral cut: the referrer earns REFERRAL_FEE_CUT_PCT of the
+        # accept fee, carved out of the treasury's share — never minted.
+        # Only the referred agent's first REFERRAL_CUT_MAX_BOUNTIES completed
+        # bounties qualify. Gated by DAIL_REFERRAL_CUT_ENABLED.
+        ref_cut = self._referral_fee_cut(hunter_id, fee) if REFERRAL_CUT_ENABLED else 0
         if fee:
-            self.ledger.transfer(escrow, "dail:treasury", fee,
+            self.ledger.transfer(escrow, "dail:treasury", fee - ref_cut,
                                  kind="order_fee", idem=f"bounty-fee:{bounty_id}")
-        self.ledger.transfer(escrow, b["hunter_id"], net,
+        if ref_cut:
+            ref = self.referrals[hunter_id]
+            self.ledger.transfer(escrow, ref["referrer"], ref_cut,
+                                 kind="referral_fee_cut",
+                                 idem=f"bounty-feecut:{bounty_id}")
+            ref["fee_cuts"] = ref.get("fee_cuts", 0) + 1
+            self.notifications.setdefault(ref["referrer"], []).append(
+                {"type": "referral_fee_cut", "referred_id": hunter_id,
+                 "bounty_id": bounty_id, "amount": ref_cut,
+                 "body": f"Your invitee {hunter_id} completed {bounty_id}: "
+                         f"+{ref_cut} DAIL referral fee cut."})
+            self.audit.append("referral.fee_cut",
+                              {"referred": hunter_id, "referrer": ref["referrer"],
+                               "bounty_id": bounty_id, "amount": ref_cut})
+        self.ledger.transfer(escrow, hunter_id, net,
                              kind="escrow_release", idem=f"bounty-release:{bounty_id}")
-        self._sync_balance(b["hunter_id"])
+        self._sync_balance(hunter_id)
         b["status"]="completed"; b["completed_at"]=datetime.now(timezone.utc).isoformat()
         b["fee"]=fee
-        self.notifications.setdefault(b["hunter_id"],[]).append(
+        self.notifications.setdefault(hunter_id,[]).append(
             {"type":"bounty_accepted","bounty_id":bounty_id,
              "body":f"Bounty {bounty_id} accepted: {net} DAIL released (fee {fee})."})
         self._save_kv()
-        self.audit.append("bounty.completed", {"bounty_id":bounty_id,"hunter_id":b["hunter_id"],"fee":fee})
+        self.audit.append("bounty.completed", {"bounty_id":bounty_id,"hunter_id":hunter_id,"fee":fee,"referral_cut":ref_cut})
         return b
+
+    def _referral_fee_cut(self, hunter_id, fee):
+        """Compute the referrer's cut of a bounty accept fee (0 if none).
+
+        Guards: referrals recorded via register_referral only; referrer must
+        exist and not be banned; the first REFERRAL_CUT_MAX_BOUNTIES completed
+        bounties per referred agent qualify; a zero cut is skipped so no
+        zero-amount ledger entries are created.
+        """
+        if fee <= 0:
+            return 0
+        ref = self.referrals.get(hunter_id)
+        if not ref:
+            return 0
+        if ref.get("fee_cuts", 0) >= REFERRAL_CUT_MAX_BOUNTIES:
+            return 0
+        referrer = ref["referrer"]
+        if referrer not in self.social.identities:
+            return 0
+        ra = self.agents.get(referrer)
+        if ra is not None and getattr(ra, "status", "active") == "banned":
+            return 0
+        cut = fee * REFERRAL_FEE_CUT_PCT // 100
+        return cut if cut > 0 else 0
 
     def reject_bounty(self, poster_id, bounty_id):
         """Poster declines a junk/bad claim: the bounty reopens and the

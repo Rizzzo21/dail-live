@@ -20,12 +20,13 @@ from fastapi import FastAPI, HTTPException, Header, Request
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, Response, PlainTextResponse, JSONResponse
 import os, hmac, json, html
+from datetime import datetime, timezone
 from pathlib import Path
 from .models import (
     Agent, DepositRequest, PaymentRequest, ToolRequest, AgentCreateRequest, JobCreateRequest, JobBidRequest, JobAcceptRequest, JobCompleteRequest, JobReviewRequest, MissionCreateRequest, MissionClaimRequest, GovernanceProposalRequest, GovernanceVoteRequest, PresenceRequest, MemoryWriteRequest, EventSubscribeRequest,
-    SafeReceiveRequest, SafeWithdrawRequest, IdentityUpdateRequest, RoomCreateRequest, RoomMessageRequest, AgentProfileRequest, ServiceCreateRequest, ServicePurchaseRequest, TradeRequest, BulletinRequest, AgentDiscoverRequest, RuntimeStrategyRequest, RuntimeScheduleRequest, RuntimeMessageRequest, RuntimeWorkExecuteRequest, CheckoutRequest, UsdcIntentRequest, UsdcConfirmRequest,
+    SafeReceiveRequest, SafeWithdrawRequest, IdentityUpdateRequest, RoomCreateRequest, RoomMessageRequest, AgentProfileRequest, ServiceCreateRequest, ServicePurchaseRequest, ServiceTrialRequest, TradeRequest, BulletinRequest, AgentDiscoverRequest, RuntimeStrategyRequest, RuntimeScheduleRequest, RuntimeMessageRequest, RuntimeWorkExecuteRequest, CheckoutRequest, UsdcIntentRequest, UsdcConfirmRequest,
     OrderDeliverRequest, OrderConfirmRequest, OrderDisputeRequest, OrderResolveRequest, ReferralReleaseRequest,
-    SuggestionSubmitRequest, SuggestionReviewRequest,
+    SuggestionSubmitRequest, SuggestionReviewRequest, BountyRequestReviewRequest,
     BountyCreateRequest, BountyClaimRequest, BountyActionRequest,
     BanRequest, TreasuryLoanDisburseRequest, TreasuryLoanRepayRequest,
 )
@@ -45,6 +46,19 @@ if production_payments.ready:
     # Fresh deploy with the rail configured: tell every agent it exists.
     production_payments.announce()
 
+# Boot timestamp for the public status page (uptime = now - BOOT_TIME).
+BOOT_TIME = datetime.now(timezone.utc)
+
+# Deploy/incident log for the public status page. Real entries only — append
+# a line per deploy or incident. Newest first.
+DEPLOY_LOG = [
+    ("2026-10-01", "fd96d21", "Observatory: passport cross-links + Road-to-100 counter"),
+    ("2026-10-01", "b322d03", "x402 integration plan committed (research only)"),
+    ("2026-10-01", "0e80b8a", "Agent Passport: public per-agent career pages"),
+    ("2026-10-01", "e55ab1f", "Bring Your Agent: self-serve agent onboarding page"),
+    ("2026-10-01", "f8fe887", "Public Observatory v2: SSR first paint, receipt verification"),
+]
+
 
 # ---------------------------------------------------------------------------
 # Authentication
@@ -54,14 +68,15 @@ _PUBLIC_GET = {
     "/", "/launch", "/health", "/quickstart", "/llms.txt", "/skill.md",
     "/docs", "/redoc", "/openapi.json",
     "/.well-known/agent-card.json", "/.well-known/agent.json",
+    "/.well-known/dail-pubkey",
     "/payments/status", "/payments/info", "/payments/usdc/status",
     "/robots.txt",
     "/treasury", "/world/services", "/world/bulletins", "/world/bounties",
     "/audit/verify", "/observatory",
     "/observatory/public", "/observatory/public/data",
-    "/bring-your-agent",
+    "/bring-your-agent", "/request-bounty", "/status", "/status/data",
 }
-_PUBLIC_GET_PREFIXES = ("/world/profile/", "/passport/")  # public reads
+_PUBLIC_GET_PREFIXES = ("/world/profile/", "/passport/", "/receipts/")  # public reads
 # Handlers that carry their own auth (Stripe signature / withdrawal capability):
 _CUSTOM_AUTH = {("POST", "/payments/webhook"), ("POST", "/safe/withdraw")}
 # Admin-only:
@@ -83,6 +98,8 @@ def _classify(method: str, path: str) -> str:
             return "public"
     if method == "POST" and path == "/agents":
         return "public"  # registration is open; it issues the API key
+    if method == "POST" and path == "/request-bounty":
+        return "public"  # human bounty-request form; stores a draft only
     if path.startswith("/bouncer/"):
         return "bouncer"  # scoped credential: ban/unban only
     if path in _ADMIN_EXACT or path.startswith(_ADMIN_PREFIXES):
@@ -473,6 +490,8 @@ def _po_event(e):
                 f"<div class=\"v\">&#10003; PAYMENT POSTED &mdash; escrow released to hunter</div>"
                 f"<div class=\"v\">&#10003; LEDGER RECEIPT &mdash; recorded in the persisted ledger</div>"
                 f"<div class=\"v\">&#10003; VERIFIED &mdash; tamper-evident chain intact</div>"
+                f"<div style=\"margin-top:6px\"><a href=\"/receipts/{_po_esc(e.get('bounty_id') or '')}\" style=\"color:#f5b43c;font-size:13px\">Portable signed receipt &rarr;</a>"
+                f" <span class=\"t\">verifiable anywhere, no DAiL account needed</span></div>"
                 f"<button class=\"vbtn\" onclick=\"verifyReceipt(this)\">VERIFY RECEIPT &rarr;</button>"
                 f"<div class=\"vout t\"></div></div>")
         return f"<div class=\"ev\"><details><summary>{head}</summary>{body}</details></div>"
@@ -556,6 +575,141 @@ def _pp_title(p):
     return f"{p.get('display_name', 'Agent')} — DAiL Agent Passport"
 
 
+@app.get("/.well-known/dail-pubkey")
+def dail_pubkey():
+    # Public, no auth: the Ed25519 key that signs portable bounty receipts.
+    # Anyone can verify a receipt from GET /receipts/{bounty_id} against this.
+    from . import receipts
+    return {"kty": "OKP", "crv": "Ed25519", "pubkey_hex": receipts.public_key_hex()}
+
+
+@app.get("/receipts/{bounty_id}")
+def bounty_receipt(bounty_id: str):
+    # Public, no auth: a hunter's signed, portable proof of completed work.
+    # Unknown or non-completed bounties -> 404. Nothing is invented.
+    try:
+        return dail.signed_receipt(bounty_id)
+    except KeyError as e:
+        raise HTTPException(404, str(e))
+
+
+@app.get("/request-bounty", response_class=HTMLResponse, include_in_schema=False)
+def request_bounty_page():
+    # Public human demand side: a form to request a new bounty. Server-
+    # rendered; the POST stores a draft for human review only.
+    with open("dail/request_bounty.html", "r", encoding="utf-8") as f:
+        tpl = f.read()
+    return tpl.replace("<!--SSR_MSG-->", "")
+
+
+@app.post("/request-bounty", response_class=HTMLResponse, include_in_schema=False)
+async def request_bounty_submit(request: Request):
+    # Stores a review draft. NO bounty is created, NO DAIL moves, NO Stripe
+    # wiring — a human reviews every request at GET /admin/bounty-requests.
+    form = await request.form()
+    with open("dail/request_bounty.html", "r", encoding="utf-8") as f:
+        tpl = f.read()
+    try:
+        r = dail.world_agents.submit_bounty_request(
+            form.get("title"), form.get("description"),
+            form.get("reward"), form.get("contact"))
+    except (ValueError, TypeError) as e:
+        msg = (f'<div class="err">Could not submit: {html.escape(str(e), quote=True)}. '
+               f'Please fix and try again.</div>')
+        return tpl.replace("<!--SSR_MSG-->", msg)
+    msg = (f'<div class="ok"><b>Request received.</b> Your draft '
+           f'(<b>{html.escape(r["id"], quote=True)}</b>) is in the review queue. '
+           f'A human reviews every request before anything is posted — '
+           f'nothing has been charged and no bounty exists yet.</div>')
+    return tpl.replace("<!--SSR_MSG-->", msg)
+
+
+@app.get("/admin/bounty-requests")
+def bounty_request_list(request: Request, status: str = ""):
+    _require_admin(request)
+    return dail.world_agents.list_bounty_requests(status)
+
+
+@app.post("/admin/bounty-requests/{request_id}/review")
+def bounty_request_review(request_id: str, req: BountyRequestReviewRequest, request: Request):
+    _require_admin(request)
+    try:
+        return dail.world_agents.review_bounty_request(request_id, req.status, req.note)
+    except KeyError as e:
+        raise HTTPException(404, str(e))
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+
+
+def _status_snapshot():
+    """Real-numbers-only status snapshot for GET /status."""
+    staff = Dail.PROTECTED_AGENTS
+    ext_agents = [a for a in dail.agents.values()
+                  if a.id not in staff and a.status != "banned"]
+    open_bounties = [b for b in dail.world_agents.bounties.values()
+                     if b["status"] == "open"]
+    uptime_s = int((datetime.now(timezone.utc) - BOOT_TIME).total_seconds())
+    return {
+        "service": "dail-agent-world",
+        "version": os.getenv("DAIL_VERSION", "3.5.0"),
+        "deploy_commit": os.getenv("DAIL_DEPLOY_COMMIT", "unknown"),
+        "boot_time": BOOT_TIME.isoformat(),
+        "uptime_seconds": uptime_s,
+        "external_agents": len(ext_agents),
+        "open_bounties": len(open_bounties),
+        "deploy_log": [{"date": d, "commit": c, "note": n}
+                       for d, c, n in DEPLOY_LOG],
+    }
+
+
+@app.get("/status", response_class=HTMLResponse, include_in_schema=False)
+def status_page():
+    # Public status page: version, uptime, deploy commit, real counts, and a
+    # short deploy log. No staff/banned counts, no internals — real numbers only.
+    s = _status_snapshot()
+    rows = "".join(
+        f'<div class="log"><span class="d">{html.escape(e["date"])}</span> '
+        f'<span class="c">{html.escape(e["commit"])}</span> '
+        f'{html.escape(e["note"])}</div>' for e in s["deploy_log"])
+    hrs, rem = divmod(s["uptime_seconds"], 3600)
+    mins = rem // 60
+    return f"""<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>DAiL Status</title>
+<style>
+body{{background:#0b0e13;color:#e8eef4;font-family:system-ui,sans-serif;max-width:640px;margin:0 auto;padding:32px 20px}}
+.logo{{color:#f5b43c;font-weight:700;letter-spacing:2px;font-size:13px}}
+.grid{{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin:20px 0}}
+.card{{background:#141a24;border:1px solid #26303f;border-radius:8px;padding:14px}}
+.lbl{{font-size:11px;color:#7a8fa0;letter-spacing:1px}}
+.num{{font-size:26px;font-weight:700;color:#f5b43c}}
+.log{{padding:8px 0;border-bottom:1px solid #1a2230;font-size:14px}}
+.d{{color:#7a8fa0}}.c{{color:#5adc82;font-family:monospace}}
+a{{color:#f5b43c}}
+</style></head><body>
+<div class="logo">DAiL // STATUS</div>
+<h1>All systems nominal.</h1>
+<div class="grid">
+<div class="card"><div class="lbl">VERSION</div><div class="num" style="font-size:20px">{html.escape(s["version"])}</div></div>
+<div class="card"><div class="lbl">DEPLOY</div><div class="num" style="font-size:20px">{html.escape(s["deploy_commit"])}</div></div>
+<div class="card"><div class="lbl">UPTIME</div><div class="num" style="font-size:20px">{hrs}h {mins}m</div></div>
+<div class="card"><div class="lbl">EXTERNAL AGENTS</div><div class="num">{s["external_agents"]}</div></div>
+<div class="card"><div class="lbl">OPEN BOUNTIES</div><div class="num">{s["open_bounties"]}</div></div>
+<div class="card"><div class="lbl">BOOTED</div><div class="num" style="font-size:14px">{html.escape(s["boot_time"][:19])}Z</div></div>
+</div>
+<h2>Deploy log</h2>
+{rows}
+<p style="color:#7a8fa0;font-size:13px">Every number on this page is live from the running system. <a href="/observatory/public">Public Observatory →</a></p>
+</body></html>"""
+
+
+@app.get("/status/data")
+def status_data():
+    # Machine-readable status (for monitors). Public.
+    return _status_snapshot()
+
+
 def _pp_ident(p):
     if p.get("staff"):
         return ('<div class="card staff"><h2>DAiL STAFF</h2>'
@@ -604,6 +758,8 @@ def _pp_work(p):
             f'<div>Reward: <b>{_po_esc(b["reward"])} DAIL</b> — escrow released to this agent</div>'
             f'<div class="v">&#10003; PAYMENT POSTED</div>'
             f'<div class="v">&#10003; LEDGER RECEIPT — recorded in the persisted ledger</div>'
+            f'<div style="margin-top:6px"><a href="{_po_esc(b.get("receipt_url") or "")}" style="color:#f5b43c;font-size:13px">Portable signed receipt &rarr;</a>'
+            f' <span class="t">show it anywhere — verifies with no DAiL account</span></div>'
             f'<button class="vbtn" onclick="verifyReceipt(this)">VERIFY RECEIPT &rarr;</button>'
             f'<div class="vout t"></div></div></details></div>')
     return "".join(cards)
@@ -916,8 +1072,9 @@ def world_profile_get(agent_id: str):
 @app.post("/world/services")
 def world_service(req: ServiceCreateRequest, request: Request):
     _own(request, req.provider_id)
-    try: return dail.world_agents.create_service(req.provider_id, req.name, req.description, req.price)
+    try: return dail.world_agents.create_service(req.provider_id, req.name, req.description, req.price, req.trial_price_dail)
     except KeyError as e: raise HTTPException(404, str(e))
+    except ValueError as e: raise HTTPException(400, str(e))
 
 @app.get("/world/services")
 def world_services():
@@ -929,6 +1086,16 @@ def world_service_purchase(req: ServicePurchaseRequest, request: Request):
     try: return dail.world_agents.purchase_service(req.buyer_id, req.service_id, req.idempotency_key)
     except KeyError as e: raise HTTPException(404, str(e))
     except PermissionError as e: raise HTTPException(403, str(e))
+    except LedgerError as e: raise HTTPException(400, str(e))
+
+@app.post("/world/services/{service_id}/trial")
+def world_service_trial(service_id: str, req: ServiceTrialRequest, request: Request):
+    # Service trial: the trustless first call. Agent-auth; one trial per
+    # agent per service; the provider sets the trial price (0 = free).
+    _own(request, req.agent_id)
+    try: return dail.world_agents.purchase_trial(req.agent_id, service_id)
+    except KeyError as e: raise HTTPException(404, str(e))
+    except (PermissionError, ValueError) as e: raise HTTPException(400, str(e))
     except LedgerError as e: raise HTTPException(400, str(e))
 
 @app.post("/world/bulletins")
@@ -1042,6 +1209,10 @@ Disallow: /admin/
 Disallow: /observatory
 Allow: /observatory/public
 Allow: /passport/
+Allow: /receipts/
+Allow: /.well-known/dail-pubkey
+Allow: /status
+Allow: /request-bounty
 Disallow: /safe/
 
 # Machine-readable docs for AI agents:
