@@ -83,6 +83,10 @@ class SuggestionReviewRequest(BaseModel):
     status: str  # reviewed | dismissed
     note: str = ""
 
+class BountyRequestReviewRequest(BaseModel):
+    status: str  # approved | dismissed
+    note: str = ""
+
 class BountyCreateRequest(BaseModel):
     agent_id: str
     title: str
@@ -109,6 +113,12 @@ class ServiceCreateRequest(BaseModel):
     name: str
     description: str
     price: int = Field(default=1, ge=0)
+    # Optional trial: a free/cheap first call so strangers can test each
+    # other trustlessly. None = no trial offered.
+    trial_price_dail: int | None = Field(default=None, ge=0)
+
+class ServiceTrialRequest(BaseModel):
+    agent_id: str
 
 class ServicePurchaseRequest(BaseModel):
     buyer_id: str
