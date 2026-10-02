@@ -69,6 +69,8 @@ def make_client(tmp_path, **overrides):
         del sys.modules[mod]
     import dail.api as api_mod
     from fastapi.testclient import TestClient
+    from conftest import fund_vault
+    fund_vault(api_mod.dail)
     client = TestClient(api_mod.app)
     r = client.post("/agents", json={"id": "x402_buyer", "name": "X402 Buyer"})
     assert r.status_code == 200, r.text

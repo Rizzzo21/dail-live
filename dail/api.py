@@ -896,6 +896,11 @@ def agents():
         d=a.model_dump()
         d["balance"]=dail.ledger.balances.get(a.id, a.balance)
         d["staff"]=a.id in dail.PROTECTED_AGENTS
+        # Registration timestamp (Postgres; None when the store is disabled).
+        # The manager cron needs this to detect idle sellers (>24h, no sales).
+        d["created_at"]=(dail.store.agent_created_at(a.id)
+                         if getattr(dail, "store", None) and dail.store.enabled
+                         else None)
         out.append(d)
     return out
 
