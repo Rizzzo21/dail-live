@@ -10,6 +10,7 @@ from pathlib import Path
 os.environ["DAIL_ADMIN_KEY"] = "test-admin-key"
 os.environ["DAIL_TRADE_FEE_BPS"] = "1000"
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from conftest import fund_vault
 
 
 def test_service_and_bulletin_survive_restart(tmp_path):
@@ -21,6 +22,7 @@ def test_service_and_bulletin_survive_restart(tmp_path):
     os.environ["DATABASE_URL"] = db_url
     try:
         d1 = Dail()
+        fund_vault(d1)
         _, raw_key = d1.create_agent(Agent(id="m1", name="m1", goal="test", balance=100))
         assert raw_key.startswith("dail_sk_")
         assert d1.keystore.verify(raw_key) == "m1"

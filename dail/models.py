@@ -288,6 +288,19 @@ class TreasuryLoanDisburseRequest(BaseModel):
     memo: str = ""
     idempotency_key: str | None = None
 
+
+class VaultMintRequest(BaseModel):
+    amount: int = Field(gt=0)
+    reason: str = ""
+    idempotency_key: str | None = None
+
+
+class VaultDisburseRequest(BaseModel):
+    agent_id: str
+    amount: int = Field(gt=0)
+    purpose: str = ""
+    idempotency_key: str | None = None
+
 class TreasuryLoanRepayRequest(BaseModel):
     amount: int = Field(gt=0)
     idempotency_key: str | None = None

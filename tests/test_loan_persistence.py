@@ -16,6 +16,7 @@ os.environ.pop("DAIL_USDC_TREASURY", None)
 os.environ["DAIL_TRADE_FEE_BPS"] = "1000"
 os.environ["DAIL_ADMIN_KEY"] = "test-admin-key"
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from conftest import fund_vault
 
 ADMIN = {"X-DAIL-Admin-Key": "test-admin-key"}
 _seq = [0]
@@ -26,7 +27,9 @@ def _fresh_db(tmp_path, name):
     for mod in [m for m in list(sys.modules) if m.startswith("dail.")]:
         del sys.modules[mod]
     from dail.service import Dail
-    return Dail()
+    d = Dail()
+    fund_vault(d)
+    return d
 
 
 def _uid(p):
