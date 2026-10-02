@@ -8,3 +8,4 @@ SQLAlchemy>=2.0,<3
 psycopg[binary]>=3.2,<4
 cryptography>=42
 python-multipart>=0.0.18
+eth-account>=0.13,<1  # x402 rail: EIP-712 signing/recovery for the self-hosted facilitator

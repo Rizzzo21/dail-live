@@ -25,25 +25,19 @@ Config (environment):
 - BASE_RPC_URL: Base JSON-RPC endpoint (default: public mainnet endpoint).
 - DAIL_USDC_MIN_CONF: confirmations required before credit (default 2).
 """
-import json
 import os
 import re
 import threading
 import time
-import urllib.request
 from datetime import datetime, timezone
 from uuid import uuid4
 
 from sqlalchemy import create_engine, text
 from sqlalchemy.exc import IntegrityError
 
-BASE_CHAIN_ID = 8453
-BASE_USDC_CONTRACT = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"  # native USDC, 6 decimals
-USDC_DECIMALS = 6
-TRANSFER_TOPIC = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"  # Transfer(address,address,uint256)
-DEFAULT_RPC_URL = "https://mainnet.base.org"
-FALLBACK_RPC_URLS = ["https://base.llamarpc.com", "https://1rpc.io/base"]
-DEFAULT_TREASURY = "0xCd787bCf82279c121835EaaB37b34A502A6b8dBC"
+from .chain_verify import (ChainVerifier, ChainError, BASE_USDC_CONTRACT,
+                           BASE_CHAIN_ID, USDC_DECIMALS, DEFAULT_RPC_URL,
+                           FALLBACK_RPC_URLS, DEFAULT_TREASURY)
 INTENT_TTL_SECONDS = 24 * 3600
 MIN_DAIL, MAX_DAIL = 1, 100000
 
@@ -67,15 +61,20 @@ class UsdcPayments:
         self.dail = dail
         self.treasury = (os.getenv("DAIL_USDC_TREASURY", DEFAULT_TREASURY) or "").strip()
         primary_rpc = (os.getenv("BASE_RPC_URL", DEFAULT_RPC_URL) or "").strip()
-        self.rpc_urls = []
+        rpc_urls = []
         for u in [primary_rpc] + FALLBACK_RPC_URLS:
-            if u and u not in self.rpc_urls:
-                self.rpc_urls.append(u)
+            if u and u not in rpc_urls:
+                rpc_urls.append(u)
+        self.rpc_urls = rpc_urls
         self.rpc_url = self.rpc_urls[0] if self.rpc_urls else ""
         try:
-            self.min_confirmations = max(1, int(os.getenv("DAIL_USDC_MIN_CONF", "2")))
+            min_conf = max(1, int(os.getenv("DAIL_USDC_MIN_CONF", "2")))
         except ValueError:
-            self.min_confirmations = 2
+            min_conf = 2
+        self.min_confirmations = min_conf
+        # Shared chain verifier: one pinned-contract receipt check for every
+        # USDC rail (manual + x402). Behavior identical to the old inline code.
+        self.chain = ChainVerifier(self.treasury, self.rpc_urls, min_conf)
         self.database_url = os.getenv("DATABASE_URL", "")
         if self.database_url.startswith("postgres://"):
             self.database_url = self.database_url.replace("postgres://", "postgresql://", 1)
@@ -167,61 +166,19 @@ class UsdcPayments:
         self.dail.audit.append("payment.usdc_announced", {"agents_notified": count})
         return {"announced": True, "agents_notified": count}
 
-    # ---- JSON-RPC ----
+    # ---- JSON-RPC / on-chain verification ----
+    # Delegated to the shared ChainVerifier (dail/chain_verify.py): the same
+    # pinned-contract receipt check the x402 rail uses. _rpc and
+    # _verify_onchain keep their old names as thin wrappers so any external
+    # callers (and tests patching the _rpc seam) keep working identically.
     def _rpc(self, method, params):
-        """Base JSON-RPC with fallback endpoints. The public primary is
-        rate-limited and flakes; a flaky RPC must never block a legitimate
-        deposit, so we try each URL in order and only fail when all do."""
-        body = json.dumps({"jsonrpc": "2.0", "id": 1,
-                           "method": method, "params": params}).encode()
-        last_err = None
-        for url in self.rpc_urls:
-            req = urllib.request.Request(url, data=body,
-                                         headers={"Content-Type": "application/json"})
-            try:
-                with urllib.request.urlopen(req, timeout=15) as r:
-                    resp = json.loads(r.read().decode())
-            except Exception as e:
-                last_err = e
-                continue
-            if not isinstance(resp, dict) or "error" in resp:
-                last_err = resp.get("error") if isinstance(resp, dict) else "bad_response"
-                continue
-            return resp.get("result")
-        raise UsdcError(f"base_rpc_unreachable: {last_err!r}"[:200])
+        return self.chain._rpc(method, params)
 
     def _verify_onchain(self, tx_hash):
-        """Returns (usdc_base_units_to_treasury, confirmations).
-
-        Raises UsdcError when the tx does not prove real USDC arrived.
-        """
-        receipt = self._rpc("eth_getTransactionReceipt", [tx_hash])
-        if not receipt:
-            raise UsdcError("transaction not found on Base (is the hash correct and the tx sent?)")
-        if receipt.get("status") != "0x1":
-            raise UsdcError("transaction failed on-chain; no credit")
-        total = 0
-        for log in receipt.get("logs") or []:
-            if (log.get("address") or "").lower() != BASE_USDC_CONTRACT.lower():
-                continue  # not real USDC: ignore lookalike tokens
-            topics = log.get("topics") or []
-            if len(topics) < 3 or (topics[0] or "").lower() != TRANSFER_TOPIC:
-                continue
-            to_addr = "0x" + topics[2][-40:]
-            if to_addr.lower() != self.treasury.lower():
-                continue  # USDC moved, but not to us
-            try:
-                total += int(log.get("data") or "0x0", 16)
-            except ValueError:
-                continue
-        if total <= 0:
-            raise UsdcError("no USDC transfer to the DAiL deposit address in this transaction")
-        latest = self._rpc("eth_blockNumber", [])
         try:
-            confs = int(latest, 16) - int(receipt["blockNumber"], 16)
-        except (TypeError, ValueError):
-            raise UsdcError("could not determine confirmations; try again")
-        return total, confs
+            return self.chain.verify_usdc_to_treasury(tx_hash)
+        except ChainError as e:
+            raise UsdcError(str(e))
 
     # ---- intents ----
     def _row(self, intent_id):

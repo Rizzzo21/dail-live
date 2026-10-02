@@ -282,6 +282,10 @@ class UsdcConfirmRequest(BaseModel):
     tx_hash: str
     idempotency_key: str | None = None
 
+class X402TopupRequest(BaseModel):
+    agent_id: str
+    usdc_amount: int
+
 class TreasuryLoanDisburseRequest(BaseModel):
     agent_id: str
     amount: int = Field(gt=0)
