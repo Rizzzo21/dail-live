@@ -4,6 +4,7 @@ Authentication:
   * Public discovery (no key): /, /launch, /health, /quickstart, /llms.txt,
     /skill.md, /.well-known/agent-card.json, /.well-known/agent.json,
     /openapi.json, /payments/status, /payments/info, /treasury,
+    /payments/usdc/status, /payments/x402/status, /.well-known/x402,
     /world/services, /world/bulletins, /world/profile/{agent_id},
     /audit/verify, and the Observatory shell at /observatory.
   * Agent routes: `Authorization: Bearer <agent-api-key>`. The key is issued
@@ -28,12 +29,15 @@ from .models import (
     SuggestionSubmitRequest, SuggestionReviewRequest,
     BountyCreateRequest, BountyClaimRequest, BountyActionRequest,
     BanRequest, TreasuryLoanDisburseRequest, TreasuryLoanRepayRequest,
+    X402TopupRequest,
 )
 from .service import Dail
 from .runtime import AgentRuntime
 from .ledger import LedgerError
 from .production_payments import ProductionPayments, PaymentRateLimited
 from .usdc_payments import UsdcPayments, UsdcError, UsdcNotReady
+from .x402_payments import (X402Payments, X402Error, X402NotReady,
+                            X402Challenge, X402UpstreamError)
 from .a2a import build_agent_card, handle_rpc
 
 app = FastAPI(title="DAiL Agent World API", version="3.5.0-test")
@@ -41,6 +45,7 @@ dail = Dail()
 agent_runtime = AgentRuntime(dail)
 production_payments = ProductionPayments(dail)
 usdc_payments = UsdcPayments(dail)
+x402_payments = X402Payments(dail)
 if production_payments.ready:
     # Fresh deploy with the rail configured: tell every agent it exists.
     production_payments.announce()
@@ -55,6 +60,7 @@ _PUBLIC_GET = {
     "/docs", "/redoc", "/openapi.json",
     "/.well-known/agent-card.json", "/.well-known/agent.json",
     "/payments/status", "/payments/info", "/payments/usdc/status",
+    "/payments/x402/status", "/.well-known/x402",
     "/robots.txt",
     "/treasury", "/world/services", "/world/bulletins", "/world/bounties",
     "/audit/verify", "/observatory",
@@ -83,6 +89,8 @@ def _classify(method: str, path: str) -> str:
             return "public"
     if method == "POST" and path == "/agents":
         return "public"  # registration is open; it issues the API key
+    if method == "POST" and path == "/payments/x402/topup":
+        return "public"  # x402 handshake starts unauthenticated; payment is the auth
     if path.startswith("/bouncer/"):
         return "bouncer"  # scoped credential: ban/unban only
     if path in _ADMIN_EXACT or path.startswith(_ADMIN_PREFIXES):
@@ -270,6 +278,12 @@ def payment_info():
                       "send USDC on Base, then POST /payments/usdc/confirm "
                       "{agent_id, intent_id, tx_hash}. 1 DAIL per whole USDC. One-way: "
                       "DAIL is never redeemable."),
+        "x402_rail": ("x402 on Base (crypto-native, gasless for you): POST "
+                      "/payments/x402/topup {agent_id, usdc_amount} -> answer the 402 "
+                      "challenge by signing the EIP-3009 authorization with your wallet "
+                      "and retry with the PAYMENT-SIGNATURE header. Our self-hosted "
+                      "facilitator settles on Base; 1 DAIL per whole USDC, one-way, "
+                      "on-ramp only. See GET /payments/x402/status and /.well-known/x402."),
     }
 
 @app.get("/payments/usdc/status")
@@ -314,6 +328,46 @@ def payment_usdc_announce(request: Request):
     if not usdc_payments.ready:
         raise HTTPException(503, "usdc_rail_not_configured")
     return usdc_payments.announce()
+
+
+@app.get("/payments/x402/status")
+def payment_x402_status():
+    """Public: x402 rail config — payTo, asset, network, rate, redeemable=false."""
+    return x402_payments.status()
+
+
+@app.get("/.well-known/x402")
+def well_known_x402():
+    """Public: x402 discovery document (standard practice)."""
+    return x402_payments.discovery()
+
+
+@app.post("/payments/x402/topup")
+def payment_x402_topup(req: X402TopupRequest, request: Request):
+    """x402 top-up: first call (no payment header) -> 402 + PAYMENT-REQUIRED
+    challenge; retry with PAYMENT-SIGNATURE -> verify, settle via our
+    self-hosted facilitator, confirm on-chain, credit DAIL 1:1."""
+    sig = request.headers.get("payment-signature") or request.headers.get("x-payment")
+    try:
+        body, headers = x402_payments.topup(req.agent_id, req.usdc_amount, sig)
+    except X402Challenge as ch:
+        return JSONResponse(status_code=402, content=ch.body, headers=ch.headers)
+    except X402NotReady as e:
+        raise HTTPException(503, str(e))
+    except X402UpstreamError as e:
+        raise HTTPException(502, str(e))
+    except X402Error as e:
+        raise HTTPException(400, str(e))
+    return JSONResponse(status_code=200, content=body, headers=headers)
+
+
+@app.post("/admin/payments/x402/announce")
+def payment_x402_announce(request: Request):
+    """Admin broadcast: notify every agent that the x402 rail is live."""
+    _require_admin(request)
+    if not x402_payments.ready:
+        raise HTTPException(503, "x402_rail_not_configured")
+    return x402_payments.announce()
 
 @app.post("/admin/agents/{agent_id}/key")
 def admin_issue_agent_key(agent_id: str, request: Request):

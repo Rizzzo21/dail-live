@@ -15,7 +15,7 @@ os.environ["DAIL_USDC_MIN_CONF"] = "2"
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 TREASURY = "0xCd787bCf82279c121835EaaB37b34A502A6b8dBC"
-USDC = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA4a1309"
+USDC = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"
 TRANSFER_TOPIC = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
 FAKE_USDC = "0xdead0000000000000000000000000000000000beef"
 PAYER = "0x1111111111111111111111111111111111111111"
@@ -102,7 +102,7 @@ def test_happy_path_credits_1_to_1(api):
     intent = _intent(client, auth)
     assert intent["deposit_address"] == TREASURY
     before = _bal(client, auth)
-    with patch.object(mod.usdc_payments, "_rpc", _rpc_factory(_receipt())):
+    with patch.object(mod.usdc_payments.chain, "_rpc", _rpc_factory(_receipt())):
         r = _confirm(client, auth, intent["intent_id"], TX)
     assert r.status_code == 200, r.text
     body = r.json()
@@ -113,7 +113,7 @@ def test_happy_path_credits_1_to_1(api):
 def test_replay_same_tx_no_double_credit(api):
     client, mod, auth = api
     intent = _intent(client, auth)
-    with patch.object(mod.usdc_payments, "_rpc", _rpc_factory(_receipt())):
+    with patch.object(mod.usdc_payments.chain, "_rpc", _rpc_factory(_receipt())):
         r1 = _confirm(client, auth, intent["intent_id"], TX, key="c1")
         assert r1.json()["duplicate"] is False
         # Same tx submitted again (new intent): duplicate, no second credit.
@@ -128,7 +128,7 @@ def test_replay_same_tx_no_double_credit(api):
 def test_concurrent_confirm_same_tx_single_credit(api):
     client, mod, auth = api
     i1, i2 = _intent(client, auth, key="k1"), _intent(client, auth, key="k2")
-    with patch.object(mod.usdc_payments, "_rpc", _rpc_factory(_receipt())):
+    with patch.object(mod.usdc_payments.chain, "_rpc", _rpc_factory(_receipt())):
         r1 = _confirm(client, auth, i1["intent_id"], TX, key="c1")
         r2 = _confirm(client, auth, i2["intent_id"], TX, key="c2")
     assert r1.json()["duplicate"] is False
@@ -139,7 +139,7 @@ def test_concurrent_confirm_same_tx_single_credit(api):
 def test_lookalike_token_rejected(api):
     client, mod, auth = api
     intent = _intent(client, auth)
-    with patch.object(mod.usdc_payments, "_rpc",
+    with patch.object(mod.usdc_payments.chain, "_rpc",
                       _rpc_factory(_receipt(contract=FAKE_USDC))):
         r = _confirm(client, auth, intent["intent_id"], TX)
     assert r.status_code == 400
@@ -150,7 +150,7 @@ def test_lookalike_token_rejected(api):
 def test_transfer_to_wrong_address_rejected(api):
     client, mod, auth = api
     intent = _intent(client, auth)
-    with patch.object(mod.usdc_payments, "_rpc",
+    with patch.object(mod.usdc_payments.chain, "_rpc",
                       _rpc_factory(_receipt(to=OTHER))):
         r = _confirm(client, auth, intent["intent_id"], TX)
     assert r.status_code == 400
@@ -160,7 +160,7 @@ def test_transfer_to_wrong_address_rejected(api):
 def test_failed_transaction_rejected(api):
     client, mod, auth = api
     intent = _intent(client, auth)
-    with patch.object(mod.usdc_payments, "_rpc",
+    with patch.object(mod.usdc_payments.chain, "_rpc",
                       _rpc_factory(_receipt(status="0x0"))):
         r = _confirm(client, auth, intent["intent_id"], TX)
     assert r.status_code == 400
@@ -171,7 +171,7 @@ def test_insufficient_confirmations_rejected(api):
     client, mod, auth = api
     intent = _intent(client, auth)
     # latest 0x101 vs receipt 0x100 -> 1 confirmation < min 2
-    with patch.object(mod.usdc_payments, "_rpc",
+    with patch.object(mod.usdc_payments.chain, "_rpc",
                       _rpc_factory(_receipt(), latest="0x101")):
         r = _confirm(client, auth, intent["intent_id"], TX)
     assert r.status_code == 400
@@ -182,7 +182,7 @@ def test_insufficient_confirmations_rejected(api):
 def test_dust_rejected(api):
     client, mod, auth = api
     intent = _intent(client, auth)
-    with patch.object(mod.usdc_payments, "_rpc",
+    with patch.object(mod.usdc_payments.chain, "_rpc",
                       _rpc_factory(_receipt(units=500_000))):  # 0.5 USDC
         r = _confirm(client, auth, intent["intent_id"], TX)
     assert r.status_code == 400
@@ -212,7 +212,7 @@ def test_expired_intent_rejected(api):
         from sqlalchemy import text
         c.execute(text("UPDATE dail_usdc_deposits SET created_at=:o WHERE id=:i"),
                   {"o": old, "i": intent["intent_id"]})
-    with patch.object(mod.usdc_payments, "_rpc", _rpc_factory(_receipt())):
+    with patch.object(mod.usdc_payments.chain, "_rpc", _rpc_factory(_receipt())):
         r = _confirm(client, auth, intent["intent_id"], TX)
     assert r.status_code == 400
     assert "expired" in r.json()["detail"]
