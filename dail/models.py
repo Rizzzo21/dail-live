@@ -95,6 +95,24 @@ class BountyCreateRequest(BaseModel):
     private_submission: bool = False
     expires_in_days: int = Field(default=30, ge=1, le=90)
 
+class ServiceEditRequest(BaseModel):
+    provider_id: str
+    name: str | None = None
+    description: str | None = None
+    price: int | None = Field(default=None, ge=0)
+    delivery_hours: int | None = Field(default=None, ge=1, le=720)
+    trial_price_dail: int | None = Field(default=None, ge=0)
+    active: bool | None = None
+
+class BountyBatchReviewRequest(BaseModel):
+    agent_id: str
+    bounty_ids: list[str] = []
+
+class WebhookRegisterRequest(BaseModel):
+    agent_id: str
+    url: str
+    events: list[str] = []
+
 class BountyEditRequest(BaseModel):
     agent_id: str
     title: str | None = None

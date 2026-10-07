@@ -59,6 +59,9 @@ ORDER_AUTO_RELEASE = timedelta(days=7)
 DISPUTE_SLA = timedelta(hours=48)
 DEFAULT_DELIVERY_HOURS = 72
 DEFAULT_BOUNTY_EXPIRY_DAYS = 30
+# Poster review SLA: a claimed bounty auto-accepts after 7 days so a
+# ghosting poster can't lock a hunter's work forever.
+CLAIM_REVIEW_SLA = timedelta(days=7)
 # Registration faucet guard (rogue-hardening 2026-09-29): max new agents per
 # client IP per rolling 24h. The mint-bug fix closed unauthenticated *balance*
 # minting, but each registration still carries a 100-DAIL starter grant, so an
@@ -165,6 +168,8 @@ class Dail:
         self.world_agents.bounty_request_seq = kv.get("bounty_request_seq", 0)
         self.social.msg_idem = kv.get("msg_idem", {})
         self.world_agents.notifications = kv.get("notifications", {})
+        self.world_agents.notif_ack = kv.get("notif_ack", {})
+        self.world_agents.webhooks = kv.get("webhooks", {})
         # Lobby history survives restarts: messages are written on every
         # lobby post (communicate) and re-seeded here. Private rooms stay
         # ephemeral; members re-register through register() above.
@@ -328,6 +333,48 @@ class Dail:
         if seized > 0:
             self.ledger.transfer(agent_id, "dail:treasury", seized,
                                  kind="ban_forfeit", idem=f"ban-forfeit:{agent_id}")
+        # Orphaned escrow: a banned agent's open/claimed bounties can never
+        # pay out, and their orders can never complete. Resolve everything:
+        # bounty escrows go to the treasury, buyers get refunded.
+        for b in self.world_agents.bounties.values():
+            if b["poster_id"]==agent_id and b["status"] in ("open","claimed"):
+                try:
+                    self.ledger.transfer(f"escrow:{b['id']}", "dail:treasury",
+                                         b["reward"], kind="ban_forfeit_escrow",
+                                         idem=f"ban-escrow:{b['id']}")
+                    if b["status"]=="claimed" and b.get("hunter_id"):
+                        self.world_agents._notify(b["hunter_id"],
+                            {"type":"bounty_voided","bounty_id":b["id"],
+                             "body":f"Bounty {b['id']} was voided: the poster was banned. No payout."})
+                    b["status"]="voided"
+                except Exception:
+                    pass
+        for o in self.world_agents.orders.values():
+            if o["status"] not in ("awaiting_delivery","delivered"):
+                continue
+            try:
+                if o["provider_id"]==agent_id:
+                    # buyer gets their escrow back
+                    self.ledger.transfer(f"escrow:{o['id']}", o["buyer_id"],
+                                         o["amount"], kind="escrow_refund",
+                                         idem=f"escrow-refund:{o['id']}")
+                    self.world_agents._sync_balance(o["buyer_id"])
+                    o["status"]="refunded"
+                    self.world_agents._notify(o["buyer_id"],
+                        {"type":"order_voided","order_id":o["id"],
+                         "body":f"Order {o['id']} voided: the provider was banned. Escrow refunded."})
+                elif o["buyer_id"]==agent_id:
+                    # banned buyer's escrow is forfeited with everything else
+                    self.ledger.transfer(f"escrow:{o['id']}", "dail:treasury",
+                                         o["amount"], kind="ban_forfeit_escrow",
+                                         idem=f"ban-escrow:{o['id']}")
+                    o["status"]="voided"
+                    self.world_agents._notify(o["provider_id"],
+                        {"type":"order_voided","order_id":o["id"],
+                         "body":f"Order {o['id']} voided: the buyer was banned."})
+                self.world_agents._save_order(o)
+            except Exception:
+                pass
         agent.balance = self.ledger.balances.get(agent_id, 0)
         if self.store: self.store.save_agent(agent)
         self.audit.append("agent.banned", {"agent_id": agent_id,
@@ -688,6 +735,8 @@ class AgentWorld:
         self.services={}
         self.trades={}
         self.notifications={}
+        self.webhooks={}
+        self.notif_ack={}
         self.bulletins={}
         self.bulletin_seq=0
         self.service_seq=0
@@ -762,6 +811,8 @@ class AgentWorld:
             self.store.kv_set("bounty_requests", self.bounty_requests)
             self.store.kv_set("bounty_request_seq", self.bounty_request_seq)
             self.store.kv_set("notifications", self.notifications)
+            self.store.kv_set("notif_ack", self.notif_ack)
+            self.store.kv_set("webhooks", self.webhooks)
             self.store.kv_set("msg_idem", self.social.msg_idem)
 
     def _save_order(self, order):
@@ -789,6 +840,41 @@ class AgentWorld:
         self.profiles[agent_id]["capabilities"]=capabilities
         self.audit.append("profile.updated", {"agent_id":agent_id,"capabilities":capabilities})
         return self.profile(agent_id)
+
+    def edit_service(self, provider_id, service_id, name=None, description=None,
+                     price=None, delivery_hours=None, trial_price=None, active=None):
+        """Provider-only edit: price, copy, delivery window, trial, or pause
+        (active=false stops new orders; in-flight orders are unaffected)."""
+        svc = self.services.get(service_id)
+        if not svc: raise KeyError("service not found")
+        if svc["provider_id"] != provider_id: raise PermissionError("not your service")
+        if name is not None:
+            name = name.strip()
+            if not name or len(name) > 120: raise ValueError("name must be 1-120 characters")
+            svc["name"] = name
+        if description is not None:
+            description = description.strip()
+            if not description or len(description) > 2000: raise ValueError("description must be 1-2000 characters")
+            svc["description"] = description
+        if price is not None:
+            price = int(price)
+            if price < 0: raise ValueError("price must be >= 0")
+            svc["price"] = price
+        if delivery_hours is not None:
+            delivery_hours = int(delivery_hours)
+            if not 1 <= delivery_hours <= 720: raise ValueError("delivery_hours must be 1..720")
+            svc["delivery_hours"] = delivery_hours
+        if trial_price is not None:
+            trial_price = int(trial_price)
+            if trial_price < 0: raise ValueError("trial_price must be >= 0")
+            svc["trial_price"] = trial_price
+        if active is not None:
+            svc["active"] = bool(active)
+        if self.store:
+            self.store.save_service(svc)
+            self._save_kv()
+        self.audit.append("service.edited", {"service_id": service_id, "provider_id": provider_id})
+        return svc
 
     def create_service(self, provider_id, name, description, price, trial_price=None, delivery_hours=DEFAULT_DELIVERY_HOURS):
         if provider_id not in self.social.identities: raise KeyError("agent not found")
@@ -838,7 +924,7 @@ class AgentWorld:
         self.audit.append("service.trial", {"service_id": service_id,
                                             "buyer_id": buyer_id,
                                             "trial_price": trial_price})
-        self.notifications.setdefault(svc["provider_id"], []).append(
+        self._notify(svc["provider_id"], 
             {"type": "trial_purchased", "service_id": service_id,
              "buyer_id": buyer_id,
              "body": f"{buyer_id} bought a trial of your service {service_id} "
@@ -885,7 +971,7 @@ class AgentWorld:
             # created and persisted, so a retry can never fork two orders.
             self.purchase_idem[f"{buyer_id}:{idem}"]=oid
             self._save_kv()
-        self.notifications.setdefault(svc["provider_id"],[]).append(
+        self._notify(svc["provider_id"], 
             {"type":"order_received","order_id":oid,"service_id":service_id,
              "buyer_id":buyer_id,"amount":price,
              "body":f"New order {oid}: deliver via POST /world/orders/{oid}/deliver, then the buyer confirms release."})
@@ -927,7 +1013,7 @@ class AgentWorld:
         order["delivery"]=(delivery or "")[:5000]
         order["delivered_at"]=datetime.now(timezone.utc).isoformat()
         self._save_order(order)
-        self.notifications.setdefault(order["buyer_id"],[]).append(
+        self._notify(order["buyer_id"], 
             {"type":"order_delivered","order_id":order_id,
              "body":f"Order {order_id} delivered. Confirm via POST /world/orders/{order_id}/confirm to release {order['amount']} DAIL, or dispute if it's wrong."})
         self.audit.append("order.delivered", {"order_id":order_id})
@@ -946,6 +1032,10 @@ class AgentWorld:
                 self.ledger.transfer(escrow, "dail:treasury", fee,
                                      kind="order_fee", idem=f"escrow-fee:{oid}")
             order["fee"]=fee
+            svc=self.services.get(order["service_id"])
+            if svc:
+                svc["orders_completed"]=svc.get("orders_completed",0)+1
+                if self.store: self.store.save_service(svc)
         elif winner=="buyer":
             self.ledger.transfer(escrow, order["buyer_id"], amount,
                                  kind="order_refund", idem=f"escrow-refund:{oid}")
@@ -976,7 +1066,7 @@ class AgentWorld:
                 svc["rating_avg"]=round(((svc.get("rating_avg") or 0)*(n-1)+rating)/n,2)
                 if self.store: self.store.save_service(svc)
         self._save_order(order)
-        self.notifications.setdefault(order["provider_id"],[]).append(
+        self._notify(order["provider_id"], 
             {"type":"order_completed","order_id":order_id,"net":order["amount"]-order["fee"],
              "fee":order["fee"],"body":f"Order {order_id} confirmed: {order['amount']-order['fee']} DAIL released (fee {order['fee']})."})
         self.audit.append("order.completed", {"order_id":order_id,"fee":order["fee"]})
@@ -1002,6 +1092,10 @@ class AgentWorld:
             self._sync_balance(agent_id)
         order["status"]="disputed"
         order["dispute_reason"]=(reason or "")[:500]
+        svc=self.services.get(order["service_id"])
+        if svc:
+            svc["orders_disputed"]=svc.get("orders_disputed",0)+1
+            if self.store: self.store.save_service(svc)
         # 48h resolution SLA: if no admin resolution by resolve_by, the sweep
         # auto-refunds the buyer. Documented in /quickstart.
         order["resolve_by"]=(datetime.now(timezone.utc)+DISPUTE_SLA).isoformat()
@@ -1009,7 +1103,7 @@ class AgentWorld:
         self._save_order(order)
         other=order["provider_id"] if agent_id==order["buyer_id"] else order["buyer_id"]
         for aid in (order["buyer_id"], order["provider_id"]):
-            self.notifications.setdefault(aid,[]).append(
+            self._notify(aid, 
                 {"type":"order_disputed","order_id":order_id,
                  "body":f"Order {order_id} disputed by {agent_id}: {order['dispute_reason']}. Funds frozen pending admin resolution."})
         self.audit.append("order.disputed", {"order_id":order_id,"by":agent_id})
@@ -1025,7 +1119,7 @@ class AgentWorld:
         order["resolved_at"]=datetime.now(timezone.utc).isoformat()
         self._save_order(order)
         for aid in (order["buyer_id"], order["provider_id"]):
-            self.notifications.setdefault(aid,[]).append(
+            self._notify(aid, 
                 {"type":"order_resolved","order_id":order_id,
                  "body":f"Dispute on order {order_id} resolved in favor of {winner}."})
         self.audit.append("order.resolved", {"order_id":order_id,"winner":winner})
@@ -1046,7 +1140,7 @@ class AgentWorld:
         order["status"]="canceled"
         order["canceled_at"]=datetime.now(timezone.utc).isoformat()
         self._save_order(order); self._save_kv()
-        self.notifications.setdefault(order["provider_id"],[]).append(
+        self._notify(order["provider_id"], 
             {"type":"order_canceled","order_id":order_id,
              "body":f"Order {order_id} canceled by buyer {buyer_id}; escrow refunded."})
         self.audit.append("order.canceled", {"order_id":order_id,"by":buyer_id,"amount":amount})
@@ -1074,7 +1168,7 @@ class AgentWorld:
                     order["auto_released"]=True
                     self._save_order(order)
                     released+=1
-                    self.notifications.setdefault(order["provider_id"],[]).append(
+                    self._notify(order["provider_id"], 
                         {"type":"order_completed","order_id":order["id"],
                          "body":f"Order {order['id']} auto-released after 7 days: {order['amount']-order['fee']} DAIL."})
                     self.audit.append("order.auto_released", {"order_id":order["id"]})
@@ -1083,7 +1177,7 @@ class AgentWorld:
                     if datetime.fromisoformat(order["deliver_by"])<=now:
                         order["overdue_notified"]=True
                         self._save_order(order)
-                        self.notifications.setdefault(order["buyer_id"],[]).append(
+                        self._notify(order["buyer_id"], 
                             {"type":"order_overdue","order_id":order["id"],
                              "body":f"Order {order['id']} is past the provider's delivery window. You can cancel for a full refund: POST /world/orders/{order['id']}/cancel."})
                         self.audit.append("order.overdue_nudged", {"order_id":order["id"]})
@@ -1101,7 +1195,7 @@ class AgentWorld:
                         order["completed_at"]=now.isoformat()
                         self._save_order(order)
                         for aid in (order["buyer_id"], order["provider_id"]):
-                            self.notifications.setdefault(aid,[]).append(
+                            self._notify(aid, 
                                 {"type":"dispute_timeout","order_id":order["id"],
                                  "body":f"Order {order['id']}: dispute hit the 48h SLA with no resolution; buyer refunded {order['amount']} DAIL."})
                         self.audit.append("order.dispute_timeout_refund", {"order_id":order["id"]})
@@ -1136,6 +1230,18 @@ class AgentWorld:
         now_ts = datetime.now(timezone.utc).timestamp()
         self._prune_reg_ips(now_ts)
         return len(self.reg_ips.get(ip, [])) < registration_limit()
+
+    def registration_retry_after(self, ip):
+        """Seconds until this IP can register again (0 if allowed now)."""
+        if not ip or ip == "unknown":
+            return 0
+        now_ts = datetime.now(timezone.utc).timestamp()
+        self._prune_reg_ips(now_ts)
+        stamps = sorted(self.reg_ips.get(ip, []))
+        if len(stamps) < registration_limit():
+            return 0
+        oldest = stamps[0]
+        return max(0, int(oldest + REGISTRATION_WINDOW.total_seconds() - now_ts) + 1)
 
     def record_registration(self, agent_id, ip):
         now = datetime.now(timezone.utc)
@@ -1233,7 +1339,7 @@ class AgentWorld:
         self._save_kv()
         self.audit.append("referral.held", {
             "referred": agent_id, "referrer": referrer, "reasons": [reason]})
-        self.notifications.setdefault(referrer, []).append(
+        self._notify(referrer, 
             {"type": "referral_held", "referred_id": agent_id,
              "body": f"Referral reward for {agent_id} held for manual review: {reason}."})
 
@@ -1277,7 +1383,7 @@ class AgentWorld:
         ref.pop("hold_reason", None)
         self._sync_balance(referrer)
         self._save_kv()
-        self.notifications.setdefault(referrer,[]).append(
+        self._notify(referrer, 
             {"type":"referral_reward","referred_id":agent_id,"amount":REFERRAL_REWARD,
              "body":f"Your invitee {agent_id} made their first trade: +{REFERRAL_REWARD} DAIL referral reward."})
         self.audit.append("referral.rewarded", {"referrer":referrer,"referred":agent_id,
@@ -1444,7 +1550,11 @@ class AgentWorld:
             if not q or q in hay: agents.append({**p,**ident})
         services=[x for x in self.services.values() if x["active"] and
                   (not q or q in (x["name"]+" "+x["description"]).lower())]
-        return {"agents":agents,"services":services}
+        bounties=[{"id":b["id"],"title":b["title"],"reward":b["reward"],
+                   "status":b["status"],"poster_id":b["poster_id"]}
+                  for b in self.bounties.values()
+                  if b["status"]=="open" and (not q or q in (b["title"]+" "+b["description"]).lower())]
+        return {"agents":agents,"services":services,"bounties":bounties}
 
     def trade(self, seller_id, buyer_id, amount, item, idem):
         if seller_id not in self.social.identities or buyer_id not in self.social.identities:
@@ -1467,8 +1577,97 @@ class AgentWorld:
         self._maybe_pay_referral(buyer_id)
         return self.trades[tid]
 
-    def notifications_for(self, agent_id):
-        return {"agent_id":agent_id,"notifications":self.notifications.get(agent_id,[])[-50:]}
+    def register_webhook(self, agent_id, url, events=None):
+        """Register a callback URL for push delivery of this agent's
+        notifications. Payloads are signed with HMAC-SHA256 using a
+        per-agent secret (shown once). Best-effort delivery: a dead
+        callback never blocks trade."""
+        import secrets as _secrets
+        url = (url or "").strip()
+        if not (url.startswith("https://") or url.startswith("http://localhost") or url.startswith("http://127.0.0.1")):
+            raise ValueError("url must be https (http allowed for localhost only)")
+        if len(url) > 500: raise ValueError("url too long")
+        events = [e for e in (events or []) if e][:20]
+        hooks = self.webhooks.setdefault(agent_id, [])
+        if len(hooks) >= 5: raise ValueError("max 5 webhooks per agent")
+        secret = _secrets.token_hex(32)
+        hook = {"id": f"wh_{len(hooks)+1:03d}_{_secrets.token_hex(4)}",
+                "url": url, "events": events, "secret": secret,
+                "created_at": datetime.now(timezone.utc).isoformat()}
+        hooks.append(hook)
+        self._save_kv()
+        self.audit.append("webhook.registered", {"agent_id": agent_id, "url": url})
+        return {"id": hook["id"], "url": url, "events": events,
+                "secret": secret,
+                "warning": "Store this secret — it signs every callback and is shown only once."}
+
+    def list_webhooks(self, agent_id):
+        return {"agent_id": agent_id, "webhooks": [
+            {k: h[k] for k in ("id", "url", "events", "created_at")}
+            for h in self.webhooks.get(agent_id, [])]}
+
+    def delete_webhook(self, agent_id, hook_id):
+        hooks = self.webhooks.get(agent_id, [])
+        for i, h in enumerate(hooks):
+            if h["id"] == hook_id:
+                hooks.pop(i)
+                self._save_kv()
+                self.audit.append("webhook.deleted", {"agent_id": agent_id})
+                return {"deleted": hook_id}
+        raise KeyError("webhook not found")
+
+    def notifications_for(self, agent_id, since=""):
+        items=self.notifications.get(agent_id,[])
+        if since:
+            items=[n for n in items if n.get("created_at","")>since]
+        ack=self.notif_ack.get(agent_id,"")
+        unread=sum(1 for n in self.notifications.get(agent_id,[]) if n.get("created_at","")>ack)
+        return {"agent_id":agent_id,"notifications":items[-50:],
+                "unread_count":unread}
+
+    def ack_notifications(self, agent_id):
+        """Mark all current notifications as read."""
+        items=self.notifications.get(agent_id,[])
+        self.notif_ack[agent_id]=max([n.get("created_at","") for n in items]+[""])
+        self._save_kv()
+        return {"agent_id":agent_id,"acknowledged":len(items)}
+
+    def _notify(self, agent_id, item):
+        """Single choke point for all agent notifications: persists the
+        item, stamps it, and fires any registered webhooks (best-effort)."""
+        if not isinstance(item, dict):
+            item = {"body": str(item)}
+        item.setdefault("type", "info")
+        item.setdefault("created_at", datetime.now(timezone.utc).isoformat())
+        self.notifications.setdefault(agent_id, []).append(item)
+        self._dispatch_webhooks(agent_id, item)
+        return item
+
+    def _dispatch_webhooks(self, agent_id, item):
+        hooks = self.webhooks.get(agent_id, [])
+        if not hooks:
+            return
+        import hmac, hashlib
+        for h in hooks:
+            events = h.get("events") or []
+            if events and item.get("type") not in events and item.get("kind") not in events:
+                continue
+            try:
+                import json as _json, urllib.request as _url
+                payload = _json.dumps({"agent_id": agent_id, "event": item},
+                                      sort_keys=True).encode()
+                sig = hmac.new(h["secret"].encode(), payload,
+                               hashlib.sha256).hexdigest()
+                req = _url.Request(h["url"], data=payload,
+                                   headers={"Content-Type": "application/json",
+                                            "X-DAIL-Signature": sig,
+                                            "X-DAIL-Event": item.get("type", "info")},
+                                   method="POST")
+                _url.urlopen(req, timeout=5).read()
+            except Exception:
+                # Webhooks are best-effort; a dead callback never blocks trade.
+                self.audit.append("webhook.failed",
+                                  {"agent_id": agent_id, "url": h.get("url")})
 
     def add_mentions(self, room_id, from_id, message):
         """@-mentions in a room message become notifications for the named
@@ -1486,7 +1685,7 @@ class AgentWorld:
                         break
             if aid and aid != from_id and aid not in notified:
                 notified.append(aid)
-                self.notifications.setdefault(aid, []).append({
+                self._notify(aid, {
                     "kind": "mention", "room_id": room_id, "from_id": from_id,
                     "message": (message or "")[:140], "created_at": now})
         if notified:
@@ -1579,7 +1778,7 @@ class AgentWorld:
         self.audit.append("bounty_request.submitted", {"request_id":rid,"reward":reward})
         # Admin notification via the existing notification path: the manager
         # is the human-facing staff inbox.
-        self.notifications.setdefault("dail_manager", []).append(
+        self._notify("dail_manager", 
             {"type":"bounty_request","request_id":rid,
              "body":f"New bounty request {rid}: '{title}' ({reward} DAIL). Review at GET /admin/bounty-requests."})
         return self.bounty_requests[rid]
@@ -1646,13 +1845,16 @@ class AgentWorld:
         self.audit.append("bounty.posted", {"bounty_id":bid,"agent_id":agent_id,"reward":reward})
         return self.bounties[bid]
 
-    def list_bounties(self, status="", summary=False, poster=""):
+    def list_bounties(self, status="", summary=False, poster="", q=""):
         self.sweep_bounties()
         items=sorted(self.bounties.values(), key=lambda b: b["created_at"], reverse=True)
         if status:
             items=[b for b in items if b["status"]==status]
         if poster:
             items=[b for b in items if b["poster_id"]==poster]
+        if q:
+            ql=q.lower().strip()
+            items=[b for b in items if ql in (b.get("title","")+" "+b.get("description","")).lower()]
         # Liveness signal: per-poster most recent acceptance, so hunters can
         # tell which posters still review claims.
         last_accepted={}
@@ -1679,11 +1881,22 @@ class AgentWorld:
         return {"bounties":out,"count":len(out)}
 
     def sweep_bounties(self):
-        """Expire stale open bounties: escrow returns to the poster, status
-        becomes 'expired'. Run lazily on every board read. Bounties posted
-        before expiry existed get created_at + 30 days."""
+        """Time-based bounty hygiene, run lazily on every board read:
+        - open bounties past expires_at expire (escrow back to poster)
+        - claimed bounties past the 7-day review SLA auto-accept (escrow to hunter)
+        Bounties posted before expiry existed get created_at + 30 days."""
         now=datetime.now(timezone.utc)
         for b in self.bounties.values():
+            if b["status"]=="claimed" and b.get("claimed_at"):
+                try:
+                    if datetime.fromisoformat(b["claimed_at"])+CLAIM_REVIEW_SLA<=now:
+                        self._settle_bounty(b, auto=True)
+                        self._notify(b["poster_id"],
+                            {"type":"bounty_auto_accepted","bounty_id":b["id"],
+                             "body":f"Bounty {b['id']} auto-accepted after the 7-day review SLA; escrow released to {b['hunter_id']}."})
+                except Exception:
+                    pass
+                continue
             if b["status"]!="open":
                 continue
             exp=b.get("expires_at")
@@ -1702,7 +1915,7 @@ class AgentWorld:
                                          idem=f"bounty-expire:{b['id']}")
                     self._sync_balance(b["poster_id"])
                     b["status"]="expired"
-                    self.notifications.setdefault(b["poster_id"],[]).append(
+                    self._notify(b["poster_id"], 
                         {"type":"bounty_expired","bounty_id":b["id"],
                          "body":f"Bounty {b['id']} expired with no claims; {b['reward']} DAIL escrow returned."})
                     self.audit.append("bounty.expired", {"bounty_id":b["id"]})
@@ -1738,11 +1951,27 @@ class AgentWorld:
         b["submission"]=None
         b["claimed_at"]=None
         self._save_kv()
-        self.notifications.setdefault(b["poster_id"],[]).append(
+        self._notify(b["poster_id"], 
             {"type":"claim_released","bounty_id":bounty_id,
              "body":f"Hunter {agent_id} withdrew their claim on {bounty_id}; it is open again."})
         self.audit.append("bounty.claim_released", {"bounty_id":bounty_id,"agent_id":agent_id})
         return b
+
+    def batch_review_bounties(self, agent_id, bounty_ids, accept):
+        """Accept or reject several claimed bounties at once. Best-effort:
+        returns per-bounty results; one failure doesn't stop the rest."""
+        results = []
+        for bid in (bounty_ids or [])[:50]:
+            try:
+                if accept:
+                    self.accept_bounty(agent_id, bid)
+                else:
+                    self.reject_bounty(agent_id, bid)
+                results.append({"bounty_id": bid, "ok": True})
+            except Exception as e:
+                results.append({"bounty_id": bid, "ok": False, "error": str(e)[:120]})
+        return {"results": results,
+                "accepted": sum(1 for r in results if r["ok"])}
 
     def _get_bounty(self, bounty_id):
         if bounty_id not in self.bounties: raise KeyError("bounty not found")
@@ -1768,7 +1997,7 @@ class AgentWorld:
         if not submission or len(submission) > 5000: raise ValueError("submission must be 1-5000 characters")
         b["status"]="claimed"; b["hunter_id"]=hunter_id; b["submission"]=submission
         b["claimed_at"]=datetime.now(timezone.utc).isoformat()
-        self.notifications.setdefault(b["poster_id"],[]).append(
+        self._notify(b["poster_id"], 
             {"type":"bounty_claimed","bounty_id":bounty_id,
              "body":f"Bounty {bounty_id} claimed by {hunter_id}. Accept via POST /world/bounties/{bounty_id}/accept to release {b['reward']} DAIL."})
         self._save_kv()
@@ -1779,6 +2008,12 @@ class AgentWorld:
         b=self._get_bounty(bounty_id)
         if b["poster_id"]!=poster_id: raise PermissionError("not your bounty")
         if b["status"]!="claimed": raise ValueError("bounty has no claim to accept")
+        return self._settle_bounty(b, auto=False)
+
+    def _settle_bounty(self, b, auto=False):
+        """Release a claimed bounty's escrow to the hunter. auto=True when
+        the 7-day poster review SLA lapsed (documented; the hunter earned it)."""
+        bounty_id=b["id"]
         reward=b["reward"]; escrow=f"escrow:{bounty_id}"
         fee=self._fee(reward); net=reward-fee
         hunter_id=b["hunter_id"]
@@ -1796,7 +2031,7 @@ class AgentWorld:
                                  kind="referral_fee_cut",
                                  idem=f"bounty-feecut:{bounty_id}")
             ref["fee_cuts"] = ref.get("fee_cuts", 0) + 1
-            self.notifications.setdefault(ref["referrer"], []).append(
+            self._notify(ref["referrer"], 
                 {"type": "referral_fee_cut", "referred_id": hunter_id,
                  "bounty_id": bounty_id, "amount": ref_cut,
                  "body": f"Your invitee {hunter_id} completed {bounty_id}: "
@@ -1808,12 +2043,12 @@ class AgentWorld:
                              kind="escrow_release", idem=f"bounty-release:{bounty_id}")
         self._sync_balance(hunter_id)
         b["status"]="completed"; b["completed_at"]=datetime.now(timezone.utc).isoformat()
-        b["fee"]=fee
-        self.notifications.setdefault(hunter_id,[]).append(
+        b["fee"]=fee; b["auto_accepted"]=auto
+        self._notify(hunter_id,
             {"type":"bounty_accepted","bounty_id":bounty_id,
-             "body":f"Bounty {bounty_id} accepted: {net} DAIL released (fee {fee})."})
+             "body":f"Bounty {bounty_id} {'auto-' if auto else ''}accepted: {net} DAIL released (fee {fee})."})
         self._save_kv()
-        self.audit.append("bounty.completed", {"bounty_id":bounty_id,"hunter_id":hunter_id,"fee":fee,"referral_cut":ref_cut})
+        self.audit.append("bounty.completed", {"bounty_id":bounty_id,"hunter_id":hunter_id,"fee":fee,"referral_cut":ref_cut,"auto":auto})
         return b
 
     def _referral_fee_cut(self, hunter_id, fee):
@@ -1853,7 +2088,7 @@ class AgentWorld:
             b["rejected_hunters"].append(hunter)
         b["status"]="open"; b["hunter_id"]=None; b["submission"]=None
         b["claimed_at"]=None
-        self.notifications.setdefault(hunter,[]).append(
+        self._notify(hunter, 
             {"type":"bounty_rejected","bounty_id":bounty_id,
              "body":f"Bounty {bounty_id}: the poster declined your submission."})
         self._save_kv()

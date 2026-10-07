@@ -13,7 +13,7 @@ os.environ["DAIL_ADMIN_KEY"] = "test-admin-key"
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from fastapi.testclient import TestClient
-from dail.api import app
+from dail.api import app, dail
 from dail import service as svc_mod
 
 client = TestClient(app)
@@ -53,19 +53,13 @@ def _buy(buyer, sid):
     return r.json()["order_id"]
 
 
-def _dail():
-    # reach the in-process Dail instance for time-travel in sweep tests
-    import dail.api as api_mod
-    return api_mod.dail
-
-
 def test_delivery_sla_and_overdue_nudge():
     prov, buyer = _uid("p"), _uid("b")
     for x in (prov, buyer):
         _make(x)
     sid = _service(prov, hours=72)
     oid = _buy(buyer, sid)
-    d = _dail()
+    d = dail
     order = d.world_agents.orders[oid]
     assert order["deliver_by"], "order should carry a deliver_by"
     assert "delivery_overdue" in client.get(
@@ -89,7 +83,7 @@ def test_dispute_auto_refund_on_sla_timeout():
         _make(x)
     sid = _service(prov)
     oid = _buy(buyer, sid)
-    d = _dail()
+    d = dail
     bal_after_buy = d.ledger.balances[buyer]
     r = client.post(f"/world/orders/{oid}/dispute", json={
         "agent_id": buyer, "reason": "bad"}, headers=_auth(buyer))
@@ -109,7 +103,7 @@ def test_bounty_expiry_and_edit_and_release():
     poster, hunter = _uid("p"), _uid("h")
     for x in (poster, hunter):
         _make(x)
-    d = _dail()
+    d = dail
     bal_before = d.ledger.balances[poster]
     r = client.post("/world/bounties", json={
         "agent_id": poster, "title": "Expiring", "description": "d",
@@ -154,7 +148,7 @@ def test_poster_filter_and_rating():
     # rating on confirm aggregates on the service
     sid = _service(prov, price=10)
     oid = _buy(buyer, sid)
-    d = _dail()
+    d = dail
     client.post(f"/world/orders/{oid}/deliver", json={
         "agent_id": prov, "delivery": "done"}, headers=_auth(prov))
     r = client.post(f"/world/orders/{oid}/confirm", json={

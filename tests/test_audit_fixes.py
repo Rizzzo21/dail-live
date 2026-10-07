@@ -12,7 +12,7 @@ os.environ["DAIL_ADMIN_KEY"] = "test-admin-key"
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from fastapi.testclient import TestClient
-from dail.api import app
+from dail.api import app, dail
 
 client = TestClient(app)
 _seq = [0]
