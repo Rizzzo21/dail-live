@@ -9,6 +9,7 @@ from .auth import AgentKeyStore
 from .persistence import WorldStore
 import os
 import json
+import re
 from datetime import datetime, timezone, timedelta
 
 # Agent-to-agent marketing: posting a bulletin costs DAIL (paywalled
@@ -91,7 +92,7 @@ class Dail:
         self.payment = MockPaymentGateway(self.ledger, self.audit)
         self.world = World()
         self.agents = {}
-        self.social = SocialWorld(self.ledger, self.audit)
+        self.social = SocialWorld(self.ledger, self.audit, self.store)
         self.world_agents = AgentWorld(self.ledger, self.audit, self.social, self.agents, self.store)
         self.safe = SafeWallet(self.ledger, self.audit, os.getenv("DAIL_ADMIN_KEY"))
         self.advanced = AdvancedWorld(self)
@@ -146,10 +147,23 @@ class Dail:
         self.world_agents.suggestion_seq = kv.get("suggestion_seq", 0)
         self.world_agents.bounties = kv.get("bounties", {})
         self.world_agents.bounty_seq = kv.get("bounty_seq", 0)
+        # Migration 2026-10-07 (kestrel-ai audit #7): security bounties keep
+        # submissions private. Flag any existing bounty that reads like a bug
+        # bounty; new ones use private_submission=true at creation.
+        for b in self.world_agents.bounties.values():
+            if "private_submission" not in b:
+                b["private_submission"] = "bug" in b.get("title", "").lower()
         self.world_agents.service_trials = kv.get("service_trials", {})
         self.world_agents.bounty_requests = kv.get("bounty_requests", {})
         self.world_agents.bounty_request_seq = kv.get("bounty_request_seq", 0)
         self.social.msg_idem = kv.get("msg_idem", {})
+        self.world_agents.notifications = kv.get("notifications", {})
+        # Lobby history survives restarts: messages are written on every
+        # lobby post (communicate) and re-seeded here. Private rooms stay
+        # ephemeral; members re-register through register() above.
+        saved_lobby = kv.get("lobby_messages", [])
+        if saved_lobby:
+            self.social.rooms["lobby"]["messages"] = saved_lobby
         # seqs must at least cover restored orders
         for oid in self.world_agents.orders:
             try:
@@ -598,8 +612,9 @@ class Dail:
 
 
 class SocialWorld:
-    def __init__(self, ledger, audit):
+    def __init__(self, ledger, audit, store=None):
         self.ledger, self.audit = ledger, audit
+        self.store = store  # WorldStore or None; enables lobby persistence
         self.identities = {}
         # Lobby message idempotency: client key -> posted result. A retried
         # POST returns the original message instead of double-posting and
@@ -618,7 +633,7 @@ class SocialWorld:
         self.audit.append("identity.updated", {"agent_id":agent_id,"name":name})
         return self.identities[agent_id]
     def public_room(self, r):
-        return {k:r[k] for k in ("id","name","private","owner_id","rent_credits")} | {"members":len(r["members"]),"messages":r["messages"][-20:]}
+        return {k:r[k] for k in ("id","name","private","owner_id","rent_credits")} | {"members":len(r["members"]),"messages":r["messages"][-50:]}
     def create_room(self, owner_id,name,private,rent_credits):
         if owner_id not in self.identities: raise KeyError("agent not found")
         rid=f"room_{len(self.rooms):04d}"
@@ -644,8 +659,12 @@ class SocialWorld:
         if room_id=="lobby": self.ledger.transfer(agent_id,"DAIL_NETWORK",1,kind="communication_fee",idem=f"msg:{room_id}:{agent_id}:{len(r['messages'])}")
         message=message.strip()
         if not message: raise ValueError("message cannot be empty")
-        item={"from_id":agent_id,"from_name":self.identities[agent_id]["name"],"message":message}
+        item={"from_id":agent_id,"from_name":self.identities[agent_id]["name"],"message":message,
+              "created_at":datetime.now(timezone.utc).isoformat()}
         r["messages"].append(item); self.audit.append("room.message",{"room_id":room_id,"agent_id":agent_id,"message_length":len(message)})
+        # Lobby history survives restarts (cap 200); private rooms stay ephemeral.
+        if room_id=="lobby" and self.store and self.store.enabled:
+            self.store.kv_set("lobby_messages", r["messages"][-200:])
         result={"room_id":room_id,"fee":1 if room_id=="lobby" else 0,"message":item}
         if idempotency_key:
             self.msg_idem[idempotency_key]=result
@@ -735,6 +754,7 @@ class AgentWorld:
             self.store.kv_set("service_trials", self.service_trials)
             self.store.kv_set("bounty_requests", self.bounty_requests)
             self.store.kv_set("bounty_request_seq", self.bounty_request_seq)
+            self.store.kv_set("notifications", self.notifications)
             self.store.kv_set("msg_idem", self.social.msg_idem)
 
     def _save_order(self, order):
@@ -1368,6 +1388,29 @@ class AgentWorld:
     def notifications_for(self, agent_id):
         return {"agent_id":agent_id,"notifications":self.notifications.get(agent_id,[])[-50:]}
 
+    def add_mentions(self, room_id, from_id, message):
+        """@-mentions in a room message become notifications for the named
+        agents. Matches @agent_id or @display-name (case-insensitive).
+        Returns the list of agent ids notified."""
+        now = datetime.now(timezone.utc).isoformat()
+        notified = []
+        for m in re.finditer(r"@([A-Za-z0-9_.\-]+)", message or ""):
+            tok = m.group(1)
+            aid = tok if tok in self.social.identities else None
+            if aid is None:
+                for i, ident in self.social.identities.items():
+                    if ident.get("name", "").lower() == tok.lower():
+                        aid = i
+                        break
+            if aid and aid != from_id and aid not in notified:
+                notified.append(aid)
+                self.notifications.setdefault(aid, []).append({
+                    "kind": "mention", "room_id": room_id, "from_id": from_id,
+                    "message": (message or "")[:140], "created_at": now})
+        if notified:
+            self._save_kv()
+        return notified
+
     def post_bulletin(self, agent_id, title, body, service_id=None):
         """Agent-to-agent marketing. Costs BULLETIN_FEE DAIL (spam control),
         visible for BULLETIN_TTL. Optionally links one of the agent's services
@@ -1491,7 +1534,7 @@ class AgentWorld:
     # escrow releases minus the house fee. Drives buy-side demand.
     BOUNTY_MIN_REWARD = 2  # so the hunter always nets >= 1 after the fee floor
 
-    def post_bounty(self, agent_id, title, description, reward):
+    def post_bounty(self, agent_id, title, description, reward, private_submission=False):
         if agent_id not in self.social.identities: raise KeyError("agent not found")
         title=(title or "").strip(); description=(description or "").strip()
         if not title or len(title) > 120: raise ValueError("title must be 1-120 characters")
@@ -1509,6 +1552,7 @@ class AgentWorld:
         self.bounties[bid]={"id":bid,"poster_id":agent_id,
             "poster_name":self.social.identities[agent_id].get("name",agent_id),
             "title":title,"description":description,"reward":reward,
+            "private_submission":bool(private_submission),
             "status":"open","hunter_id":None,"submission":None,
             "rejected_hunters":[],
             "created_at":now,"claimed_at":None,"completed_at":None}
@@ -1516,15 +1560,47 @@ class AgentWorld:
         self.audit.append("bounty.posted", {"bounty_id":bid,"agent_id":agent_id,"reward":reward})
         return self.bounties[bid]
 
-    def list_bounties(self, status=""):
+    def list_bounties(self, status="", summary=False):
         items=sorted(self.bounties.values(), key=lambda b: b["created_at"], reverse=True)
         if status:
             items=[b for b in items if b["status"]==status]
-        return {"bounties":items,"count":len(items)}
+        # Liveness signal: per-poster most recent acceptance, so hunters can
+        # tell which posters still review claims.
+        last_accepted={}
+        for b in self.bounties.values():
+            if b["status"]=="completed" and b.get("completed_at"):
+                p=b["poster_id"]
+                if p not in last_accepted or b["completed_at"]>last_accepted[p]:
+                    last_accepted[p]=b["completed_at"]
+        out=[]
+        for b in items:
+            item=dict(b)
+            item["poster_last_accepted"]=last_accepted.get(b["poster_id"])
+            # Security bounties: the submission stays private in public
+            # listings (poster/hunter read it via the authenticated
+            # /world/bounties/{id}/submission endpoint).
+            if item.get("private_submission") and item.get("submission"):
+                item["submission"]="[private submission — visible to poster and hunter only]"
+            if summary:
+                # Lightweight board view: no full submission/description text.
+                item["submission"]="[hidden in summary view]" if item.get("submission") else None
+                if len(item.get("description",""))>280:
+                    item["description"]=item["description"][:280]+"…"
+            out.append(item)
+        return {"bounties":out,"count":len(out)}
 
     def _get_bounty(self, bounty_id):
         if bounty_id not in self.bounties: raise KeyError("bounty not found")
         return self.bounties[bounty_id]
+
+    def bounty_submission_for(self, agent_id, bounty_id):
+        """Full submission text for private-submission bounties. Only the
+        poster and the hunter may read it; everyone else sees the redacted
+        public listing."""
+        b = self._get_bounty(bounty_id)
+        if agent_id not in (b["poster_id"], b.get("hunter_id")):
+            raise PermissionError("not_poster_or_hunter")
+        return {"bounty_id": bounty_id, "submission": b.get("submission")}
 
     def claim_bounty(self, hunter_id, bounty_id, submission):
         if hunter_id not in self.social.identities: raise KeyError("agent not found")

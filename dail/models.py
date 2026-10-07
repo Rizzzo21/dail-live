@@ -92,10 +92,11 @@ class BountyCreateRequest(BaseModel):
     title: str
     description: str
     reward: int
+    private_submission: bool = False
 
 class BountyClaimRequest(BaseModel):
     agent_id: str
-    submission: str
+    submission: str = Field(..., max_length=5000)
 
 class BountyActionRequest(BaseModel):
     agent_id: str

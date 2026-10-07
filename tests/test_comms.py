@@ -1,0 +1,135 @@
+"""Inter-agent comms (Slice A): @-mentions become pollable notifications and the
+lobby history survives restarts.
+
+Covers the route wiring (mention -> notification on a fresh POST, no
+duplicate on idempotency retry, no self-notify, @display-name matching) and
+the persistence round-trip (notifications + lobby messages restored after a
+restart when the store is enabled).
+"""
+import os
+import sys
+from pathlib import Path
+
+os.environ.pop("DAIL_REAL_PAYMENTS", None)
+os.environ.pop("DATABASE_URL", None)
+os.environ["DAIL_TRADE_FEE_BPS"] = "1000"
+os.environ["DAIL_ADMIN_KEY"] = "test-admin-key"
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from fastapi.testclient import TestClient
+from dail.api import app
+
+client = TestClient(app)
+_seq = [0]
+_keys = {}
+
+
+def _uid(prefix):
+    _seq[0] += 1
+    return f"{prefix}_cm{_seq[0]}"
+
+
+def _make(aid):
+    r = client.post("/agents", json={"id": aid, "name": aid})
+    assert r.status_code == 200, r.text
+    _keys[aid] = r.json()["api_key"]
+    return _keys[aid]
+
+
+def _auth(aid):
+    return {"Authorization": f"Bearer {_keys[aid]}"}
+
+
+def _post(aid, room_id, message, idem=""):
+    payload = {"agent_id": aid, "room_id": room_id, "message": message}
+    if idem:
+        payload["idempotency_key"] = idem
+    return client.post("/social/rooms/message", json=payload, headers=_auth(aid))
+
+
+def _notifs(aid):
+    r = client.get(f"/world/notifications/{aid}", headers=_auth(aid))
+    assert r.status_code == 200, r.text
+    return r.json()["notifications"]
+
+
+def test_mention_creates_notification_via_route():
+    a, b = _uid("poster"), _uid("mentioned")
+    _make(a)
+    _make(b)
+    r = _post(a, "lobby", f"hey @{b} check this bounty")
+    assert r.status_code == 200, r.text
+    notifs = _notifs(b)
+    assert len(notifs) == 1
+    assert notifs[0]["kind"] == "mention"
+    assert notifs[0]["room_id"] == "lobby"
+    assert notifs[0]["from_id"] == a
+
+
+def test_idempotent_retry_does_not_duplicate_notification():
+    a, b = _uid("poster"), _uid("mentioned")
+    _make(a)
+    _make(b)
+    key = f"mention-idem-{a}"
+    r1 = _post(a, "lobby", f"ping @{b}", idem=key)
+    r2 = _post(a, "lobby", f"ping @{b}", idem=key)
+    assert r1.status_code == 200 and r2.status_code == 200
+    assert len(_notifs(b)) == 1
+
+
+def test_no_self_notification():
+    a = _uid("selfie")
+    _make(a)
+    r = _post(a, "lobby", f"note to self @{a}")
+    assert r.status_code == 200, r.text
+    assert _notifs(a) == []
+
+
+def test_mention_matches_display_name_case_insensitive():
+    a, b = _uid("poster"), _uid("mentioned")
+    _make(a)
+    _make(b)
+    r = _post(a, "lobby", f"hello @{b.upper()} are you there")
+    assert r.status_code == 200, r.text
+    assert len(_notifs(b)) == 1
+
+
+def test_message_without_mention_notifies_nobody():
+    a, b = _uid("poster"), _uid("quiet")
+    _make(a)
+    _make(b)
+    r = _post(a, "lobby", "just talking, no mentions here")
+    assert r.status_code == 200, r.text
+    assert _notifs(b) == []
+
+
+def test_notifications_and_lobby_survive_restart(tmp_path):
+    from conftest import fund_vault
+    from dail.models import Agent
+    from dail.service import Dail
+
+    db_url = f"sqlite:///{tmp_path}/comms_restart.db"
+    old = os.environ.get("DATABASE_URL")
+    os.environ["DATABASE_URL"] = db_url
+    try:
+        d1 = Dail()
+        fund_vault(d1)
+        d1.create_agent(Agent(id="c1", name="c1", goal="test", balance=100))
+        d1.create_agent(Agent(id="c2", name="c2", goal="test", balance=100))
+        d1.social.communicate("c1", "lobby", "hey @c2 post your bounty", "")
+        d1.world_agents.add_mentions("lobby", "c1", "hey @c2 post your bounty")
+
+        d2 = Dail()  # fresh instance, same DB = simulated redeploy
+        notifs = d2.world_agents.notifications_for("c2")["notifications"]
+        assert len(notifs) == 1
+        assert notifs[0]["kind"] == "mention"
+        assert notifs[0]["from_id"] == "c1"
+        msgs = d2.social.rooms["lobby"]["messages"]
+        assert any(m["message"] == "hey @c2 post your bounty" for m in msgs)
+        assert "c1" in d2.social.rooms["lobby"]["members"]
+        assert "c2" in d2.social.rooms["lobby"]["members"]
+    finally:
+        if old is None:
+            os.environ.pop("DATABASE_URL", None)
+        else:
+            os.environ["DATABASE_URL"] = old
