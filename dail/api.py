@@ -1351,8 +1351,11 @@ def world_discover(req: AgentDiscoverRequest, request: Request):
 
 @app.post("/world/trades")
 def world_trade(req: TradeRequest, request: Request):
-    if not request.state.is_admin and request.state.caller not in (req.seller_id, req.buyer_id):
-        raise HTTPException(403, "not_your_agent")
+    # SECURITY FIX 2026-10-07: only the PAYER may initiate a trade. The old
+    # gate let either party call, and trade() debits buyer_id with no consent
+    # step -- any agent could drain any other agent's balance unilaterally.
+    if not request.state.is_admin and request.state.caller != req.buyer_id:
+        raise HTTPException(403, "only_the_buyer_can_initiate_a_trade")
     try: return dail.world_agents.trade(req.seller_id, req.buyer_id, req.amount, req.item, req.idempotency_key)
     except KeyError as e: raise HTTPException(404, str(e))
     except LedgerError as e: raise HTTPException(400, str(e))
@@ -1884,7 +1887,11 @@ def runtime_schedule(req: RuntimeScheduleRequest, request: Request):
     except ValueError as e: raise HTTPException(400, str(e))
 
 @app.post("/runtime/scheduler/tick")
-def runtime_scheduler_tick():
+def runtime_scheduler_tick(request: Request):
+    # SECURITY FIX 2026-10-07: advancing the global scheduler executes other
+    # agents' scheduled actions (purchase_service spends their DAIL,
+    # message_lobby impersonates them). Admin only.
+    _require_admin(request)
     return agent_runtime.scheduler.advance()
 
 @app.get("/runtime/scheduler")

@@ -52,7 +52,7 @@ def test_trade_fee_flows_to_treasury():
     t0 = _treasury()["balance"]
     r = client.post("/world/trades", json={
         "seller_id": s, "buyer_id": b, "amount": 100,
-        "item": "widget", "idempotency_key": f"k-{s}"}, headers=_auth(s))
+        "item": "widget", "idempotency_key": f"k-{s}"}, headers=_auth(b))
     assert r.status_code == 200, r.text
     t = r.json()
     assert t["fee"] == 10 and t["seller_net"] == 90
@@ -67,7 +67,7 @@ def test_minimum_fee_floor_on_micro_trade():
     t0 = _treasury()["balance"]
     r = client.post("/world/trades", json={
         "seller_id": s, "buyer_id": b, "amount": 5,
-        "item": "micro", "idempotency_key": f"micro-{s}"}, headers=_auth(s))
+        "item": "micro", "idempotency_key": f"micro-{s}"}, headers=_auth(b))
     assert r.status_code == 200, r.text
     t = r.json()
     assert t["fee"] == 1 and t["seller_net"] == 4  # 10% of 5 truncates to 0 -> floor 1
@@ -79,8 +79,8 @@ def test_trade_replay_still_idempotent_with_fee():
     _make(s); _make(b)
     body = {"seller_id": s, "buyer_id": b, "amount": 100,
             "item": "w", "idempotency_key": f"rk-{s}"}
-    assert client.post("/world/trades", json=body, headers=_auth(s)).status_code == 200
-    assert client.post("/world/trades", json=body, headers=_auth(s)).status_code == 200
+    assert client.post("/world/trades", json=body, headers=_auth(b)).status_code == 200
+    assert client.post("/world/trades", json=body, headers=_auth(b)).status_code == 200
     assert _bal(b) == 0 and _bal(s) == 190  # charged exactly once
 
 
@@ -161,7 +161,7 @@ def test_referral_reward_on_first_trade():
     # buyer: 100 - 20 = 80; new: 100 + 18 = 118; inviter: 100 + 10 reward = 110.
     r = client.post("/world/trades", json={
         "seller_id": new, "buyer_id": buyer, "amount": 20,
-        "item": "y", "idempotency_key": f"ref-{new}"}, headers=_auth(new))
+        "item": "y", "idempotency_key": f"ref-{new}"}, headers=_auth(buyer))
     assert r.status_code == 200, r.text
     assert _bal(buyer) == 80, _bal(buyer)
     assert _bal(new) == 118, _bal(new)
@@ -169,7 +169,7 @@ def test_referral_reward_on_first_trade():
     # trade 2: reward must not pay twice. buyer: 80 - 20 = 60.
     r = client.post("/world/trades", json={
         "seller_id": new, "buyer_id": buyer, "amount": 20,
-        "item": "y2", "idempotency_key": f"ref2-{new}"}, headers=_auth(new))
+        "item": "y2", "idempotency_key": f"ref2-{new}"}, headers=_auth(buyer))
     assert r.status_code == 200, r.text
     assert _bal(buyer) == 60, _bal(buyer)
     assert _bal(inviter) == 110, _bal(inviter)

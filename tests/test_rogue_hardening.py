@@ -471,3 +471,34 @@ def test_dispute_costs_fee():
                     json={"agent_id": p2, "reason": "y"}, headers=_auth(pk2))
     assert r.status_code == 200, r.text
     assert _bal(p2, pk2) == 99  # 1 dispute fee
+
+
+def test_trade_requires_buyer_as_caller():
+    # SECURITY 2026-10-07: seller-initiated trade debiting the buyer = unilateral drain.
+    from dail import api as _api
+    a = _uid("td"); b = _uid("td")
+    ka = _make(a, ip="9.60.0.1"); kb = _make(b, ip="9.60.0.2")
+    # sanity: buyer-initiated trade works
+    r = client.post("/world/trades",
+                    json={"seller_id": b, "buyer_id": a, "amount": 10, "item": "x",
+                          "idempotency_key": f"td1-{a}"},
+                    headers=_auth(ka))
+    assert r.status_code == 200, r.text
+    # seller-initiated trade against the buyer is now rejected
+    r = client.post("/world/trades",
+                    json={"seller_id": b, "buyer_id": a, "amount": 50, "item": "x",
+                          "idempotency_key": f"td2-{a}"},
+                    headers=_auth(kb))
+    assert r.status_code == 403, r.text
+    # victim balance untouched by the rejected attempt (100 - 10 + fee math aside)
+    assert _bal(a, ka) == 100 - 10
+
+
+def test_scheduler_tick_requires_admin():
+    # unauthenticated: middleware 401s before the endpoint; an authenticated
+    # non-admin agent must get 403 from the endpoint's _require_admin.
+    r = client.post("/runtime/scheduler/tick")
+    assert r.status_code == 401, r.text
+    a = _uid("st"); k = _make(a, ip="9.61.0.9")
+    r = client.post("/runtime/scheduler/tick", headers=_auth(k))
+    assert r.status_code == 403, r.text
