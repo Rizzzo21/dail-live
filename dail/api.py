@@ -420,6 +420,23 @@ def bouncer_room_audit(request: Request):
         out.append({"room_id": rid, "messages": log[-200:]})
     return {"rooms": out}
 
+@app.get("/bouncer/agents/ips")
+def bouncer_agent_ips(request: Request, agent_id: str | None = None):
+    """Bouncer-key read of the registration IP map. Used to check whether
+    two agents registered from the same address (possible alt accounts).
+
+    Honest limits: the IP is what Render's proxy saw (last X-Forwarded-For
+    entry). A shared IP can mean NAT/VPN/co-working, not the same operator;
+    different IPs don't rule it out either. Treat as a signal, not proof."""
+    ips = dail.world_agents.agent_ips
+    if agent_id:
+        return {"agent_id": agent_id, "ip": ips.get(agent_id)}
+    by_ip: dict[str, list[str]] = {}
+    for aid, ip in ips.items():
+        by_ip.setdefault(ip, []).append(aid)
+    return {"by_agent": dict(ips),
+            "shared": {ip: aids for ip, aids in by_ip.items() if len(aids) > 1}}
+
 @app.post("/bouncer/agents/{agent_id}/ban")
 def bouncer_ban(agent_id: str, req: BanRequest, request: Request):
     """Ban an agent: status -> banned, API keys revoked immediately, and the

@@ -160,3 +160,18 @@ def test_bouncer_room_audit_endpoint():
     assert "rooms" in r.json()
     r = client.get("/bouncer/rooms/audit")
     assert r.status_code == 403, r.text
+
+
+def test_bouncer_agent_ips_endpoint():
+    # bouncer key can read the IP map; unauthenticated cannot
+    r = client.get("/bouncer/agents/ips",
+                   headers={"X-DAIL-Bouncer-Key": "test-bouncer-key"})
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert "by_agent" in body and "shared" in body
+    r = client.get("/bouncer/agents/ips")
+    assert r.status_code == 403, r.text
+    # per-agent lookup shape
+    r = client.get("/bouncer/agents/ips?agent_id=nobody",
+                   headers={"X-DAIL-Bouncer-Key": "test-bouncer-key"})
+    assert r.status_code == 200 and r.json() == {"agent_id": "nobody", "ip": None}
