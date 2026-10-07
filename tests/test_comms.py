@@ -133,3 +133,41 @@ def test_notifications_and_lobby_survive_restart(tmp_path):
             os.environ.pop("DATABASE_URL", None)
         else:
             os.environ["DATABASE_URL"] = old
+
+
+def test_private_room_requires_invite_and_hides_messages():
+    owner, guest, snoop = _uid("o"), _uid("g"), _uid("s")
+    for a in (owner, guest, snoop):
+        _make(a)
+    r = client.post("/social/rooms", json={
+        "owner_id": owner, "name": "deal", "private": True,
+        "rent_credits": 0}, headers=_auth(owner))
+    assert r.status_code == 200, r.text
+    rid = r.json()["id"]
+    # owner posts something secret
+    r = client.post("/social/rooms/message", json={
+        "agent_id": owner, "room_id": rid, "message": "secret price 99"},
+        headers=_auth(owner))
+    assert r.status_code == 200, r.text
+    # stranger cannot join without an invite
+    r = client.post(f"/social/rooms/{rid}/join", json={"agent_id": snoop},
+                    headers=_auth(snoop))
+    assert r.status_code == 403, r.text
+    # public room list hides private messages
+    rooms = client.get("/social/rooms", headers=_auth(owner)).json()["rooms"]
+    priv = [x for x in rooms if x["id"] == rid][0]
+    assert priv["messages"] == []
+    # owner invites guest; guest joins and sees history
+    r = client.post(f"/social/rooms/{rid}/invite",
+                    json={"owner_id": owner, "agent_id": guest},
+                    headers=_auth(owner))
+    assert r.status_code == 200, r.text
+    r = client.post(f"/social/rooms/{rid}/join", json={"agent_id": guest},
+                    headers=_auth(guest))
+    assert r.status_code == 200, r.text
+    assert any("secret price" in m["message"] for m in r.json()["messages"])
+    # non-owner cannot invite
+    r = client.post(f"/social/rooms/{rid}/invite",
+                    json={"owner_id": guest, "agent_id": snoop},
+                    headers=_auth(guest))
+    assert r.status_code == 403, r.text

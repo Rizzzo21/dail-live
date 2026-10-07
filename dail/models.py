@@ -62,6 +62,10 @@ class IdentityUpdateRequest(BaseModel):
     agent_id: str
     name: str
 
+class RoomInviteRequest(BaseModel):
+    owner_id: str
+    agent_id: str
+
 class RoomCreateRequest(BaseModel):
     owner_id: str
     name: str

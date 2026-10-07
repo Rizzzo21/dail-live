@@ -689,18 +689,32 @@ class SocialWorld:
         self.identities[agent_id]["name"]=name
         self.audit.append("identity.updated", {"agent_id":agent_id,"name":name})
         return self.identities[agent_id]
-    def public_room(self, r):
-        return {k:r[k] for k in ("id","name","private","owner_id","rent_credits")} | {"members":len(r["members"]),"messages":r["messages"][-50:]}
+    def public_room(self, r, include_messages=True):
+        d={k:r[k] for k in ("id","name","private","owner_id","rent_credits")} | {"members":len(r["members"])}
+        d["messages"]=r["messages"][-50:] if include_messages else []
+        return d
     def create_room(self, owner_id,name,private,rent_credits):
         if owner_id not in self.identities: raise KeyError("agent not found")
         rid=f"room_{len(self.rooms):04d}"
-        self.rooms[rid]={"id":rid,"name":name.strip() or rid,"private":private,"owner_id":owner_id,"rent_credits":rent_credits,"members":{owner_id},"messages":[]}
+        self.rooms[rid]={"id":rid,"name":name.strip() or rid,"private":private,"owner_id":owner_id,"rent_credits":rent_credits,"members":{owner_id},"invitees":set(),"messages":[]}
         self.audit.append("room.created", {"room_id":rid,"owner_id":owner_id,"private":private,"rent_credits":rent_credits})
         return self.public_room(self.rooms[rid])
+    def invite_to_room(self, owner_id, room_id, agent_id):
+        """Room owners invite agents to private rooms. No invite, no entry."""
+        if room_id not in self.rooms: raise KeyError("room not found")
+        r=self.rooms[room_id]
+        if r["owner_id"]!=owner_id: raise PermissionError("not your room")
+        if agent_id not in self.identities: raise KeyError("agent not found")
+        r["invitees"].add(agent_id)
+        self.audit.append("room.invited",{"room_id":room_id,"agent_id":agent_id})
+        return {"room_id":room_id,"invited":agent_id}
+
     def join_room(self, agent_id,room_id):
         if agent_id not in self.identities: raise KeyError("agent not found")
         if room_id not in self.rooms: raise KeyError("room not found")
         r=self.rooms[room_id]
+        if r["private"] and agent_id!=r["owner_id"] and agent_id not in r.get("invitees",set()):
+            raise PermissionError("not_invited")
         if r["private"] and agent_id!=r["owner_id"] and r["rent_credits"]>0:
             self.ledger.transfer(agent_id,r["owner_id"],r["rent_credits"],kind="room_rent",idem=f"roomrent:{room_id}:{agent_id}")
         r["members"].add(agent_id); self.audit.append("room.joined",{"room_id":room_id,"agent_id":agent_id}); return self.public_room(r)

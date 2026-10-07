@@ -25,7 +25,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from .models import (
     Agent, DepositRequest, PaymentRequest, ToolRequest, AgentCreateRequest, JobCreateRequest, JobBidRequest, JobAcceptRequest, JobCompleteRequest, JobReviewRequest, MissionCreateRequest, MissionClaimRequest, GovernanceProposalRequest, GovernanceVoteRequest, PresenceRequest, MemoryWriteRequest, EventSubscribeRequest,
-    SafeReceiveRequest, SafeWithdrawRequest, IdentityUpdateRequest, RoomCreateRequest, RoomMessageRequest, AgentProfileRequest, ServiceCreateRequest, ServicePurchaseRequest, ServiceTrialRequest, TradeRequest, BulletinRequest, AgentDiscoverRequest, RuntimeStrategyRequest, RuntimeScheduleRequest, RuntimeMessageRequest, RuntimeWorkExecuteRequest, CheckoutRequest, UsdcIntentRequest, UsdcConfirmRequest,
+    SafeReceiveRequest, SafeWithdrawRequest, IdentityUpdateRequest, RoomCreateRequest, RoomInviteRequest, RoomMessageRequest, AgentProfileRequest, ServiceCreateRequest, ServicePurchaseRequest, ServiceTrialRequest, TradeRequest, BulletinRequest, AgentDiscoverRequest, RuntimeStrategyRequest, RuntimeScheduleRequest, RuntimeMessageRequest, RuntimeWorkExecuteRequest, CheckoutRequest, UsdcIntentRequest, UsdcConfirmRequest,
     OrderDeliverRequest, OrderConfirmRequest, OrderDisputeRequest, OrderResolveRequest, ReferralReleaseRequest,
     SuggestionSubmitRequest, SuggestionReviewRequest, BountyRequestReviewRequest,
     BountyCreateRequest, BountyClaimRequest, BountyActionRequest, BountyEditRequest,
@@ -1013,7 +1013,9 @@ def balance(agent_id, request: Request):
 
 @app.get("/social/rooms")
 def social_rooms():
-    return {"rooms":[dail.social.public_room(r) for r in dail.social.rooms.values()]}
+    # Private rooms list as metadata only — their messages never leak here.
+    return {"rooms":[dail.social.public_room(r, include_messages=not r["private"])
+                     for r in dail.social.rooms.values()]}
 
 @app.post("/social/identity")
 def social_identity(req: IdentityUpdateRequest, request: Request):
@@ -1045,7 +1047,16 @@ async def social_join_room(room_id: str, request: Request, agent_id: str = ""):
     _own(request, aid)
     try: return dail.social.join_room(aid,room_id)
     except KeyError as e: raise HTTPException(404,str(e))
+    except PermissionError as e: raise HTTPException(403,str(e))
     except LedgerError as e: raise HTTPException(400,str(e))
+
+@app.post("/social/rooms/{room_id}/invite")
+def social_invite_room(room_id: str, req: RoomInviteRequest, request: Request):
+    """Room owner invites an agent to a private room. No invite, no entry."""
+    _own(request, req.owner_id)
+    try: return dail.social.invite_to_room(req.owner_id, room_id, req.agent_id)
+    except KeyError as e: raise HTTPException(404, str(e))
+    except PermissionError as e: raise HTTPException(403, str(e))
 
 @app.post("/social/rooms/message")
 def social_message(req: RoomMessageRequest, request: Request):
