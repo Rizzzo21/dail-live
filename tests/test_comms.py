@@ -171,3 +171,36 @@ def test_private_room_requires_invite_and_hides_messages():
                     json={"owner_id": guest, "agent_id": snoop},
                     headers=_auth(guest))
     assert r.status_code == 403, r.text
+
+
+def test_private_room_audit_log_and_bouncer_access():
+    from dail.api import dail as _d
+    owner, guest = _uid("o"), _uid("g")
+    for a in (owner, guest):
+        _make(a)
+    r = client.post("/social/rooms", json={
+        "owner_id": owner, "name": "deal", "private": True,
+        "rent_credits": 0}, headers=_auth(owner))
+    rid = r.json()["id"]
+    client.post(f"/social/rooms/{rid}/invite",
+                json={"owner_id": owner, "agent_id": guest},
+                headers=_auth(owner))
+    client.post(f"/social/rooms/{rid}/join", json={"agent_id": guest},
+                headers=_auth(guest))
+    client.post("/social/rooms/message", json={
+        "agent_id": owner, "room_id": rid, "message": "the plan is 99"},
+        headers=_auth(owner))
+    # recorded in the hidden audit
+    assert any("the plan is 99" in m["message"]
+               for m in _d.social.room_audit.get(rid, []))
+    # admin can read it
+    r = client.get(f"/admin/rooms/{rid}/messages",
+                   headers={"X-DAIL-Admin-Key": "test-admin-key"})
+    assert r.status_code == 200, r.text
+    assert any("the plan is 99" in m["message"] for m in r.json()["messages"])
+    r = client.get("/admin/rooms", headers={"X-DAIL-Admin-Key": "test-admin-key"})
+    assert r.status_code == 200
+    assert any(x["id"] == rid for x in r.json()["rooms"])
+    # agents cannot
+    r = client.get(f"/admin/rooms/{rid}/messages", headers=_auth(owner))
+    assert r.status_code == 403, r.text

@@ -176,6 +176,11 @@ class Dail:
         saved_lobby = kv.get("lobby_messages", [])
         if saved_lobby:
             self.social.rooms["lobby"]["messages"] = saved_lobby
+        # Hidden room audit survives restarts for admin/bouncer review only.
+        for rid in kv.get("room_audit_index", []) or []:
+            msgs = kv.get(f"room_messages:{rid}", [])
+            if msgs:
+                self.social.room_audit[rid] = msgs
         # seqs must at least cover restored orders
         for oid in self.world_agents.orders:
             try:
@@ -678,6 +683,9 @@ class SocialWorld:
         # double-charging the 1 DAIL communication fee. Persisted via dail_kv.
         self.msg_idem = {}
         self.rooms = {"lobby": {"id":"lobby","name":"DAiL LOBBY","private":False,"owner_id":"SYSTEM","rent_credits":0,"members":set(),"messages":[]}}
+        # Hidden room audit: every private-room message is recorded here for
+        # admin/bouncer review. Never exposed on any agent route.
+        self.room_audit = {}
     def register(self, agent):
         self.identities[agent.id] = {"id":agent.id,"name":agent.name}
         self.rooms["lobby"]["members"].add(agent.id)
@@ -693,6 +701,37 @@ class SocialWorld:
         d={k:r[k] for k in ("id","name","private","owner_id","rent_credits")} | {"members":len(r["members"])}
         d["messages"]=r["messages"][-50:] if include_messages else []
         return d
+    def _audit_room_message(self, room_id, item):
+        log=self.room_audit.setdefault(room_id, [])
+        log.append(item)
+        if len(log)>200: del log[:-200]
+        if self.store and self.store.enabled:
+            self.store.kv_set(f"room_messages:{room_id}", log[-200:])
+            idx=set(self.store.kv_get("room_audit_index", []) or [])
+            idx.add(room_id)
+            self.store.kv_set("room_audit_index", sorted(idx))
+
+    def admin_room_list(self):
+        """Every room the house can see, including recorded-only ones."""
+        out=[]
+        for rid, r in self.rooms.items():
+            out.append({"id":rid,"name":r["name"],"private":r["private"],
+                        "owner_id":r["owner_id"],"members":len(r["members"]),
+                        "live_messages":len(r["messages"]),
+                        "recorded_messages":len(self.room_audit.get(rid,[]))})
+        for rid, log in self.room_audit.items():
+            if rid not in self.rooms:
+                out.append({"id":rid,"name":rid,"private":True,"owner_id":"?",
+                            "members":0,"live_messages":0,
+                            "recorded_messages":len(log)})
+        return out
+
+    def admin_room_messages(self, room_id):
+        if room_id not in self.room_audit and room_id not in self.rooms:
+            raise KeyError("room not found")
+        return {"room_id":room_id,
+                "messages":self.room_audit.get(room_id, [])}
+
     def create_room(self, owner_id,name,private,rent_credits):
         if owner_id not in self.identities: raise KeyError("agent not found")
         rid=f"room_{len(self.rooms):04d}"
@@ -733,9 +772,13 @@ class SocialWorld:
         item={"from_id":agent_id,"from_name":self.identities[agent_id]["name"],"message":message,
               "created_at":datetime.now(timezone.utc).isoformat()}
         r["messages"].append(item); self.audit.append("room.message",{"room_id":room_id,"agent_id":agent_id,"message_length":len(message)})
-        # Lobby history survives restarts (cap 200); private rooms stay ephemeral.
+        # Lobby history survives restarts (cap 200). Private rooms stay
+        # ephemeral for members — but every private message is recorded in
+        # the hidden admin/bouncer audit log (cap 200 per room).
         if room_id=="lobby" and self.store and self.store.enabled:
             self.store.kv_set("lobby_messages", r["messages"][-200:])
+        if r["private"]:
+            self._audit_room_message(room_id, item)
         result={"room_id":room_id,"fee":1 if room_id=="lobby" else 0,"message":item}
         if idempotency_key:
             self.msg_idem[idempotency_key]=result

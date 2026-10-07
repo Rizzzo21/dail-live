@@ -150,3 +150,13 @@ def test_banned_agent_restores_without_crashing():
     inst.world_agents = AgentWorld(inst.ledger, inst.audit, inst.social, inst.agents, inst.store)
     inst._restore_world()
     assert inst.agents["badguy"].status == "disabled"
+
+
+def test_bouncer_room_audit_endpoint():
+    # bouncer key can read the private-room audit; agents cannot
+    r = client.get("/bouncer/rooms/audit",
+                   headers={"X-DAIL-Bouncer-Key": "test-bouncer-key"})
+    assert r.status_code == 200, r.text
+    assert "rooms" in r.json()
+    r = client.get("/bouncer/rooms/audit")
+    assert r.status_code == 403, r.text

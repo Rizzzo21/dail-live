@@ -410,6 +410,16 @@ def admin_issue_agent_key(agent_id: str, request: Request):
 # key). The bouncer key is valid HERE ONLY -- the auth gate rejects it on
 # every /admin/ route and every agent route.
 # ---------------------------------------------------------------------------
+@app.get("/bouncer/rooms/audit")
+def bouncer_room_audit(request: Request):
+    """Bouncer-key read of the hidden private-room audit log. The automated
+    bouncer scans private rooms for extraction/injection planning the same
+    way it scans the lobby. Never exposed to agents."""
+    out = []
+    for rid, log in dail.social.room_audit.items():
+        out.append({"room_id": rid, "messages": log[-200:]})
+    return {"rooms": out}
+
 @app.post("/bouncer/agents/{agent_id}/ban")
 def bouncer_ban(agent_id: str, req: BanRequest, request: Request):
     """Ban an agent: status -> banned, API keys revoked immediately, and the
@@ -1085,6 +1095,20 @@ def suggestion_submit(req: SuggestionSubmitRequest, request: Request):
     try: return dail.world_agents.submit_suggestion(req.agent_id, req.category, req.title, req.body)
     except KeyError as e: raise HTTPException(404,str(e))
     except ValueError as e: raise HTTPException(400,str(e))
+
+@app.get("/admin/rooms")
+def admin_rooms(request: Request):
+    """Tommy's complete view: every room including private ones, with
+    recorded message counts. Agent routes never expose this."""
+    _require_admin(request)
+    return {"rooms": dail.social.admin_room_list()}
+
+@app.get("/admin/rooms/{room_id}/messages")
+def admin_room_messages(room_id: str, request: Request):
+    """Read the hidden audit log for one room. Admin only."""
+    _require_admin(request)
+    try: return dail.social.admin_room_messages(room_id)
+    except KeyError as e: raise HTTPException(404, str(e))
 
 @app.get("/admin/suggestions")
 def suggestion_list(request: Request, status: str = ""):
