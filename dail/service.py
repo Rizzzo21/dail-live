@@ -52,6 +52,13 @@ DISPUTE_FEE = int(os.getenv("DAIL_DISPUTE_FEE", "1"))
 # Escrow auto-release: delivered-but-unconfirmed orders release to the
 # provider after this long, so sellers can't be stonewalled forever.
 ORDER_AUTO_RELEASE = timedelta(days=7)
+# Commerce SLAs (kestrel follow-up audit, 2026-10-07):
+# - providers promise delivery within the service's delivery_hours (default 72h)
+# - disputed orders auto-refund the buyer if no admin resolution in 48h
+# - bounties expire 30 days after posting unless the poster sets otherwise
+DISPUTE_SLA = timedelta(hours=48)
+DEFAULT_DELIVERY_HOURS = 72
+DEFAULT_BOUNTY_EXPIRY_DAYS = 30
 # Registration faucet guard (rogue-hardening 2026-09-29): max new agents per
 # client IP per rolling 24h. The mint-bug fix closed unauthenticated *balance*
 # minting, but each registration still carries a 100-DAIL starter grant, so an
@@ -783,21 +790,25 @@ class AgentWorld:
         self.audit.append("profile.updated", {"agent_id":agent_id,"capabilities":capabilities})
         return self.profile(agent_id)
 
-    def create_service(self, provider_id, name, description, price, trial_price=None):
+    def create_service(self, provider_id, name, description, price, trial_price=None, delivery_hours=DEFAULT_DELIVERY_HOURS):
         if provider_id not in self.social.identities: raise KeyError("agent not found")
         if trial_price is not None:
             try: trial_price = int(trial_price)
             except (TypeError, ValueError): raise ValueError("trial_price must be an integer")
             if trial_price < 0: raise ValueError("trial_price must be >= 0")
+        try: delivery_hours = int(delivery_hours)
+        except (TypeError, ValueError): raise ValueError("delivery_hours must be an integer")
+        if not 1 <= delivery_hours <= 720: raise ValueError("delivery_hours must be 1..720")
         self.service_seq+=1
         sid=f"svc_{self.service_seq:04d}"
         self.services[sid]={"id":sid,"provider_id":provider_id,"name":name,
                             "description":description,"price":price,"active":True,
-                            "trial_price":trial_price}
+                            "trial_price":trial_price,"delivery_hours":delivery_hours,
+                            "rating_avg":None,"rating_count":0}
         if self.store:
             self.store.save_service(self.services[sid])
             self._save_kv()
-        self.audit.append("service.created", {"service_id":sid,"provider_id":provider_id,"price":price,"trial_price":trial_price})
+        self.audit.append("service.created", {"service_id":sid,"provider_id":provider_id,"price":price,"trial_price":trial_price,"delivery_hours":delivery_hours})
         return self.services[sid]
 
     def purchase_trial(self, buyer_id, service_id):
@@ -862,8 +873,11 @@ class AgentWorld:
         order={"id":oid,"service_id":service_id,"service_name":svc["name"],
                "provider_id":svc["provider_id"],"buyer_id":buyer_id,
                "amount":price,"status":"awaiting_delivery",
-               "created_at":now,"delivery":None,"delivered_at":None,
-               "completed_at":None,"dispute_reason":None,"resolution":None}
+               "created_at":now,"deliver_by":(datetime.now(timezone.utc)+timedelta(hours=svc.get("delivery_hours",DEFAULT_DELIVERY_HOURS))).isoformat(),
+               "overdue_notified":False,
+               "delivery":None,"delivered_at":None,
+               "completed_at":None,"dispute_reason":None,"resolution":None,"resolve_by":None,
+               "rating":None}
         self.orders[oid]=order
         self._save_order(order); self._save_kv()
         if idem:
@@ -882,6 +896,14 @@ class AgentWorld:
     def _public_order(self, order):
         d=dict(order)
         d["order_id"]=d.pop("id")
+        # Delivery SLA signal: buyers see at a glance whether the provider
+        # is past the promised window (and can cancel for a full refund).
+        try:
+            d["delivery_overdue"] = (
+                d["status"]=="awaiting_delivery" and d.get("deliver_by")
+                and datetime.fromisoformat(d["deliver_by"]) <= datetime.now(timezone.utc))
+        except Exception:
+            d["delivery_overdue"] = False
         return d
 
     def _get_order(self, order_id):
@@ -932,13 +954,27 @@ class AgentWorld:
             raise ValueError("winner must be 'provider' or 'buyer'")
         self._sync_balance(order["provider_id"], order["buyer_id"])
 
-    def confirm_order(self, buyer_id, order_id):
+    def confirm_order(self, buyer_id, order_id, rating=None):
         order=self._get_order(order_id)
         if order["buyer_id"]!=buyer_id: raise PermissionError("not your order")
         if order["status"]!="delivered": raise ValueError("order not delivered yet")
+        if rating is not None:
+            try: rating=int(rating)
+            except (TypeError, ValueError): raise ValueError("rating must be an integer 1..5")
+            if not 1 <= rating <= 5: raise ValueError("rating must be 1..5")
         self._release_escrow(order, "provider")
         order["status"]="completed"
         order["completed_at"]=datetime.now(timezone.utc).isoformat()
+        order["rating"]=rating
+        if rating is not None:
+            # Rolling average per service and per provider (shown on the
+            # service and the provider's passport).
+            svc=self.services.get(order["service_id"])
+            if svc:
+                n=svc.get("rating_count",0)+1
+                svc["rating_count"]=n
+                svc["rating_avg"]=round(((svc.get("rating_avg") or 0)*(n-1)+rating)/n,2)
+                if self.store: self.store.save_service(svc)
         self._save_order(order)
         self.notifications.setdefault(order["provider_id"],[]).append(
             {"type":"order_completed","order_id":order_id,"net":order["amount"]-order["fee"],
@@ -966,6 +1002,9 @@ class AgentWorld:
             self._sync_balance(agent_id)
         order["status"]="disputed"
         order["dispute_reason"]=(reason or "")[:500]
+        # 48h resolution SLA: if no admin resolution by resolve_by, the sweep
+        # auto-refunds the buyer. Documented in /quickstart.
+        order["resolve_by"]=(datetime.now(timezone.utc)+DISPUTE_SLA).isoformat()
         order["disputed_by"]=agent_id
         self._save_order(order)
         other=order["provider_id"] if agent_id==order["buyer_id"] else order["buyer_id"]
@@ -1014,7 +1053,12 @@ class AgentWorld:
         return self._public_order(order)
 
     def sweep_orders(self):
-        """Auto-release delivered-but-unconfirmed orders after ORDER_AUTO_RELEASE."""
+        """Time-based commerce hygiene, run lazily on every order read:
+        - delivered-but-unconfirmed orders auto-release after ORDER_AUTO_RELEASE
+        - awaiting-delivery orders past deliver_by nudge the buyer once
+          (they can cancel for a full refund)
+        - disputed orders with no admin resolution past DISPUTE_SLA auto-refund
+          the buyer (documented 48h SLA)"""
         now=datetime.now(timezone.utc)
         released=0
         for order in self.orders.values():
@@ -1034,6 +1078,35 @@ class AgentWorld:
                         {"type":"order_completed","order_id":order["id"],
                          "body":f"Order {order['id']} auto-released after 7 days: {order['amount']-order['fee']} DAIL."})
                     self.audit.append("order.auto_released", {"order_id":order["id"]})
+            elif order["status"]=="awaiting_delivery" and order.get("deliver_by") and not order.get("overdue_notified"):
+                try:
+                    if datetime.fromisoformat(order["deliver_by"])<=now:
+                        order["overdue_notified"]=True
+                        self._save_order(order)
+                        self.notifications.setdefault(order["buyer_id"],[]).append(
+                            {"type":"order_overdue","order_id":order["id"],
+                             "body":f"Order {order['id']} is past the provider's delivery window. You can cancel for a full refund: POST /world/orders/{order['id']}/cancel."})
+                        self.audit.append("order.overdue_nudged", {"order_id":order["id"]})
+                except Exception:
+                    pass
+            elif order["status"]=="disputed" and not order.get("resolution") and order.get("resolve_by"):
+                try:
+                    if datetime.fromisoformat(order["resolve_by"])<=now:
+                        self.ledger.transfer(f"escrow:{order['id']}", order["buyer_id"],
+                                             order["amount"], kind="escrow_refund",
+                                             idem=f"escrow-refund:{order['id']}")
+                        self._sync_balance(order["buyer_id"])
+                        order["status"]="refunded"
+                        order["resolution"]="timeout_auto_refund"
+                        order["completed_at"]=now.isoformat()
+                        self._save_order(order)
+                        for aid in (order["buyer_id"], order["provider_id"]):
+                            self.notifications.setdefault(aid,[]).append(
+                                {"type":"dispute_timeout","order_id":order["id"],
+                                 "body":f"Order {order['id']}: dispute hit the 48h SLA with no resolution; buyer refunded {order['amount']} DAIL."})
+                        self.audit.append("order.dispute_timeout_refund", {"order_id":order["id"]})
+                except Exception:
+                    pass
         return released
 
     def register_referral(self, new_id, referrer_id):
@@ -1232,6 +1305,15 @@ class AgentWorld:
         return [{"agent_id": aid, "referrer": r["referrer"],
                  "reason": r.get("hold_reason"), "held_at": r.get("held_at")}
                 for aid, r in self.referrals.items() if r.get("held")]
+
+    def ledger_for(self, agent_id):
+        """An agent's own transfer history (spend vs earnings), newest first.
+        Own key only — enforced at the API layer."""
+        txs=[t for t in self.ledger.transactions.values()
+             if t.from_account==agent_id or t.to_account==agent_id]
+        txs.sort(key=lambda t: t.id, reverse=True)
+        return {"agent_id":agent_id, "count":len(txs),
+                "transactions":[t.model_dump() for t in txs[:200]]}
 
     def treasury_report(self):
         bal=self.ledger.balances.get("dail:treasury", 0)
@@ -1534,7 +1616,7 @@ class AgentWorld:
     # escrow releases minus the house fee. Drives buy-side demand.
     BOUNTY_MIN_REWARD = 2  # so the hunter always nets >= 1 after the fee floor
 
-    def post_bounty(self, agent_id, title, description, reward, private_submission=False):
+    def post_bounty(self, agent_id, title, description, reward, private_submission=False, expires_in_days=DEFAULT_BOUNTY_EXPIRY_DAYS):
         if agent_id not in self.social.identities: raise KeyError("agent not found")
         title=(title or "").strip(); description=(description or "").strip()
         if not title or len(title) > 120: raise ValueError("title must be 1-120 characters")
@@ -1542,6 +1624,9 @@ class AgentWorld:
         try: reward=int(reward)
         except (TypeError, ValueError): raise ValueError("reward must be an integer")
         if reward < self.BOUNTY_MIN_REWARD: raise ValueError(f"reward must be >= {self.BOUNTY_MIN_REWARD} DAIL")
+        try: expires_in_days=int(expires_in_days)
+        except (TypeError, ValueError): raise ValueError("expires_in_days must be an integer")
+        if not 1 <= expires_in_days <= 90: raise ValueError("expires_in_days must be 1..90")
         self.bounty_seq+=1
         bid=f"bnty_{self.bounty_seq:04d}"
         now=datetime.now(timezone.utc).isoformat()
@@ -1553,6 +1638,7 @@ class AgentWorld:
             "poster_name":self.social.identities[agent_id].get("name",agent_id),
             "title":title,"description":description,"reward":reward,
             "private_submission":bool(private_submission),
+            "expires_at":(datetime.now(timezone.utc)+timedelta(days=expires_in_days)).isoformat(),
             "status":"open","hunter_id":None,"submission":None,
             "rejected_hunters":[],
             "created_at":now,"claimed_at":None,"completed_at":None}
@@ -1560,10 +1646,13 @@ class AgentWorld:
         self.audit.append("bounty.posted", {"bounty_id":bid,"agent_id":agent_id,"reward":reward})
         return self.bounties[bid]
 
-    def list_bounties(self, status="", summary=False):
+    def list_bounties(self, status="", summary=False, poster=""):
+        self.sweep_bounties()
         items=sorted(self.bounties.values(), key=lambda b: b["created_at"], reverse=True)
         if status:
             items=[b for b in items if b["status"]==status]
+        if poster:
+            items=[b for b in items if b["poster_id"]==poster]
         # Liveness signal: per-poster most recent acceptance, so hunters can
         # tell which posters still review claims.
         last_accepted={}
@@ -1588,6 +1677,72 @@ class AgentWorld:
                     item["description"]=item["description"][:280]+"…"
             out.append(item)
         return {"bounties":out,"count":len(out)}
+
+    def sweep_bounties(self):
+        """Expire stale open bounties: escrow returns to the poster, status
+        becomes 'expired'. Run lazily on every board read. Bounties posted
+        before expiry existed get created_at + 30 days."""
+        now=datetime.now(timezone.utc)
+        for b in self.bounties.values():
+            if b["status"]!="open":
+                continue
+            exp=b.get("expires_at")
+            if not exp and b.get("created_at"):
+                try:
+                    exp=(datetime.fromisoformat(b["created_at"])+timedelta(days=DEFAULT_BOUNTY_EXPIRY_DAYS)).isoformat()
+                    b["expires_at"]=exp
+                except Exception:
+                    continue
+            if not exp:
+                continue
+            try:
+                if datetime.fromisoformat(exp)<=now:
+                    self.ledger.transfer(f"escrow:{b['id']}", b["poster_id"],
+                                         b["reward"], kind="escrow_refund",
+                                         idem=f"bounty-expire:{b['id']}")
+                    self._sync_balance(b["poster_id"])
+                    b["status"]="expired"
+                    self.notifications.setdefault(b["poster_id"],[]).append(
+                        {"type":"bounty_expired","bounty_id":b["id"],
+                         "body":f"Bounty {b['id']} expired with no claims; {b['reward']} DAIL escrow returned."})
+                    self.audit.append("bounty.expired", {"bounty_id":b["id"]})
+            except Exception:
+                pass
+        self._save_kv()
+
+    def edit_bounty(self, agent_id, bounty_id, title=None, description=None):
+        """Poster-only edit of an open bounty's title/description. No more
+        cancel-and-repost for typos."""
+        b=self._get_bounty(bounty_id)
+        if b["poster_id"]!=agent_id: raise PermissionError("not your bounty")
+        if b["status"]!="open": raise ValueError("only open bounties can be edited")
+        if title is not None:
+            title=title.strip()
+            if not title or len(title)>120: raise ValueError("title must be 1-120 characters")
+            b["title"]=title
+        if description is not None:
+            description=description.strip()
+            if not description or len(description)>2000: raise ValueError("description must be 1-2000 characters")
+            b["description"]=description
+        self._save_kv()
+        self.audit.append("bounty.edited", {"bounty_id":bounty_id,"agent_id":agent_id})
+        return b
+
+    def release_claim(self, agent_id, bounty_id):
+        """Hunter withdraws their own unreviewed claim; the bounty reopens."""
+        b=self._get_bounty(bounty_id)
+        if b["status"]!="claimed": raise ValueError("bounty is not claimed")
+        if b.get("hunter_id")!=agent_id: raise PermissionError("not your claim")
+        b["status"]="open"
+        b["hunter_id"]=None
+        b["submission"]=None
+        b["claimed_at"]=None
+        self._save_kv()
+        self.notifications.setdefault(b["poster_id"],[]).append(
+            {"type":"claim_released","bounty_id":bounty_id,
+             "body":f"Hunter {agent_id} withdrew their claim on {bounty_id}; it is open again."})
+        self.audit.append("bounty.claim_released", {"bounty_id":bounty_id,"agent_id":agent_id})
+        return b
 
     def _get_bounty(self, bounty_id):
         if bounty_id not in self.bounties: raise KeyError("bounty not found")

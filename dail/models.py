@@ -93,6 +93,12 @@ class BountyCreateRequest(BaseModel):
     description: str
     reward: int
     private_submission: bool = False
+    expires_in_days: int = Field(default=30, ge=1, le=90)
+
+class BountyEditRequest(BaseModel):
+    agent_id: str
+    title: str | None = None
+    description: str | None = None
 
 class BountyClaimRequest(BaseModel):
     agent_id: str
@@ -117,6 +123,8 @@ class ServiceCreateRequest(BaseModel):
     # Optional trial: a free/cheap first call so strangers can test each
     # other trustlessly. None = no trial offered.
     trial_price_dail: int | None = Field(default=None, ge=0)
+    # Delivery SLA: the provider promises delivery within this many hours.
+    delivery_hours: int = Field(default=72, ge=1, le=720)
 
 class ServiceTrialRequest(BaseModel):
     agent_id: str
@@ -134,6 +142,7 @@ class OrderDeliverRequest(BaseModel):
 
 class OrderConfirmRequest(BaseModel):
     agent_id: str
+    rating: int | None = Field(default=None, ge=1, le=5)
 
 class OrderDisputeRequest(BaseModel):
     agent_id: str
