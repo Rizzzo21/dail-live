@@ -20,7 +20,7 @@ Authentication:
 from fastapi import FastAPI, HTTPException, Header, Request
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, Response, PlainTextResponse, JSONResponse
-import os, hmac, json, html
+import os, hmac, json, html, ipaddress
 from datetime import datetime, timezone
 from pathlib import Path
 from .models import (
@@ -124,6 +124,33 @@ def _classify(method: str, path: str) -> str:
 def _admin_ok(provided: str | None) -> bool:
     admin_key = os.getenv("DAIL_ADMIN_KEY", "")
     return bool(admin_key) and hmac.compare_digest(provided or "", admin_key)
+
+
+def _client_ip(request: Request) -> str:
+    """Real client IP behind Render's proxy chain.
+
+    X-Forwarded-For grows as client -> edge -> internal router -> app, so the
+    LAST entry is our own infrastructure (a 10.x address) -- useless for
+    identifying the registrant and wrong for the faucet guard. Strip trailing
+    non-global entries; the last remaining entry is the client IP as Render's
+    edge saw it (a client-supplied spoof prefix, if any, sits left of it).
+    """
+    xff = request.headers.get("x-forwarded-for", "")
+    entries = [e.strip() for e in xff.split(",") if e.strip()]
+    while entries:
+        try:
+            if not ipaddress.ip_address(entries[-1]).is_global:
+                entries.pop()
+                continue
+        except ValueError:
+            entries.pop()
+            continue
+        break
+    if entries:
+        return entries[-1]
+    if request.client:
+        return request.client.host
+    return "unknown"
 
 
 def _bouncer_ok(provided: str | None) -> bool:
@@ -939,10 +966,10 @@ def agents():
 @app.post("/agents")
 def create_agent(agent: AgentCreateRequest, request: Request):
     # Faucet guard (rogue-hardening 2026-09-29): rate-limit registrations per
-    # client IP. Behind Render's proxy the LAST X-Forwarded-For entry is the
-    # address our proxy actually saw — the only entry a client cannot spoof.
-    xff = request.headers.get("x-forwarded-for", "")
-    ip = (xff.split(",")[-1].strip() if xff else "") or (request.client.host if request.client else "unknown")
+    # real client IP. _client_ip strips Render's internal proxy hops (the old
+    # code took the LAST X-Forwarded-For entry, which is our own 10.x infra --
+    # the guard was rate-limiting per router node, not per registrant).
+    ip = _client_ip(request)
     if not dail.world_agents.registration_allowed(ip):
         retry = dail.world_agents.registration_retry_after(ip)
         return JSONResponse(

@@ -82,7 +82,7 @@ def _trade(provider_key, buyer_key, provider_id, buyer_id, price):
 
 def test_registration_rate_limit(monkeypatch):
     monkeypatch.setenv("DAIL_REG_LIMIT", "2")
-    ip = "10.9.9.1"
+    ip = "9.9.9.1"
     a, b = _uid("rl"), _uid("rl")
     assert client.post("/agents", json={"id": a, "name": a},
                        headers={"X-Forwarded-For": ip}).status_code == 200
@@ -95,11 +95,11 @@ def test_registration_rate_limit(monkeypatch):
     # A different address is unaffected.
     d = _uid("rl")
     assert client.post("/agents", json={"id": d, "name": d},
-                       headers={"X-Forwarded-For": "10.9.9.2"}).status_code == 200
+                       headers={"X-Forwarded-For": "9.9.9.2"}).status_code == 200
 
 
 def test_registration_records_ip_and_timestamp():
-    aid, ip = _uid("rip"), "10.9.9.3"
+    aid, ip = _uid("rip"), "9.9.9.3"
     _make(aid, ip=ip)
     assert dail.world_agents.agent_ips[aid] == ip
     assert dail.world_agents.agent_created[aid]  # ISO timestamp present
@@ -109,9 +109,9 @@ def test_registration_records_ip_and_timestamp():
 
 def test_referral_held_when_counterparty_is_referrer():
     main = _uid("ref")
-    main_k = _make(main, ip="10.10.0.1")
+    main_k = _make(main, ip="9.10.0.1")
     alt = _uid("ref")
-    alt_k = _make(alt, ip="10.10.0.2", referred_by=main)
+    alt_k = _make(alt, ip="9.10.0.2", referred_by=main)
     # Alt "trades" with its own referrer: the classic circular wash.
     order = _trade(main_k, alt_k, main, alt, 20)
     assert order["status"] == "completed"
@@ -125,11 +125,11 @@ def test_referral_held_when_counterparty_is_referrer():
 
 def test_referral_held_on_shared_registration_ip():
     main = _uid("ref")
-    main_k = _make(main, ip="10.10.1.1")
+    main_k = _make(main, ip="9.10.1.1")
     alt = _uid("ref")
-    alt_k = _make(alt, ip="10.10.1.9", referred_by=main)
+    alt_k = _make(alt, ip="9.10.1.9", referred_by=main)
     carol = _uid("ref")
-    carol_k = _make(carol, ip="10.10.1.9")  # same IP as alt: alt farm
+    carol_k = _make(carol, ip="9.10.1.9")  # same IP as alt: alt farm
     order = _trade(carol_k, alt_k, carol, alt, 20)
     assert order["status"] == "completed"
     assert _bal(main, main_k) == 100  # no reward paid
@@ -141,11 +141,11 @@ def test_referral_held_on_shared_registration_ip():
 
 def test_referral_pays_when_trade_is_clean():
     main = _uid("ref")
-    main_k = _make(main, ip="10.10.2.1")
+    main_k = _make(main, ip="9.10.2.1")
     alt = _uid("ref")
-    alt_k = _make(alt, ip="10.10.2.2", referred_by=main)
+    alt_k = _make(alt, ip="9.10.2.2", referred_by=main)
     carol = _uid("ref")
-    carol_k = _make(carol, ip="10.10.2.3")
+    carol_k = _make(carol, ip="9.10.2.3")
     # Backdate carol so the burst signal doesn't fire: genuinely distinct agent.
     dail.world_agents.agent_created[carol] = (
         datetime.now(timezone.utc) - timedelta(days=2)).isoformat()
@@ -158,9 +158,9 @@ def test_referral_pays_when_trade_is_clean():
 
 def test_admin_referral_review_flow():
     main = _uid("ref")
-    main_k = _make(main, ip="10.10.3.1")
+    main_k = _make(main, ip="9.10.3.1")
     alt = _uid("ref")
-    alt_k = _make(alt, ip="10.10.3.2", referred_by=main)
+    alt_k = _make(alt, ip="9.10.3.2", referred_by=main)
     _trade(main_k, alt_k, main, alt, 20)  # circular -> held
     # Admin gate: no key -> 403.
     assert client.get("/admin/referrals/held").status_code == 403
@@ -182,9 +182,9 @@ def test_admin_referral_review_flow():
 
 def test_admin_referral_approve_pays():
     main = _uid("ref")
-    main_k = _make(main, ip="10.10.4.1")
+    main_k = _make(main, ip="9.10.4.1")
     alt = _uid("ref")
-    alt_k = _make(alt, ip="10.10.4.2", referred_by=main)
+    alt_k = _make(alt, ip="9.10.4.2", referred_by=main)
     _trade(main_k, alt_k, main, alt, 20)  # circular -> held
     r = client.post("/admin/referrals/release",
                     json={"agent_id": alt, "approve": True}, headers=ADMIN)
@@ -213,7 +213,7 @@ def _order_open(provider_key, buyer_key, provider_id, buyer_id, price):
 
 def test_dispute_freezes_and_admin_resolves_to_buyer():
     p, b = _uid("dsp"), _uid("dsb")
-    pk, bk = _make(p, ip="10.20.0.1"), _make(b, ip="10.20.0.2")
+    pk, bk = _make(p, ip="9.20.0.1"), _make(b, ip="9.20.0.2")
     oid = _order_open(pk, bk, p, b, 30)
     assert _bal(b, bk) == 70  # 30 held in escrow
     r = client.post(f"/world/orders/{oid}/dispute",
@@ -232,7 +232,7 @@ def test_dispute_freezes_and_admin_resolves_to_buyer():
 
 def test_dispute_resolved_to_provider_takes_fee():
     p, b = _uid("dsp"), _uid("dsb")
-    pk, bk = _make(p, ip="10.20.1.1"), _make(b, ip="10.20.1.2")
+    pk, bk = _make(p, ip="9.20.1.1"), _make(b, ip="9.20.1.2")
     oid = _order_open(pk, bk, p, b, 30)
     client.post(f"/world/orders/{oid}/dispute",
                 json={"agent_id": b, "reason": "changed mind"},
@@ -246,7 +246,7 @@ def test_dispute_resolved_to_provider_takes_fee():
 
 def test_escrow_auto_releases_after_seven_days():
     p, b = _uid("dsp"), _uid("dsb")
-    pk, bk = _make(p, ip="10.20.2.1"), _make(b, ip="10.20.2.2")
+    pk, bk = _make(p, ip="9.20.2.1"), _make(b, ip="9.20.2.2")
     oid = _order_open(pk, bk, p, b, 20)
     # Backdate delivery 8 days; the next order read sweeps it.
     dail.world_agents.orders[oid]["delivered_at"] = (
@@ -262,7 +262,7 @@ def test_escrow_auto_releases_after_seven_days():
 
 def test_safe_is_dail_denominated_no_cash_out():
     aid = _uid("safe")
-    key = _make(aid, ip="10.30.0.1")
+    key = _make(aid, ip="9.30.0.1")
     r = client.get("/safe", headers=_auth(key))
     assert r.status_code == 200, r.text
     info = r.json()
@@ -305,7 +305,7 @@ def _order_pending(provider_key, buyer_key, provider_id, buyer_id, price):
 
 def test_order_cancel_refunds_buyer():
     p, b = _uid("cx"), _uid("cx")
-    pk, bk = _make(p, ip="10.40.0.1"), _make(b, ip="10.40.0.2")
+    pk, bk = _make(p, ip="9.40.0.1"), _make(b, ip="9.40.0.2")
     oid = _order_pending(pk, bk, p, b, 30)
     assert _bal(b, bk) == 70  # 30 held in escrow
     r = client.post(f"/world/orders/{oid}/cancel",
@@ -317,7 +317,7 @@ def test_order_cancel_refunds_buyer():
 
 def test_order_cancel_after_delivery_fails():
     p, b = _uid("cx"), _uid("cx")
-    pk, bk = _make(p, ip="10.40.1.1"), _make(b, ip="10.40.1.2")
+    pk, bk = _make(p, ip="9.40.1.1"), _make(b, ip="9.40.1.2")
     oid = _order_open(pk, bk, p, b, 30)  # already delivered
     r = client.post(f"/world/orders/{oid}/cancel",
                     json={"agent_id": b}, headers=_auth(bk))
@@ -327,7 +327,7 @@ def test_order_cancel_after_delivery_fails():
 
 def test_order_cancel_by_non_buyer_fails():
     p, b = _uid("cx"), _uid("cx")
-    pk, bk = _make(p, ip="10.40.2.1"), _make(b, ip="10.40.2.2")
+    pk, bk = _make(p, ip="9.40.2.1"), _make(b, ip="9.40.2.2")
     oid = _order_pending(pk, bk, p, b, 30)
     r = client.post(f"/world/orders/{oid}/cancel",
                     json={"agent_id": p}, headers=_auth(pk))
@@ -337,20 +337,20 @@ def test_order_cancel_by_non_buyer_fails():
 
 def test_referral_pays_provider_side():
     main = _uid("rp")
-    main_k = _make(main, ip="10.41.0.1")
+    main_k = _make(main, ip="9.41.0.1")
     prov = _uid("rp")
-    prov_k = _make(prov, ip="10.41.0.2", referred_by=main)
+    prov_k = _make(prov, ip="9.41.0.2", referred_by=main)
     buyer = _uid("rp")
-    buyer_k = _make(buyer, ip="10.41.0.3")
+    buyer_k = _make(buyer, ip="9.41.0.3")
     _trade(prov_k, buyer_k, prov, buyer, 20)  # referred agent SELLS
     assert _bal(main, main_k) == 100 + 10  # provider-side referral paid
 
 
 def test_referral_held_provider_side_circular():
     main = _uid("rp")
-    main_k = _make(main, ip="10.42.0.1")
+    main_k = _make(main, ip="9.42.0.1")
     prov = _uid("rp")
-    prov_k = _make(prov, ip="10.42.0.2", referred_by=main)
+    prov_k = _make(prov, ip="9.42.0.2", referred_by=main)
     _trade(prov_k, main_k, prov, main, 20)  # referrer buys from referred provider
     held = [h for h in dail.world_agents.held_referrals() if h["agent_id"] == prov]
     assert len(held) == 1 and "referrer" in held[0]["reason"]
@@ -361,11 +361,11 @@ def test_referral_held_provider_side_circular():
 
 def test_referral_dust_trade_earns_nothing_then_pays_on_real_trade():
     r = _uid("r3")
-    rk = _make(r, ip="10.50.0.1")
+    rk = _make(r, ip="9.50.0.1")
     a = _uid("r3")
-    ak = _make(a, ip="10.50.0.2", referred_by=r)
+    ak = _make(a, ip="9.50.0.2", referred_by=r)
     seller = _uid("r3")
-    sk = _make(seller, ip="10.50.0.3")
+    sk = _make(seller, ip="9.50.0.3")
     # Dust trade: 2 DAIL wash — must NOT mint the reward, and must NOT hold
     # (a genuine agent's small first trade must not poison the referral).
     _trade(sk, ak, seller, a, 2)
@@ -378,11 +378,11 @@ def test_referral_dust_trade_earns_nothing_then_pays_on_real_trade():
 
 def test_referral_banned_referrer_held_not_paid():
     r = _uid("r3")
-    rk = _make(r, ip="10.51.0.1")
+    rk = _make(r, ip="9.51.0.1")
     a = _uid("r3")
-    ak = _make(a, ip="10.51.0.2", referred_by=r)
+    ak = _make(a, ip="9.51.0.2", referred_by=r)
     seller = _uid("r3")
-    sk = _make(seller, ip="10.51.0.3")
+    sk = _make(seller, ip="9.51.0.3")
     dail.ban_agent(r, "round-3 probe")
     rbal_before = dail.world_agents.ledger.balances.get(r, 0)
     _trade(sk, ak, seller, a, 20)
@@ -396,19 +396,19 @@ def test_referral_banned_referrer_held_not_paid():
 
 def test_staff_names_reserved_at_registration():
     r = client.post("/agents", json={"id": _uid("rn"), "name": "dail_host"},
-                    headers={"X-Forwarded-For": "10.70.0.1"})
+                    headers={"X-Forwarded-For": "9.70.0.1"})
     assert r.status_code == 409, r.text
     r = client.post("/agents", json={"id": _uid("rn"), "name": "DAIL_MANAGER"},
-                    headers={"X-Forwarded-For": "10.70.0.2"})
+                    headers={"X-Forwarded-For": "9.70.0.2"})
     assert r.status_code == 409, r.text
     r = client.post("/agents", json={"id": _uid("rn"), "name": "honest trader"},
-                    headers={"X-Forwarded-For": "10.70.0.3"})
+                    headers={"X-Forwarded-For": "9.70.0.3"})
     assert r.status_code == 200, r.text
 
 
 def test_staff_names_reserved_on_rename():
     aid = _uid("rn")
-    key = _make(aid, ip="10.70.0.4")
+    key = _make(aid, ip="9.70.0.4")
     r = client.post("/social/identity",
                     json={"agent_id": aid, "name": "dail_inspector"},
                     headers=_auth(key))
@@ -420,9 +420,9 @@ def test_staff_names_reserved_on_rename():
 
 
 def test_bounty_reject_reopens_and_blocks_griefer():
-    p = _uid("rb"); pk = _make(p, ip="10.71.0.1")
-    g = _uid("rb"); gk = _make(g, ip="10.71.0.2")
-    h = _uid("rb"); hk = _make(h, ip="10.71.0.3")
+    p = _uid("rb"); pk = _make(p, ip="9.71.0.1")
+    g = _uid("rb"); gk = _make(g, ip="9.71.0.2")
+    h = _uid("rb"); hk = _make(h, ip="9.71.0.3")
     r = client.post("/world/bounties",
                     json={"agent_id": p, "title": "t", "description": "d", "reward": 25},
                     headers=_auth(pk))
@@ -456,7 +456,7 @@ def test_bounty_reject_reopens_and_blocks_griefer():
 
 def test_dispute_costs_fee():
     p, b = _uid("rf"), _uid("rf")
-    pk, bk = _make(p, ip="10.72.0.1"), _make(b, ip="10.72.0.2")
+    pk, bk = _make(p, ip="9.72.0.1"), _make(b, ip="9.72.0.2")
     oid = _order_open(pk, bk, p, b, 30)
     assert _bal(b, bk) == 70
     r = client.post(f"/world/orders/{oid}/dispute",
@@ -465,7 +465,7 @@ def test_dispute_costs_fee():
     assert _bal(b, bk) == 69  # 30 escrowed + 1 dispute fee
     # Provider disputing also pays.
     p2, b2 = _uid("rf"), _uid("rf")
-    pk2, bk2 = _make(p2, ip="10.72.0.3"), _make(b2, ip="10.72.0.4")
+    pk2, bk2 = _make(p2, ip="9.72.0.3"), _make(b2, ip="9.72.0.4")
     oid2 = _order_open(pk2, bk2, p2, b2, 30)
     r = client.post(f"/world/orders/{oid2}/dispute",
                     json={"agent_id": p2, "reason": "y"}, headers=_auth(pk2))

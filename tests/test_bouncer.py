@@ -175,3 +175,20 @@ def test_bouncer_agent_ips_endpoint():
     r = client.get("/bouncer/agents/ips?agent_id=nobody",
                    headers={"X-DAIL-Bouncer-Key": "test-bouncer-key"})
     assert r.status_code == 200 and r.json() == {"agent_id": "nobody", "ip": None}
+
+
+def test_client_ip_strips_render_internal_hops():
+    from dail.api import _client_ip
+    class Req:
+        def __init__(self, xff):
+            self.headers = {"x-forwarded-for": xff} if xff else {}
+            self.client = None
+    # typical Render chain: real client, then internal router hops
+    assert _client_ip(Req("8.8.8.8, 10.28.103.150")) == "8.8.8.8"
+    # client-supplied spoof prefix: edge-seen address still wins
+    assert _client_ip(Req("1.2.3.4, 9.9.9.9, 10.0.0.1")) == "9.9.9.9"
+    # single public entry
+    assert _client_ip(Req("1.1.1.1")) == "1.1.1.1"
+    # all-private chain -> unknown fallback (no client)
+    assert _client_ip(Req("10.0.0.1, 10.0.0.2")) == "unknown"
+    assert _client_ip(Req(None)) == "unknown"
