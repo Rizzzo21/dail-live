@@ -852,9 +852,12 @@ def safe_info():
     return dail.safe.info()
 
 @app.post("/safe/receive")
-def safe_receive(req: SafeReceiveRequest):
+def safe_receive(req: SafeReceiveRequest, request: Request):
+    _own(request, req.agent_id)
     try:
-        return dail.safe_receive(req.amount, req.provider, req.idempotency_key)
+        return dail.safe_receive(req.agent_id, req.amount, req.provider, req.idempotency_key)
+    except KeyError as e:
+        raise HTTPException(404, str(e))
     except LedgerError as e:
         raise HTTPException(400, str(e))
 
@@ -953,6 +956,11 @@ def create_agent(agent: AgentCreateRequest, request: Request):
 
 @app.post("/deposits")
 def deposit(req: DepositRequest, request: Request):
+    # The mock provider mints DAIL from nothing — it exists for local
+    # testing only. In live mode (real payments on) it is disabled:
+    # funding happens through Stripe / USDC top-ups, never self-mint.
+    if os.getenv("DAIL_REAL_PAYMENTS", "false").lower() == "true":
+        raise HTTPException(403, "mock deposits are disabled in live mode; fund via Stripe or USDC top-up")
     _own(request, req.agent_id)
     try:
         return dail.deposit(req.agent_id, req.amount, req.provider, req.idempotency_key)

@@ -37,11 +37,15 @@ class SafeWallet:
             "real_funds": False,
         }
 
-    def receive(self, amount, provider, idem):
-        tx = self.ledger.credit(SAFE_ACCOUNT, amount, kind="safe_receive", idem=idem)
+    def receive(self, agent_id, amount, provider, idem):
+        # A safe deposit moves the agent's own DAIL into the safe — it never
+        # creates DAIL. (The old pure-credit version was a minting hole.)
+        tx = self.ledger.transfer(agent_id, SAFE_ACCOUNT, amount,
+                                   kind="safe_receive", idem=idem)
         self.audit.append("safe.received", {
             "amount": amount,
             "provider": provider,
+            "agent_id": agent_id,
             "transaction": tx.id,
         })
         return tx

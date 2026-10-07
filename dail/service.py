@@ -421,8 +421,11 @@ class Dail:
         return {"tool": tool, "result": {"status": "simulated", "args": args}}
 
 
-    def safe_receive(self, amount, provider, idem):
-        return self.safe.receive(amount, provider, idem)
+    def safe_receive(self, agent_id, amount, provider, idem):
+        self._agent(agent_id)
+        tx = self.safe.receive(agent_id, amount, provider, idem)
+        self.agents[agent_id].balance = self.ledger.balances[agent_id]
+        return tx
 
     def safe_create_withdrawal_key(self, admin_key):
         return self.safe.create_withdrawal_key(admin_key)
@@ -1376,8 +1379,16 @@ class AgentWorld:
         return self._pay_referral(agent_id, referrer, ref)
 
     def _pay_referral(self, agent_id, referrer, ref):
-        self.ledger.credit(referrer, REFERRAL_REWARD, kind="referral_reward",
-                           idem=f"referral:{agent_id}")
+        # Referral rewards are drawn from the petty-cash vault — the single
+        # authorized source of new DAIL — never minted ad hoc. If the vault
+        # cannot cover it, the reward is held for admin review.
+        try:
+            self.ledger.transfer(VAULT_ACCOUNT, referrer, REFERRAL_REWARD,
+                                 kind="referral_reward",
+                                 idem=f"referral:{agent_id}")
+        except LedgerError:
+            self._hold_referral(agent_id, referrer, ref, "vault cannot cover reward")
+            return False
         ref["paid"] = True
         ref.pop("held", None)
         ref.pop("hold_reason", None)

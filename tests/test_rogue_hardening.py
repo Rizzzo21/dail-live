@@ -270,7 +270,7 @@ def test_safe_is_dail_denominated_no_cash_out():
     assert info["currency"] == "DAIL"
     # Fund the safe, configure a withdrawal key, withdraw to a destination.
     r = client.post("/safe/receive",
-                    json={"amount": 50, "provider": "test", "idempotency_key": "rh-safe-1"},
+                    json={"agent_id": aid, "amount": 50, "provider": "test", "idempotency_key": "rh-safe-1"},
                     headers=_auth(key))
     assert r.status_code == 200, r.text
     r = client.post("/safe/keys/withdrawal", headers=ADMIN)

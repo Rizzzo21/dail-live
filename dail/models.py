@@ -42,6 +42,7 @@ class PaymentRequest(BaseModel):
 
 
 class SafeReceiveRequest(BaseModel):
+    agent_id: str
     amount: int = Field(gt=0)
     provider: str = "mock"
     idempotency_key: str
