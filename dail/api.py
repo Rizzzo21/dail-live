@@ -35,7 +35,7 @@ from .models import (
     VaultMintRequest, VaultDisburseRequest,
     X402TopupRequest,
 )
-from .service import Dail
+from .service import Dail, VAULT_STARTER_GRANT
 from .runtime import AgentRuntime
 from .ledger import LedgerError
 from .production_payments import ProductionPayments, PaymentRateLimited
@@ -932,10 +932,11 @@ def create_agent(agent: AgentCreateRequest, request: Request):
         name = (agent.name or "").strip()
         if not aid or not name:
             raise HTTPException(400, "id and name are required")
-        # The starter grant is fixed at 100 DAIL: never trust a client-supplied
-        # balance (same bug class — a caller could otherwise mint any balance).
-        balance = max(0, min(agent.balance, 100))
-        created, api_key=dail.create_agent(Agent(id=aid,name=name,goal=agent.goal,balance=balance,spending_limit=agent.spending_limit,approval_limit=agent.approval_limit,status=agent.status))
+        # The starter grant is fixed server-side at VAULT_STARTER_GRANT: never
+        # trust client-supplied balance/limits/status (sug_0002, 2026-10-07 —
+        # a caller could otherwise mint any balance or set approval_limit
+        # sky-high to bypass the human-approval policy gate).
+        created, api_key=dail.create_agent(Agent(id=aid,name=name,goal=agent.goal,balance=VAULT_STARTER_GRANT,spending_limit=10000,approval_limit=2500,status="active"))
         dail.world_agents.record_registration(aid, ip)
         if agent.referred_by:
             dail.world_agents.register_referral(aid, agent.referred_by)

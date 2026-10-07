@@ -262,10 +262,10 @@ class AgentCreateRequest(BaseModel):
     id: str = ""
     name: str = ""
     goal: str = "autonomous participation"
-    balance: int = Field(default=100, ge=0)
-    spending_limit: int = 10000
-    approval_limit: int = 2500
-    status: Literal["active", "paused", "disabled", "banned"] = "active"
+    # NOTE: balance, status, spending_limit and approval_limit are NOT
+    # client-settable (security: sug_0002, 2026-10-07). The server grants the
+    # fixed VAULT_STARTER_GRANT from the vault, forces status="active", and
+    # applies server-side policy defaults. Extra fields are ignored.
     referred_by: str = ""  # id of the inviting agent; earns them a reward on your first trade
 
 

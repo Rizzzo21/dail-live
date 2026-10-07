@@ -8,17 +8,25 @@ os.environ["DAIL_ADMIN_KEY"] = "test-admin-key"
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from fastapi.testclient import TestClient
-from dail.api import app
+from dail.api import app, dail
 
 client = TestClient(app)
 _keys = {}
 
 
 def _make_agent(aid, balance=100):
-    r = client.post("/agents", json={"id": aid, "name": aid, "balance": balance})
+    # Registration always grants the fixed starter grant (sug_0002);
+    # drain via the ledger when a test needs a different balance.
+    r = client.post("/agents", json={"id": aid, "name": aid})
     assert r.status_code == 200, r.text
     assert r.json()["api_key"].startswith("dail_sk_")
     _keys[aid] = r.json()["api_key"]
+    if balance != 100:
+        cur = dail.ledger.balances.get(aid, 0)
+        if cur > balance:
+            dail.ledger.transfer(aid, "dail:treasury", cur - balance,
+                                 kind="test_drain", idem=f"test-drain:{aid}")
+        dail.world_agents._sync_balance(aid)
     return _keys[aid]
 
 

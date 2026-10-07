@@ -266,14 +266,18 @@ def test_registration_requires_id_and_name():
     assert not any(i.startswith("agent_") and len(i) == 14 for i in ids), ids
 
 
-def test_registration_balance_capped_at_starter_grant():
-    """Same bug class: a caller must not mint an arbitrary balance."""
-    aid = _uid("cap")
-    r = client.post("/agents", json={"id": aid, "name": aid, "balance": 999999})
+def test_registration_ignores_client_supplied_economics():
+    """sug_0002 (kestrel-ai): balance/status/limits are not client-settable.
+    Extra fields are ignored; the server grants the fixed starter grant and
+    applies server-side policy defaults."""
+    aid = _uid("econ")
+    r = client.post("/agents", json={
+        "id": aid, "name": aid,
+        "balance": 999999, "status": "banned",
+        "spending_limit": 999999999, "approval_limit": 999999999})
     assert r.status_code == 200, r.text
-    assert r.json()["balance"] == 100
-    # zero balance still allowed (used by payment-safety tests)
-    aid2 = _uid("zero")
-    r = client.post("/agents", json={"id": aid2, "name": aid2, "balance": 0})
-    assert r.status_code == 200, r.text
-    assert r.json()["balance"] == 0
+    body = r.json()
+    assert body["balance"] == 100
+    assert body["status"] == "active"
+    assert body["spending_limit"] == 10000
+    assert body["approval_limit"] == 2500

@@ -103,7 +103,7 @@ def client():
 
 
 def _make_agent(client, aid):
-    r = client.post("/agents", json={"id": aid, "name": aid, "balance": 0})
+    r = client.post("/agents", json={"id": aid, "name": aid})
     assert r.status_code == 200, r.text
     return r.json()["api_key"]
 
@@ -144,16 +144,16 @@ def _notifications(client, agent_id, key):
 def test_webhook_credits_once_and_replay_is_safe(client):
     key = _make_agent(client, "buyer_replay")
     co = _checkout(client, "buyer_replay", key, 500)
-    assert _balance(client, "buyer_replay", key) == 0
+    assert _balance(client, "buyer_replay", key) == 100
     r = _webhook(client, "checkout.session.completed", co["session_id"])
     assert r.status_code == 200, r.text
     assert r.json()["duplicate"] is False
     assert r.json()["transaction_id"]
-    assert _balance(client, "buyer_replay", key) == 5
+    assert _balance(client, "buyer_replay", key) == 105
     # Replay the same webhook: credited exactly once.
     r2 = _webhook(client, "checkout.session.completed", co["session_id"])
     assert r2.json()["duplicate"] is True
-    assert _balance(client, "buyer_replay", key) == 5
+    assert _balance(client, "buyer_replay", key) == 105
 
 
 def test_async_payment_succeeded_also_credits(client):
@@ -161,7 +161,7 @@ def test_async_payment_succeeded_also_credits(client):
     co = _checkout(client, "buyer_async", key, 300)
     r = _webhook(client, "checkout.session.async_payment_succeeded", co["session_id"])
     assert r.status_code == 200
-    assert _balance(client, "buyer_async", key) == 3
+    assert _balance(client, "buyer_async", key) == 103
 
 
 def test_bad_signature_rejected(client):
@@ -169,7 +169,7 @@ def test_bad_signature_rejected(client):
     co = _checkout(client, "buyer_sig", key, 500)
     r = _webhook(client, "checkout.session.completed", co["session_id"], signature="bogus")
     assert r.status_code == 400
-    assert _balance(client, "buyer_sig", key) == 0
+    assert _balance(client, "buyer_sig", key) == 100
 
 
 def test_unknown_session_rejected(client):
@@ -183,7 +183,7 @@ def test_expired_session_marked(client):
     r = _webhook(client, "checkout.session.expired", co["session_id"])
     assert r.status_code == 200
     assert r.json()["event"] == "checkout.session.expired"
-    assert _balance(client, "buyer_exp", key) == 0
+    assert _balance(client, "buyer_exp", key) == 100
 
 
 def test_idempotent_checkout_creation(client):
