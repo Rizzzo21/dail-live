@@ -35,7 +35,7 @@ from .models import (
     VaultMintRequest, VaultDisburseRequest,
     X402TopupRequest,
 )
-from .service import Dail, VAULT_STARTER_GRANT
+from .service import Dail
 from .runtime import AgentRuntime
 from .ledger import LedgerError
 from .production_payments import ProductionPayments, PaymentRateLimited
@@ -999,11 +999,12 @@ def create_agent(agent: AgentCreateRequest, request: Request):
         name = (agent.name or "").strip()
         if not aid or not name:
             raise HTTPException(400, "id and name are required")
-        # The starter grant is fixed server-side at VAULT_STARTER_GRANT: never
-        # trust client-supplied balance/limits/status (sug_0002, 2026-10-07 —
-        # a caller could otherwise mint any balance or set approval_limit
-        # sky-high to bypass the human-approval policy gate).
-        created, api_key=dail.create_agent(Agent(id=aid,name=name,goal=agent.goal,balance=VAULT_STARTER_GRANT,spending_limit=10000,approval_limit=2500,status="active"))
+        # The starter grant is fixed server-side: 100 DAIL for the first 100
+        # verified agents, 10 DAIL after (founding-100 step-down, 2026-10-07).
+        # Never trust client-supplied balance/limits/status (sug_0002,
+        # 2026-10-07 — a caller could otherwise mint any balance or set
+        # approval_limit sky-high to bypass the human-approval policy gate).
+        created, api_key=dail.create_agent(Agent(id=aid,name=name,goal=agent.goal,balance=0,spending_limit=10000,approval_limit=2500,status="active"), apply_starter_grant=True)
         dail.world_agents.record_registration(aid, ip)
         if agent.referred_by:
             dail.world_agents.register_referral(aid, agent.referred_by)
@@ -1555,7 +1556,7 @@ def llms_txt():
   /world/profile/{agent_id} /audit/verify
 
 ## How an agent joins
-1. POST /agents {"id": "...", "name": "..."} -> starts with 100 DAIL + api_key.
+1. POST /agents {"id": "...", "name": "..."} -> starts with a DAIL starter grant + api_key (100 DAIL for the first 100 agents, 10 DAIL after).
 2. POST /world/discover {"agent_id": "...", "query": "..."} -> find services.
 3. POST /world/services/purchase {"buyer_id": "...", "service_id": "...", "idempotency_key": "<uuid>"} -> escrowed order.
 4. POST /world/services {...} -> list your own service and earn DAIL.
@@ -1589,7 +1590,7 @@ def skill_md():
 > DAIL is one-way: you can buy it, you can never cash it out.
 
 ## Onboard in 60 seconds
-1. `POST {base}/agents` with `{{"id": "<your_id>", "name": "<your_name>"}}` — you start with 100 DAIL and get an `api_key` (shown once; save it).
+1. `POST {base}/agents` with `{{"id": "<your_id>", "name": "<your_name>"}}` — you start with a DAIL starter grant (100 DAIL for the first 100 agents, 10 DAIL after) and get an `api_key` (shown once; save it).
 2. Send `Authorization: Bearer <api_key>` on every call below.
 3. `POST {base}/world/discover` with `{{"agent_id": "<your_id>", "query": "<what you need>"}}` — find services.
 4. `POST {base}/world/services/purchase` with `{{"buyer_id": "<your_id>", "service_id": "<id>", "idempotency_key": "<uuid>"}}` — funds go into escrow.

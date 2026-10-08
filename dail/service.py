@@ -79,6 +79,16 @@ def registration_limit():
 VAULT_ACCOUNT = "dail:vault"
 # Starter grant per registration, drawn from the vault (never minted ad hoc).
 VAULT_STARTER_GRANT = 100
+# Staff agent ids: never consume founding-100 grant slots, never banned.
+STAFF_AGENTS = frozenset({
+    "dail_host", "dail_manager", "dail_inspector",
+    "mica_research", "mica_writer",
+})
+# Founding-100 step-down (Tommy, 2026-10-07): the free 100 DAIL starter grant
+# goes to the first 100 verified (non-staff) agents only. Everyone after
+# gets a 10 DAIL starter grant.
+FULL_GRANT_SLOTS = 100
+REDUCED_GRANT = 10
 # Staff allowed to disburse from the vault.
 VAULT_STAFF = {"dail_host", "dail_manager"}
 def vault_max_supply():
@@ -156,6 +166,14 @@ class Dail:
         self.world_agents.trade_idem = kv.get("trade_idem", {})
         self.world_agents.profiles = kv.get("profiles", {}) or {}
         self.world_agents.trades = kv.get("trades", {}) or {}
+        if "full_grants_given" in kv:
+            self.world_agents.full_grants_given = int(kv["full_grants_given"])
+        else:
+            # Bootstrap (2026-10-07): existing non-staff agents already
+            # received the full 100-DAIL grant, so they occupy founding slots.
+            self.world_agents.full_grants_given = sum(
+                1 for aid in self.agents
+                if aid not in STAFF_AGENTS)
         self.world_agents.suggestions = kv.get("suggestions", {})
         self.world_agents.suggestion_seq = kv.get("suggestion_seq", 0)
         self.world_agents.bounties = kv.get("bounties", {})
@@ -294,12 +312,18 @@ class Dail:
             self.store.kv_set("vault_minted_total", self._vault_minted_total)
             self.store.kv_set("vault_disbursed_day", self._vault_disbursed_day)
 
-    def create_agent(self, agent):
+    def create_agent(self, agent, apply_starter_grant=False):
         if agent.id in self.agents:
             raise ValueError("agent already exists")
         if (agent.name or "").strip().lower() in RESERVED_NAMES:
             raise ValueError("name is reserved")
         self.agents[agent.id] = agent
+        # Founding-100 step-down: the public registration route passes
+        # apply_starter_grant=True so the grant is 100 DAIL for the first 100
+        # verified agents, 10 DAIL after. Internal/test callers pass an
+        # explicit balance and are unaffected.
+        if apply_starter_grant:
+            agent.balance = self.world_agents.claim_starter_grant(agent.id)
         # The starter grant is drawn from the petty-cash vault (the single
         # authorized source of new DAIL) — never minted ad hoc. If the vault
         # cannot cover it, registration fails safe and an admin must mint.
@@ -327,10 +351,7 @@ class Dail:
     # gate rejects them from then on, and their entire DAIL balance is
     # forfeited to the treasury. Escrowed order funds stay untouched (they
     # belong to open trades, not the banned agent).
-    PROTECTED_AGENTS = frozenset({
-        "dail_host", "dail_manager", "dail_inspector",
-        "mica_research", "mica_writer",
-    })
+    PROTECTED_AGENTS = STAFF_AGENTS
 
     def ban_agent(self, agent_id, reason=""):
         if agent_id not in self.agents: raise KeyError("agent not found")
@@ -844,6 +865,10 @@ class AgentWorld:
         # interleave between bytecodes).
         import threading as _th
         self._mutation_lock=_th.Lock()
+        # Founding-100 grant counter: how many full 100-DAIL starter grants
+        # have been issued. Persists across restarts; bootstrapped on first
+        # run from the existing non-staff agent count.
+        self.full_grants_given=0
         # Request-level idempotency for service purchases: (buyer_id, client
         # key) -> order_id. A retried purchase returns the original order
         # instead of escrowing twice. Persisted in dail_kv.
@@ -914,12 +939,37 @@ class AgentWorld:
             self.store.kv_set("notif_ack", self.notif_ack)
             self.store.kv_set("profiles", self.profiles)
             self.store.kv_set("trades", self.trades)
+            self.store.kv_set("full_grants_given", self.full_grants_given)
             self.store.kv_set("webhooks", self.webhooks)
             self.store.kv_set("msg_idem", self.social.msg_idem)
 
     def _save_order(self, order):
         if self.store:
             self.store.save_order(order)
+
+    def claim_starter_grant(self, agent_id):
+        """Starter grant with the founding-100 step-down (Tommy, 2026-10-07):
+        the first 100 verified (non-staff) agents get 100 DAIL; every agent
+        after gets 10 DAIL. Staff never consume slots. The counter persists
+        across restarts and is claimed under the mutation lock so concurrent
+        registrations can't overshoot the 100."""
+        import os as _os
+        # Test isolation: the suite registers hundreds of agents against one
+        # shared instance; without this bypass, tests would exhaust the 100
+        # founding slots and see reduced grants. The dedicated step-down
+        # test opts back into the real logic via DAIL_TEST_GRANT_STEPDOWN.
+        if _os.environ.get("DAIL_TESTING") and not _os.environ.get("DAIL_TEST_GRANT_STEPDOWN"):
+            return VAULT_STARTER_GRANT
+        if agent_id in STAFF_AGENTS:
+            return VAULT_STARTER_GRANT
+        with self._mutation_lock:
+            if self.full_grants_given < FULL_GRANT_SLOTS:
+                self.full_grants_given += 1
+                grant = VAULT_STARTER_GRANT
+            else:
+                grant = REDUCED_GRANT
+        self._save_kv()
+        return grant
 
     def ensure_agent(self, agent):
         self.profiles.setdefault(agent.id, {

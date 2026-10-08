@@ -14,13 +14,23 @@ os.environ.setdefault("DAIL_VAULT_MAX_SUPPLY", "1000000")
 
 import pytest
 
+# Test mode flag: claim_starter_grant bypasses the founding-100 step-down
+# so the suite's hundreds of registrations all get the full grant (the
+# dedicated step-down test opts back in via DAIL_TEST_GRANT_STEPDOWN).
+os.environ["DAIL_TESTING"] = "1"
+
 
 @pytest.fixture(autouse=True)
 def _ensure_test_vault_funded():
     from dail.api import dail as _d
     if _d.ledger.balances.get("dail:vault", 0) < 500000:
         _d.vault_mint(1000000, "test seed", idem="test-vault-seed")
+    # Founding-100 grant counter: each test starts from a clean slate so
+    # registrations get the full 100-DAIL grant by default; the step-down
+    # test sets the counter explicitly.
+    _d.world_agents.full_grants_given = 0
     yield
+    _d.world_agents.full_grants_given = 0
 
 
 def fund_vault(d, amount=100000, idem="test-vault-seed"):
