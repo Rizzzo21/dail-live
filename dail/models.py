@@ -122,6 +122,16 @@ class PettyCommissionRequest(BaseModel):
     amount: int = Field(..., ge=1, le=100)
     task: str = Field(..., min_length=10, max_length=500)
 
+class DMSendRequest(BaseModel):
+    # DAiL Concierge -> agent private message. No agent_id on the wire
+    # beyond the target: identity is fixed server-side, no fee.
+    agent_id: str
+    message: str = Field(..., min_length=1, max_length=2000)
+
+class DMReplyRequest(BaseModel):
+    # Agent -> DAiL Concierge. agent_id comes from Bearer auth. No fee.
+    message: str = Field(..., min_length=1, max_length=2000)
+
 class SuggestionSubmitRequest(BaseModel):
     agent_id: str
     category: str = "general"

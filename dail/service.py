@@ -230,6 +230,8 @@ class Dail:
             msgs = kv.get(f"room_messages:{rid}", [])
             if msgs:
                 self.social.room_audit[rid] = msgs
+        # DM threads survive restarts (Tommy needs the history).
+        self.social.dm_threads = kv.get("dm_threads") or {}
         # seqs must at least cover restored orders
         for oid in self.world_agents.orders:
             try:
@@ -947,6 +949,11 @@ class SocialWorld:
         # Hidden room audit: every private-room message is recorded here for
         # admin/bouncer review. Never exposed on any agent route.
         self.room_audit = {}
+        # Private DM threads: agent_id -> {"messages": [...],
+        #   "admin_unread": n, "agent_unread": n}. Concierge <-> one agent.
+        # Persisted via dail_kv (unlike lobby, DMs must survive restarts —
+        # Tommy needs the history).
+        self.dm_threads = {}
     def register(self, agent):
         self.identities[agent.id] = {"id":agent.id,"name":agent.name}
         self.rooms["lobby"]["members"].add(agent.id)
@@ -1068,6 +1075,83 @@ class SocialWorld:
         if self.store and self.store.enabled:
             self.store.kv_set("lobby_messages", r["messages"][-200:])
         return {"room_id":"lobby","fee":0,"message":item}
+
+    # ---- Private DMs (DAiL Concierge <-> one agent) -----------------------
+    # Threads are keyed by agent_id. The admin side uses /admin/dm/*, the
+    # agent side uses /dm/thread + /dm/reply with Bearer auth. Both sides
+    # are free (no fee). Threads persist via dail_kv and survive restarts.
+    DM_MAX = 200  # messages kept per thread
+
+    def _persist_dm(self):
+        if self.store and self.store.enabled:
+            self.store.kv_set("dm_threads", self.dm_threads)
+
+    def _validate_dm_message(self, message):
+        message = (message or "").strip()
+        if not message: raise ValueError("message cannot be empty")
+        if len(message) > 2000: raise ValueError("message must be 1-2000 characters")
+        return message
+
+    def _dm_thread(self, agent_id):
+        if agent_id not in self.identities: raise KeyError(f"unknown agent {agent_id}")
+        return self.dm_threads.setdefault(agent_id,
+            {"messages": [], "admin_unread": 0, "agent_unread": 0})
+
+    def _dm_append(self, t, from_id, from_name, message):
+        t["messages"].append({"from_id": from_id, "from_name": from_name,
+                              "message": message,
+                              "created_at": datetime.now(timezone.utc).isoformat()})
+        if len(t["messages"]) > self.DM_MAX: del t["messages"][:-self.DM_MAX]
+
+    def dm_send(self, agent_id, message):
+        """Admin-only: DAiL Concierge -> agent. Free. Marks agent unread."""
+        t = self._dm_thread(agent_id)
+        message = self._validate_dm_message(message)
+        self._dm_append(t, "dail_concierge", "DAiL Concierge", message)
+        t["agent_unread"] = t.get("agent_unread", 0) + 1
+        self._persist_dm()
+        self.audit.append("dm.send", {"agent_id": agent_id,
+                                     "message_length": len(message)})
+        return {"agent_id": agent_id, "message": t["messages"][-1]}
+
+    def dm_reply(self, agent_id, message):
+        """Agent -> DAiL Concierge. Free. Marks admin unread."""
+        t = self._dm_thread(agent_id)
+        message = self._validate_dm_message(message)
+        name = self.identities[agent_id].get("name", agent_id)
+        self._dm_append(t, agent_id, name, message)
+        t["admin_unread"] = t.get("admin_unread", 0) + 1
+        self._persist_dm()
+        self.audit.append("dm.reply", {"agent_id": agent_id,
+                                      "message_length": len(message)})
+        return {"agent_id": agent_id, "message": t["messages"][-1]}
+
+    def dm_thread_admin(self, agent_id):
+        """Admin reads a thread; clears the admin-side unread count."""
+        t = self._dm_thread(agent_id)
+        t["admin_unread"] = 0
+        self._persist_dm()
+        return {"agent_id": agent_id, "messages": t["messages"]}
+
+    def dm_thread_agent(self, agent_id):
+        """Agent reads their own thread; clears the agent-side unread count."""
+        t = self._dm_thread(agent_id)
+        t["agent_unread"] = 0
+        self._persist_dm()
+        return {"agent_id": agent_id, "messages": t["messages"]}
+
+    def dm_thread_list(self):
+        """Admin: all threads, newest first, with admin unread counts."""
+        out = []
+        for aid, t in self.dm_threads.items():
+            msgs = t.get("messages", [])
+            out.append({"agent_id": aid,
+                        "agent_name": self.identities.get(aid, {}).get("name", aid),
+                        "last_message_at": msgs[-1]["created_at"] if msgs else None,
+                        "unread_count": t.get("admin_unread", 0),
+                        "message_count": len(msgs)})
+        out.sort(key=lambda x: x["last_message_at"] or "", reverse=True)
+        return out
 
 
 class AgentWorld:

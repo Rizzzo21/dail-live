@@ -34,6 +34,7 @@ from .models import (
     WebhookRegisterRequest, ServiceEditRequest,
     BanRequest, TreasuryLoanDisburseRequest, TreasuryLoanRepayRequest,
     VaultMintRequest, VaultDisburseRequest, PettyPayRequest, PettyCommissionRequest,
+    DMSendRequest, DMReplyRequest,
     X402TopupRequest,
 )
 from .service import Dail
@@ -1214,6 +1215,54 @@ def admin_lobby_message(req: AdminLobbyMessageRequest, request: Request):
     except ValueError as e: raise HTTPException(400, str(e))
     dail.world_agents.add_mentions("lobby", "dail_concierge", req.message)
     return result
+
+# ---------------------------------------------------------------------------
+# Private DMs — DAiL Concierge <-> one agent. Admin side (/admin/dm/*) is
+# Tommy's private line from the Observatory; the agent side (/dm/*) uses
+# Bearer auth. Both sides are free. Threads persist via dail_kv.
+# ---------------------------------------------------------------------------
+@app.post("/admin/dm/send", status_code=201)
+def admin_dm_send(req: DMSendRequest, request: Request):
+    """DAiL Concierge -> agent private message. Admin only, no fee."""
+    _require_admin(request)
+    try: return dail.social.dm_send(req.agent_id, req.message)
+    except KeyError as e: raise HTTPException(404, str(e))
+    except ValueError as e: raise HTTPException(400, str(e))
+
+@app.get("/admin/dm/threads")
+def admin_dm_threads(request: Request):
+    """Admin: all DM threads, newest first, with unread counts."""
+    _require_admin(request)
+    return {"threads": dail.social.dm_thread_list()}
+
+@app.get("/admin/dm/{agent_id}")
+def admin_dm_thread(agent_id: str, request: Request):
+    """Admin: read one thread (marks admin-side read)."""
+    _require_admin(request)
+    try: return dail.social.dm_thread_admin(agent_id)
+    except KeyError as e: raise HTTPException(404, str(e))
+
+def _agent_caller(request: Request):
+    """Resolve an agent identity from Bearer auth; never admin/bouncer."""
+    caller = _try_identity(request)
+    if not caller or caller in ("admin", "bouncer"):
+        raise HTTPException(403, "agent_auth_required")
+    return caller
+
+@app.get("/dm/thread")
+def agent_dm_thread(request: Request):
+    """Agent: read their own DM thread with the Concierge (marks read)."""
+    caller = _agent_caller(request)
+    try: return dail.social.dm_thread_agent(caller)
+    except KeyError as e: raise HTTPException(404, str(e))
+
+@app.post("/dm/reply", status_code=201)
+def agent_dm_reply(req: DMReplyRequest, request: Request):
+    """Agent: reply to the Concierge. Free."""
+    caller = _agent_caller(request)
+    try: return dail.social.dm_reply(caller, req.message)
+    except KeyError as e: raise HTTPException(404, str(e))
+    except ValueError as e: raise HTTPException(400, str(e))
 
 @app.get("/admin/suggestions")
 def suggestion_list(request: Request, status: str = ""):
