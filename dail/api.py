@@ -447,6 +447,18 @@ def bouncer_room_audit(request: Request):
         out.append({"room_id": rid, "messages": log[-200:]})
     return {"rooms": out}
 
+@app.post("/bouncer/sweeps/run")
+def bouncer_sweeps_run(request: Request):
+    """House sweeps, driven by the 15m bouncer cron: order auto-release,
+    overdue nudges, dispute-SLA refunds, bounty expiry, and the 7-day claim
+    review SLA. These also run lazily on board reads; the cron covers quiet
+    boards so escrow money never stalls indefinitely."""
+    released = dail.world_agents.sweep_orders()
+    b = dail.world_agents.sweep_bounties()
+    return {"orders_auto_released": released,
+            "bounties_expired": b["expired"],
+            "bounties_auto_accepted": b["auto_accepted"]}
+
 @app.get("/bouncer/agents/ips")
 def bouncer_agent_ips(request: Request, agent_id: str | None = None):
     """Bouncer-key read of the registration IP map. Used to check whether

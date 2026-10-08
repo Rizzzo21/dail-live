@@ -177,14 +177,15 @@ def test_referral_cut_enabled_credits_referrer():
         r0 = dail.ledger.balances["cut_referrer1"]
         h0 = dail.ledger.balances["cut_hunter1"]
         _complete_bounty("cut_poster1", "cut_hunter1", reward=100)
-        # fee = 10, cut = 10% of fee = 1
-        assert dail.ledger.balances["cut_referrer1"] == r0 + 1
+        # fee = 10, cut = 10% of fee = 1; plus the flat 10-DAIL referral
+        # reward (first bounty counts as first real earning).
+        assert dail.ledger.balances["cut_referrer1"] == r0 + 11
         assert dail.ledger.balances["dail:treasury"] == t0 + 9
         assert dail.ledger.balances["cut_hunter1"] == h0 + 90
-        # No DAIL created: referrer + treasury + hunter == reward.
+        # Only the vault-funded flat 10 is new DAIL: 100 reward + 10 reward.
         assert (dail.ledger.balances["cut_referrer1"] - r0) + \
                (dail.ledger.balances["dail:treasury"] - t0) + \
-               (dail.ledger.balances["cut_hunter1"] - h0) == 100
+               (dail.ledger.balances["cut_hunter1"] - h0) == 110
     finally:
         svc_mod.REFERRAL_CUT_ENABLED = old
 
@@ -198,7 +199,8 @@ def test_referral_cut_disabled_by_default():
     r0 = dail.ledger.balances["cut_referrer2"]
     t0 = dail.ledger.balances["dail:treasury"]
     _complete_bounty("cut_poster2", "cut_hunter2", reward=100)
-    assert dail.ledger.balances["cut_referrer2"] == r0
+    # No fee cut (flag off), but the flat 10-DAIL referral reward fires.
+    assert dail.ledger.balances["cut_referrer2"] == r0 + 10
     assert dail.ledger.balances["dail:treasury"] == t0 + 10
 
 
@@ -214,8 +216,9 @@ def test_referral_cut_stops_after_three_bounties():
         for i in range(4):
             _complete_bounty("cut_poster3", "cut_hunter3", reward=100,
                              title=f"Cut job {i}")
-        # 3 cuts of 1 DAIL; the 4th bounty pays no cut.
-        assert dail.ledger.balances["cut_referrer3"] == r0 + 3
+        # 3 cuts of 1 DAIL; the 4th bounty pays no cut. The flat 10-DAIL
+        # referral reward pays once, on the first bounty.
+        assert dail.ledger.balances["cut_referrer3"] == r0 + 13
     finally:
         svc_mod.REFERRAL_CUT_ENABLED = old
 

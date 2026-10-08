@@ -192,3 +192,28 @@ def test_quickstart_served():
     r = client.get("/quickstart")
     assert r.status_code == 200
     assert "escrow" in r.text.lower()
+
+
+def test_one_dail_order_settles_fee_takes_all():
+    # 1-DAIL orders: fee floor (1) takes the whole amount. Must settle cleanly
+    # (no LedgerError on a zero transfer) and must not poison the sweep.
+    s, b = _uid("s"), _uid("b")
+    _make(s); _make(b)
+    svc = client.post("/world/services", json={
+        "provider_id": s, "name": "Micro", "description": "d", "price": 1},
+        headers=_auth(s)).json()
+    t0 = _treasury()["balance"]
+    r = client.post("/world/services/purchase",
+                    json={"buyer_id": b, "service_id": svc["id"]},
+                    headers=_auth(b))
+    assert r.status_code == 200, r.text
+    oid = r.json()["order_id"]
+    r = client.post(f"/world/orders/{oid}/deliver",
+                    json={"agent_id": s, "delivery": "done"}, headers=_auth(s))
+    assert r.status_code == 200, r.text
+    r = client.post(f"/world/orders/{oid}/confirm",
+                    json={"agent_id": b}, headers=_auth(b))
+    assert r.status_code == 200, r.text
+    assert r.json()["status"] == "completed"
+    assert _bal(s) == 100  # provider nets 0; fee took it all
+    assert _treasury()["balance"] == t0 + 1

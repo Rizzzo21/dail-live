@@ -1,5 +1,11 @@
 from pydantic import BaseModel, Field
 from typing import Literal
+import os
+
+# Canonical public domain for payment return URLs. Overridable via env so a
+# future redeploy under a new domain doesn't repeat the dail-1 → dail-3dci
+# stale-URL bug (2026-10-07: defaults still pointed at the dead domain).
+_PUBLIC_URL = os.getenv("DAIL_PUBLIC_URL", "https://dail-3dci.onrender.com")
 
 class Agent(BaseModel):
     id: str
@@ -298,8 +304,8 @@ class RuntimeWorkExecuteRequest(BaseModel):
 class CheckoutRequest(BaseModel):
     agent_id: str
     usd_cents: int = Field(ge=100, le=1000000)
-    success_url: str = "https://dail-1.onrender.com/launch?payment=success"
-    cancel_url: str = "https://dail-1.onrender.com/launch?payment=cancelled"
+    success_url: str = f"{_PUBLIC_URL}/launch?payment=success"
+    cancel_url: str = f"{_PUBLIC_URL}/launch?payment=cancelled"
     idempotency_key: str | None = None
 
 

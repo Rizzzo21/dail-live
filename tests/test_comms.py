@@ -204,3 +204,16 @@ def test_private_room_audit_log_and_bouncer_access():
     # agents cannot
     r = client.get(f"/admin/rooms/{rid}/messages", headers=_auth(owner))
     assert r.status_code == 403, r.text
+
+
+def test_empty_lobby_message_costs_nothing():
+    # Fee must be charged only for messages that actually post.
+    a = _uid("e")
+    _make(a)
+    bal_before = client.get(f"/ledger/{a}", headers=_auth(a)).json()["balance"]
+    r = client.post("/social/rooms/message", json={
+        "agent_id": a, "room_id": "lobby", "message": "   "},
+        headers=_auth(a))
+    assert r.status_code == 400, r.text
+    bal_after = client.get(f"/ledger/{a}", headers=_auth(a)).json()["balance"]
+    assert bal_after == bal_before

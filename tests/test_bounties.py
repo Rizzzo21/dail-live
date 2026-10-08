@@ -111,3 +111,69 @@ def test_bounty_guards():
     r = client.post(f"/world/bounties/{bid}/claim", json={
         "agent_id": stranger, "submission": "late"}, headers=_auth(stranger))
     assert r.status_code == 400
+
+
+def test_ban_hunter_voids_claim_reopens_bounty():
+    # Banning the hunter of a claimed bounty: the claim dies, the bounty
+    # reopens, escrow stays held for the next hunter (poster is innocent).
+    from dail.api import dail as _d
+    poster, hunter = _uid("p"), _uid("h")
+    _make(poster); _make(hunter)
+    r = client.post("/world/bounties", json={
+        "agent_id": poster, "title": "Need work",
+        "description": "do the thing", "reward": 40},
+        headers=_auth(poster))
+    assert r.status_code == 201, r.text
+    bid = r.json()["id"]
+    r = client.post(f"/world/bounties/{bid}/claim", json={
+        "agent_id": hunter, "submission": "done"}, headers=_auth(hunter))
+    assert r.status_code == 200, r.text
+    _d.ban_agent(hunter, "test")
+    b = _d.world_agents.bounties[bid]
+    assert b["status"] == "open", b
+    assert b.get("hunter_id") is None
+    assert hunter in _d.world_agents.banned_ids
+    # poster balance unchanged (escrow still held: 100 - 40)
+    r = client.get(f"/ledger/{poster}", headers=_auth(poster))
+    assert r.json()["balance"] == 60
+    # unban clears the sweep guard
+    _d.unban_agent(hunter)
+    assert hunter not in _d.world_agents.banned_ids
+
+
+def test_referral_reward_fires_on_bounty_track():
+    # Referrers earn when their invitee's first real earning is a bounty,
+    # not just a trade/order. Dust gate still applies (reward 25 >= 10).
+    from datetime import datetime, timedelta, timezone
+    from dail.api import dail as _d
+    referrer, hunter, poster = _uid("r"), _uid("h"), _uid("p")
+    # distinct public registration IPs: the TestClient reports client.host as
+    # "testclient" for all requests, which would trip the shared-IP wash guard
+    def _mk(aid, ip, **kw):
+        r = client.post("/agents", json={"id": aid, "name": aid, **kw},
+                        headers={"X-Forwarded-For": ip})
+        assert r.status_code == 200, r.text
+        _keys[aid] = r.json()["api_key"]
+    _mk(referrer, "9.80.0.1"); _mk(poster, "9.80.0.2")
+    _mk(hunter, "9.80.0.3", referred_by=referrer)
+    _d.world_agents.agent_created[poster] = (
+        datetime.now(timezone.utc) - timedelta(days=2)).isoformat()
+    _d.world_agents.agent_created[hunter] = (
+        datetime.now(timezone.utc) - timedelta(days=2)).isoformat()
+    r = client.post("/world/bounties", json={
+        "agent_id": poster, "title": "Audit this",
+        "description": "real work", "reward": 25},
+        headers=_auth(poster))
+    assert r.status_code == 201, r.text
+    bid = r.json()["id"]
+    r = client.post(f"/world/bounties/{bid}/claim", json={
+        "agent_id": hunter, "submission": "report"}, headers=_auth(hunter))
+    assert r.status_code == 200, r.text
+    bal_before = client.get(f"/ledger/{referrer}",
+                            headers=_auth(referrer)).json()["balance"]
+    r = client.post(f"/world/bounties/{bid}/accept",
+                    json={"agent_id": poster}, headers=_auth(poster))
+    assert r.status_code == 200, r.text
+    bal_after = client.get(f"/ledger/{referrer}",
+                           headers=_auth(referrer)).json()["balance"]
+    assert bal_after == bal_before + 10, (bal_before, bal_after)

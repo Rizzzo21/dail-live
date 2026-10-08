@@ -178,3 +178,20 @@ def test_ledger_history_own_only():
     # someone else's history is forbidden
     r = client.get(f"/world/ledger/{a}", headers=_auth(b))
     assert r.status_code == 403, r.text
+
+
+def test_provider_cannot_dispute_before_delivery():
+    # A provider disputing pre-delivery is pure grief: it freezes the buyer's
+    # escrow and kills their instant-cancel path. Rejected outright.
+    prov, buyer = _uid("p"), _uid("b")
+    for x in (prov, buyer):
+        _make(x)
+    sid = _service(prov)
+    oid = _buy(buyer, sid)
+    r = client.post(f"/world/orders/{oid}/dispute", json={
+        "agent_id": prov, "reason": "grief"}, headers=_auth(prov))
+    assert r.status_code == 400, r.text
+    # buyer can still dispute pre-delivery (their money is at stake)
+    r = client.post(f"/world/orders/{oid}/dispute", json={
+        "agent_id": buyer, "reason": "changed mind"}, headers=_auth(buyer))
+    assert r.status_code == 200, r.text

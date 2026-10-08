@@ -156,6 +156,7 @@ class Dail:
         self.world_agents.suggestions = kv.get("suggestions", {})
         self.world_agents.suggestion_seq = kv.get("suggestion_seq", 0)
         self.world_agents.bounties = kv.get("bounties", {})
+        self.world_agents.banned_ids = set(kv.get("banned_ids", []) or [])
         self.world_agents.bounty_seq = kv.get("bounty_seq", 0)
         # Migration 2026-10-07 (kestrel-ai audit #7): security bounties keep
         # submissions private. Flag any existing bounty that reads like a bug
@@ -340,7 +341,7 @@ class Dail:
                                  kind="ban_forfeit", idem=f"ban-forfeit:{agent_id}")
         # Orphaned escrow: a banned agent's open/claimed bounties can never
         # pay out, and their orders can never complete. Resolve everything:
-        # bounty escrows go to the treasury, buyers get refunded.
+        # poster-banned bounty escrows go to the treasury, buyers get refunded.
         for b in self.world_agents.bounties.values():
             if b["poster_id"]==agent_id and b["status"] in ("open","claimed"):
                 try:
@@ -354,8 +355,22 @@ class Dail:
                     b["status"]="voided"
                 except Exception:
                     pass
+            elif b.get("hunter_id")==agent_id and b["status"]=="claimed":
+                # Banned hunter: the claim dies, the bounty reopens. The
+                # poster is innocent -- escrow stays held for the next hunter.
+                try:
+                    b["status"]="open"
+                    b["hunter_id"]=None
+                    b["claimed_at"]=None
+                    self.world_agents._notify(b["poster_id"],
+                        {"type":"bounty_claim_voided","bounty_id":b["id"],
+                         "body":f"Bounty {b['id']} claim voided: the hunter was banned. Bounty is open again."})
+                except Exception:
+                    pass
+        self.world_agents._save_kv()
+        self.world_agents.banned_ids.add(agent_id)
         for o in self.world_agents.orders.values():
-            if o["status"] not in ("awaiting_delivery","delivered"):
+            if o["status"] not in ("awaiting_delivery","delivered","disputed"):
                 continue
             try:
                 if o["provider_id"]==agent_id:
@@ -391,6 +406,8 @@ class Dail:
         if agent_id not in self.agents: raise KeyError("agent not found")
         agent = self.agents[agent_id]
         agent.status = "active"
+        self.world_agents.banned_ids.discard(agent_id)
+        self.world_agents._save_kv()
         if self.store: self.store.save_agent(agent)
         self.audit.append("agent.unbanned", {"agent_id": agent_id})
         return {"agent_id": agent_id, "status": "active"}
@@ -766,9 +783,9 @@ class SocialWorld:
                 return prior  # retried POST: original result, no double charge
         r=self.rooms[room_id]
         if agent_id not in r["members"]: raise PermissionError("agent_not_in_room")
-        if room_id=="lobby": self.ledger.transfer(agent_id,"DAIL_NETWORK",1,kind="communication_fee",idem=f"msg:{room_id}:{agent_id}:{len(r['messages'])}")
         message=message.strip()
         if not message: raise ValueError("message cannot be empty")
+        if room_id=="lobby": self.ledger.transfer(agent_id,"DAIL_NETWORK",1,kind="communication_fee",idem=f"msg:{room_id}:{agent_id}:{len(r['messages'])}")
         item={"from_id":agent_id,"from_name":self.identities[agent_id]["name"],"message":message,
               "created_at":datetime.now(timezone.utc).isoformat()}
         r["messages"].append(item); self.audit.append("room.message",{"room_id":room_id,"agent_id":agent_id,"message_length":len(message)})
@@ -810,6 +827,9 @@ class AgentWorld:
         self.reg_ips={}
         self.agent_ips={}
         self.agent_created={}
+        # Banned agent ids, for sweep-time guards (e.g. never auto-accept a
+        # bounty claim for a banned hunter). Maintained by ban/unban.
+        self.banned_ids=set()
         # Request-level idempotency for service purchases: (buyer_id, client
         # key) -> order_id. A retried purchase returns the original order
         # instead of escrowing twice. Persisted in dail_kv.
@@ -867,6 +887,7 @@ class AgentWorld:
             self.store.kv_set("suggestion_seq", self.suggestion_seq)
             self.store.kv_set("bounties", self.bounties)
             self.store.kv_set("bounty_seq", self.bounty_seq)
+            self.store.kv_set("banned_ids", sorted(self.banned_ids))
             self.store.kv_set("service_trials", self.service_trials)
             self.store.kv_set("bounty_requests", self.bounty_requests)
             self.store.kv_set("bounty_request_seq", self.bounty_request_seq)
@@ -1086,8 +1107,12 @@ class AgentWorld:
         escrow=f"escrow:{oid}"
         if winner=="provider":
             fee=self._fee(amount); net=amount-fee
-            self.ledger.transfer(escrow, order["provider_id"], net,
-                                 kind="order_release", idem=f"escrow-release:{oid}")
+            if net > 0:
+                self.ledger.transfer(escrow, order["provider_id"], net,
+                                     kind="order_release", idem=f"escrow-release:{oid}")
+            # net == 0: the 1-DAIL fee floor takes the whole micro-order.
+            # Skip the zero transfer (ledger rejects non-positive amounts);
+            # the provider still gets the completed order + reputation.
             if fee:
                 self.ledger.transfer(escrow, "dail:treasury", fee,
                                      kind="order_fee", idem=f"escrow-fee:{oid}")
@@ -1143,6 +1168,13 @@ class AgentWorld:
             raise PermissionError("not your order")
         if order["status"] not in ("awaiting_delivery","delivered"):
             raise ValueError("order not disputable")
+        if order["status"]=="awaiting_delivery" and agent_id==order["provider_id"]:
+            # No grievance exists yet: the buyer has only paid. A provider
+            # disputing pre-delivery is pure grief -- it freezes the buyer's
+            # escrow and kills their instant-cancel path for 48h. If the
+            # provider can't deliver, they simply don't deliver (the buyer
+            # cancels or the order goes overdue).
+            raise ValueError("provider cannot dispute before delivery")
         # Filing costs DISPUTE_FEE to the treasury (red-team round 4):
         # free disputes let one griefer freeze unlimited escrows and
         # bottleneck admin resolution.
@@ -1222,7 +1254,14 @@ class AgentWorld:
                 except Exception:
                     continue
                 if delivered+ORDER_AUTO_RELEASE<=now:
-                    self._release_escrow(order, "provider")
+                    try:
+                        self._release_escrow(order, "provider")
+                    except Exception as e:
+                        # One bad order must never poison the sweep: log it and
+                        # keep releasing the rest.
+                        self.audit.append("order.auto_release_failed",
+                                          {"order_id": order["id"], "error": str(e)})
+                        continue
                     order["status"]="completed"
                     order["completed_at"]=now.isoformat()
                     order["auto_released"]=True
@@ -1316,9 +1355,10 @@ class AgentWorld:
     def _trade_counterparties(self, agent_id):
         """Counterparties of the agent's settled economic activity.
 
-        Covers completed/resolved escrow orders AND settled direct trades
-        (trades settle instantly and never touch the order book).
-        Returns [(counterparty_id, kind)] with kind in {"order", "trade"}.
+        Covers completed/resolved escrow orders, settled direct trades
+        (trades settle instantly and never touch the order book), and
+        completed bounties (the poster is the hunter's counterparty).
+        Returns [(counterparty_id, kind)] with kind in {"order", "trade", "bounty"}.
         """
         out = []
         for o in self.orders.values():
@@ -1335,6 +1375,12 @@ class AgentWorld:
                 continue
             cp = t["seller_id"] if t["buyer_id"] == agent_id else t["buyer_id"]
             out.append((cp, "trade"))
+        for b in self.bounties.values():
+            if b.get("status") != "completed":
+                continue
+            if b.get("hunter_id") != agent_id:
+                continue
+            out.append((b.get("poster_id"), "bounty"))
         seen, uniq = set(), []
         for cp, kind in out:
             if cp not in seen:
@@ -1375,7 +1421,7 @@ class AgentWorld:
         return reasons
 
     def _qualifying_trade_value(self, agent_id):
-        """Largest settled trade/order value for the agent. Used to gate the
+        """Largest settled trade/order/bounty value for the agent. Used to gate the
         referral reward: dust trades must not mint rewards."""
         best = 0
         for o in self.orders.values():
@@ -1390,6 +1436,12 @@ class AgentWorld:
             if agent_id not in (t.get("buyer_id"), t.get("seller_id")):
                 continue
             best = max(best, t.get("amount", 0) or 0)
+        for b in self.bounties.values():
+            if b.get("status") != "completed":
+                continue
+            if b.get("hunter_id") != agent_id:
+                continue
+            best = max(best, b.get("reward", 0) or 0)
         return best
 
     def _hold_referral(self, agent_id, referrer, ref, reason):
@@ -1702,13 +1754,23 @@ class AgentWorld:
 
     def _notify(self, agent_id, item):
         """Single choke point for all agent notifications: persists the
-        item, stamps it, and fires any registered webhooks (best-effort)."""
+        item, stamps it, and fires any registered webhooks (best-effort).
+
+        Webhook dispatch runs on a daemon thread: a subscriber's dead URL
+        must never add latency to the caller's own trade request (blocking
+        urlopen at 5s timeout x up to 5 hooks = up to 25s on the request
+        path before this fix)."""
         if not isinstance(item, dict):
             item = {"body": str(item)}
         item.setdefault("type", "info")
         item.setdefault("created_at", datetime.now(timezone.utc).isoformat())
         self.notifications.setdefault(agent_id, []).append(item)
-        self._dispatch_webhooks(agent_id, item)
+        if self.webhooks.get(agent_id):
+            import threading
+            t = threading.Thread(target=self._dispatch_webhooks,
+                                 args=(agent_id, dict(item)),
+                                 daemon=True)
+            t.start()
         return item
 
     def _dispatch_webhooks(self, agent_id, item):
@@ -1952,13 +2014,20 @@ class AgentWorld:
         """Time-based bounty hygiene, run lazily on every board read:
         - open bounties past expires_at expire (escrow back to poster)
         - claimed bounties past the 7-day review SLA auto-accept (escrow to hunter)
-        Bounties posted before expiry existed get created_at + 30 days."""
+        Bounties posted before expiry existed get created_at + 30 days.
+        Returns {"expired": n, "auto_accepted": n}."""
         now=datetime.now(timezone.utc)
+        expired = 0; auto_accepted = 0
         for b in self.bounties.values():
             if b["status"]=="claimed" and b.get("claimed_at"):
+                if b.get("hunter_id") in self.banned_ids:
+                    # Never auto-pay a banned hunter. The ban pass voids the
+                    # claim; this is the backstop if one slips through.
+                    continue
                 try:
                     if datetime.fromisoformat(b["claimed_at"])+CLAIM_REVIEW_SLA<=now:
                         self._settle_bounty(b, auto=True)
+                        auto_accepted += 1
                         self._notify(b["poster_id"],
                             {"type":"bounty_auto_accepted","bounty_id":b["id"],
                              "body":f"Bounty {b['id']} auto-accepted after the 7-day review SLA; escrow released to {b['hunter_id']}."})
@@ -1983,6 +2052,7 @@ class AgentWorld:
                                          idem=f"bounty-expire:{b['id']}")
                     self._sync_balance(b["poster_id"])
                     b["status"]="expired"
+                    expired += 1
                     self._notify(b["poster_id"], 
                         {"type":"bounty_expired","bounty_id":b["id"],
                          "body":f"Bounty {b['id']} expired with no claims; {b['reward']} DAIL escrow returned."})
@@ -1990,6 +2060,7 @@ class AgentWorld:
             except Exception:
                 pass
         self._save_kv()
+        return {"expired": expired, "auto_accepted": auto_accepted}
 
     def edit_bounty(self, agent_id, bounty_id, title=None, description=None):
         """Poster-only edit of an open bounty's title/description. No more
@@ -2117,6 +2188,10 @@ class AgentWorld:
              "body":f"Bounty {bounty_id} {'auto-' if auto else ''}accepted: {net} DAIL released (fee {fee})."})
         self._save_kv()
         self.audit.append("bounty.completed", {"bounty_id":bounty_id,"hunter_id":hunter_id,"fee":fee,"referral_cut":ref_cut,"auto":auto})
+        # Flat referral reward also fires on the bounty track: FIRST CONTACT
+        # bounties are the designed first-earning path, so referrers of
+        # bounty-earning agents must earn like referrers of traders.
+        self._maybe_pay_referral(hunter_id)
         return b
 
     def _referral_fee_cut(self, hunter_id, fee):
