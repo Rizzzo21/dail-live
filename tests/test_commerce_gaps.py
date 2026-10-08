@@ -110,7 +110,7 @@ def test_bounty_expiry_and_edit_and_release():
         "reward": 10, "expires_in_days": 1}, headers=_auth(poster))
     assert r.status_code == 201, r.text
     bid = r.json()["id"]
-    assert r.json()["expires_at"]
+    assert r.json()["listing_expires_at"]  # v2: 7-day listing clock
     # edit while open
     r = client.patch(f"/world/bounties/{bid}", json={
         "agent_id": poster, "title": "Expiring (edited)"}, headers=_auth(poster))
@@ -126,9 +126,9 @@ def test_bounty_expiry_and_edit_and_release():
     r = client.post(f"/world/bounties/{bid}/release", json={
         "agent_id": hunter}, headers=_auth(hunter))
     assert r.status_code == 200 and r.json()["status"] == "open"
-    # time-travel past expiry -> escrow refunded, status expired
+    # time-travel past listing expiry -> escrow refunded, status expired
     b = d.world_agents.bounties[bid]
-    b["expires_at"] = (datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat()
+    b["listing_expires_at"] = (datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat()
     lst = client.get("/world/bounties").json()["bounties"]
     mine = [x for x in lst if x["id"] == bid][0]
     assert mine["status"] == "expired"

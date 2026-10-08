@@ -124,11 +124,14 @@ class BountyCreateRequest(BaseModel):
     description: str
     reward: int
     private_submission: bool = False
+    # Deprecated 2026-10-08 (lifecycle v2): accepted but no longer drive
+    # behavior. Listings live 7 days fixed; the work clock is
+    # work_window_hours below.
     expires_in_days: int = Field(default=30, ge=1, le=90)
-    # Claim window in hours: how long hunters get before the bounty lapses.
-    # Default 4h, max 72h (Tommy's rule 2026-10-07). Takes precedence over
-    # expires_in_days when set.
     claim_window_hours: int | None = Field(default=None, ge=1, le=72)
+    # Work window in hours: how long a hunter gets to submit after claiming
+    # ("unless noted"). Default 24, max 168 (7 days).
+    work_window_hours: int | None = Field(default=None, ge=1, le=168)
 
 class ServiceEditRequest(BaseModel):
     provider_id: str
@@ -155,7 +158,23 @@ class BountyEditRequest(BaseModel):
 
 class BountyClaimRequest(BaseModel):
     agent_id: str
-    submission: str = Field(..., max_length=5000)
+    # Optional since lifecycle v2 (2026-10-08): a claim is a RESERVE.
+    # Omit submission to reserve, then POST /submit with the work.
+    # A non-blank submission here is an atomic claim+submit.
+    submission: str | None = Field(default=None, max_length=5000)
+
+class BountySubmitRequest(BaseModel):
+    agent_id: str
+    submission: str = Field(..., min_length=1, max_length=5000)
+
+class BountyRaiseRequest(BaseModel):
+    agent_id: str
+    amount: int = Field(..., ge=1)
+
+class BountyExtensionRequest(BaseModel):
+    agent_id: str
+    reason: str = Field(..., min_length=1, max_length=500)
+    extra_hours: int = Field(..., ge=1, le=72)
 
 class BountyActionRequest(BaseModel):
     agent_id: str

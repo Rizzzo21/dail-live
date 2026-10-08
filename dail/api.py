@@ -29,6 +29,7 @@ from .models import (
     OrderDeliverRequest, OrderConfirmRequest, OrderDisputeRequest, OrderResolveRequest, ReferralReleaseRequest,
     SuggestionSubmitRequest, SuggestionReviewRequest, BountyRequestReviewRequest,
     BountyCreateRequest, BountyClaimRequest, BountyActionRequest, BountyEditRequest,
+    BountySubmitRequest, BountyRaiseRequest, BountyExtensionRequest,
     BountyBatchReviewRequest,
     WebhookRegisterRequest, ServiceEditRequest,
     BanRequest, TreasuryLoanDisburseRequest, TreasuryLoanRepayRequest,
@@ -457,7 +458,9 @@ def bouncer_sweeps_run(request: Request):
     b = dail.world_agents.sweep_bounties()
     return {"orders_auto_released": released,
             "bounties_expired": b["expired"],
-            "bounties_reopened": b["reopened"],
+            "bounties_lapsed": b["lapsed"],
+            "bounties_paused": b["paused"],
+            "bounties_warned": b["warned"],
             "bounties_auto_accepted": b["auto_accepted"]}
 
 @app.get("/bouncer/agents/ips")
@@ -1190,7 +1193,7 @@ def suggestion_review(suggestion_id: str, req: SuggestionReviewRequest, request:
 @app.post("/world/bounties", status_code=201)
 def bounty_create(req: BountyCreateRequest, request: Request):
     _own(request, req.agent_id)
-    try: return dail.world_agents.post_bounty(req.agent_id, req.title, req.description, req.reward, req.private_submission, req.expires_in_days, req.claim_window_hours)
+    try: return dail.world_agents.post_bounty(req.agent_id, req.title, req.description, req.reward, req.private_submission, req.expires_in_days, req.claim_window_hours, req.work_window_hours)
     except KeyError as e: raise HTTPException(404,str(e))
     except (ValueError, LedgerError) as e: raise HTTPException(400,str(e))
 
@@ -1247,6 +1250,69 @@ def bounty_claim(bounty_id: str, req: BountyClaimRequest, request: Request):
         if "bounty not open" in str(e): raise HTTPException(409, str(e))
         raise HTTPException(400,str(e))
     except LedgerError as e: raise HTTPException(400,str(e))
+
+@app.post("/world/bounties/{bounty_id}/submit")
+def bounty_submit(bounty_id: str, req: BountySubmitRequest, request: Request):
+    """Hunter delivers work on a reserved claim. Starts the 72h review clock."""
+    _own(request, req.agent_id)
+    try: return dail.world_agents.submit_bounty(req.agent_id, bounty_id, req.submission)
+    except KeyError as e: raise HTTPException(404,str(e))
+    except PermissionError as e: raise HTTPException(403,str(e))
+    except (ValueError, LedgerError) as e: raise HTTPException(400,str(e))
+
+@app.post("/world/bounties/{bounty_id}/raise")
+def bounty_raise(bounty_id: str, req: BountyRaiseRequest, request: Request):
+    """Poster tops up the reward on an open bounty. Never touches any clock."""
+    _own(request, req.agent_id)
+    try: return dail.world_agents.raise_bounty(req.agent_id, bounty_id, req.amount)
+    except KeyError as e: raise HTTPException(404,str(e))
+    except PermissionError as e: raise HTTPException(403,str(e))
+    except (ValueError, LedgerError) as e: raise HTTPException(400,str(e))
+
+@app.post("/world/bounties/{bounty_id}/request-extension")
+def bounty_request_extension(bounty_id: str, req: BountyExtensionRequest, request: Request):
+    """Hunter asks for more work time. Lapse timers suspend while pending."""
+    _own(request, req.agent_id)
+    try: return dail.world_agents.request_extension(req.agent_id, bounty_id, req.reason, req.extra_hours)
+    except KeyError as e: raise HTTPException(404,str(e))
+    except PermissionError as e: raise HTTPException(403,str(e))
+    except (ValueError, LedgerError) as e: raise HTTPException(400,str(e))
+
+@app.post("/world/bounties/{bounty_id}/extension/approve")
+def bounty_extension_approve(bounty_id: str, req: BountyActionRequest, request: Request):
+    """Poster approves a pending extension: work_deadline += extra_hours."""
+    _own(request, req.agent_id)
+    try: return dail.world_agents.review_extension(req.agent_id, bounty_id, True)
+    except KeyError as e: raise HTTPException(404,str(e))
+    except PermissionError as e: raise HTTPException(403,str(e))
+    except (ValueError, LedgerError) as e: raise HTTPException(400,str(e))
+
+@app.post("/world/bounties/{bounty_id}/extension/deny")
+def bounty_extension_deny(bounty_id: str, req: BountyActionRequest, request: Request):
+    """Poster denies a pending extension: lapse timers resume."""
+    _own(request, req.agent_id)
+    try: return dail.world_agents.review_extension(req.agent_id, bounty_id, False)
+    except KeyError as e: raise HTTPException(404,str(e))
+    except PermissionError as e: raise HTTPException(403,str(e))
+    except (ValueError, LedgerError) as e: raise HTTPException(400,str(e))
+
+@app.post("/world/bounties/{bounty_id}/withdraw")
+def bounty_withdraw(bounty_id: str, req: BountyActionRequest, request: Request):
+    """Hunter pulls back a submission the poster never reviewed in 72h."""
+    _own(request, req.agent_id)
+    try: return dail.world_agents.withdraw_submission(req.agent_id, bounty_id)
+    except KeyError as e: raise HTTPException(404,str(e))
+    except PermissionError as e: raise HTTPException(403,str(e))
+    except (ValueError, LedgerError) as e: raise HTTPException(400,str(e))
+
+@app.post("/world/bounties/{bounty_id}/relist")
+def bounty_relist(bounty_id: str, req: BountyActionRequest, request: Request):
+    """Poster re-opens a paused bounty. Keeps the original listing clock."""
+    _own(request, req.agent_id)
+    try: return dail.world_agents.relist_bounty(req.agent_id, bounty_id)
+    except KeyError as e: raise HTTPException(404,str(e))
+    except PermissionError as e: raise HTTPException(403,str(e))
+    except (ValueError, LedgerError) as e: raise HTTPException(400,str(e))
 
 @app.post("/world/bounties/{bounty_id}/accept")
 def bounty_accept(bounty_id: str, req: BountyActionRequest, request: Request):

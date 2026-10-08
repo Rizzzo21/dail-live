@@ -208,65 +208,404 @@ def test_bounty_post_notifies_matching_capabilities():
     assert not pn
 
 
-def test_bounty_default_window_is_4h_max_72h():
+def test_bounty_v2_listing_and_work_windows():
+    # Lifecycle v2: listings live 7 days fixed; work window defaults to 24h,
+    # settable 1..168 at posting. claim_window_hours still accepted
+    # (deprecated) but drives nothing.
+    from datetime import datetime, timezone
     p = _uid("p"); _make(p)
     r = client.post("/world/bounties", json={
         "agent_id": p, "title": "Quick job", "description": "fast",
         "reward": 10}, headers=_auth(p))
     assert r.status_code == 201, r.text
-    assert r.json()["claim_window_hours"] == 4
+    b = r.json()
+    lexp = datetime.fromisoformat(b["listing_expires_at"])
+    created = datetime.fromisoformat(b["created_at"])
+    assert abs((lexp - created).total_seconds() - 7 * 86400) < 60
+    assert b["work_window_hours"] == 24
+    assert b["expires_at"] is None  # retired field
     r = client.post("/world/bounties", json={
         "agent_id": p, "title": "Slow job", "description": "slow",
-        "reward": 10, "claim_window_hours": 72}, headers=_auth(p))
+        "reward": 10, "work_window_hours": 168}, headers=_auth(p))
     assert r.status_code == 201, r.text
-    assert r.json()["claim_window_hours"] == 72
+    assert r.json()["work_window_hours"] == 168
     r = client.post("/world/bounties", json={
         "agent_id": p, "title": "Too slow", "description": "x",
-        "reward": 10, "claim_window_hours": 73}, headers=_auth(p))
-    assert r.status_code == 422, r.text  # schema caps at 72
+        "reward": 10, "work_window_hours": 169}, headers=_auth(p))
+    assert r.status_code == 422, r.text  # schema caps at 168
+    # deprecated param still accepted, no behavior
+    r = client.post("/world/bounties", json={
+        "agent_id": p, "title": "Legacy", "description": "x",
+        "reward": 10, "claim_window_hours": 72}, headers=_auth(p))
+    assert r.status_code == 201, r.text
 
 
-def test_lapsed_claim_reopens_for_sniping():
-    # Claimed but unreviewed past the window: claim dies, bounty reopens,
-    # another hunter can snipe it.
+def test_reserve_claim_then_submit():
+    # Claim is a reserve: no submission required. Submit delivers the work
+    # and starts the 72h review clock. Second submit is rejected.
+    from datetime import datetime, timezone
+    poster, hunter = _uid("p"), _uid("h")
+    _make(poster); _make(hunter)
+    bid = client.post("/world/bounties", json={
+        "agent_id": poster, "title": "t", "description": "d", "reward": 20},
+        headers=_auth(poster)).json()["id"]
+    r = client.post(f"/world/bounties/{bid}/claim", json={
+        "agent_id": hunter}, headers=_auth(hunter))
+    assert r.status_code == 200, r.text
+    b = r.json()
+    assert b["status"] == "claimed" and b["submitted_at"] is None
+    assert b["stall_deadline"] is not None and b["work_deadline"] is not None
+    r = client.post(f"/world/bounties/{bid}/submit", json={
+        "agent_id": hunter, "submission": "the work"}, headers=_auth(hunter))
+    assert r.status_code == 200, r.text
+    b = r.json()
+    assert b["submitted_at"] is not None and b["review_deadline"] is not None
+    assert b["stall_deadline"] is None
+    r = client.post(f"/world/bounties/{bid}/submit", json={
+        "agent_id": hunter, "submission": "again"}, headers=_auth(hunter))
+    assert r.status_code == 400, r.text
+
+
+def test_atomic_claim_with_submission():
+    # Non-blank submission on claim = atomic claim+submit (old one-shot flow).
+    poster, hunter = _uid("p"), _uid("h")
+    _make(poster); _make(hunter)
+    bid = client.post("/world/bounties", json={
+        "agent_id": poster, "title": "t", "description": "d", "reward": 20},
+        headers=_auth(poster)).json()["id"]
+    r = client.post(f"/world/bounties/{bid}/claim", json={
+        "agent_id": hunter, "submission": "done already"}, headers=_auth(hunter))
+    assert r.status_code == 200, r.text
+    b = r.json()
+    assert b["submitted_at"] == b["claimed_at"]
+    assert b["review_deadline"] is not None
+    r = client.post(f"/world/bounties/{bid}/accept",
+                    json={"agent_id": poster}, headers=_auth(poster))
+    assert r.status_code == 200 and r.json()["status"] == "completed"
+
+
+def test_stall_lapse_reopens_snipable_bars_hunter():
+    # Reserve with no submission past the 4h stall limit: claim lapses,
+    # bounty reopens, the stalled hunter is barred from reclaiming, a
+    # sniper can claim it.
     from datetime import datetime, timedelta, timezone
     from dail.api import dail as _d
     poster, hunter, sniper = _uid("p"), _uid("h"), _uid("s")
     _make(poster); _make(hunter); _make(sniper)
-    r = client.post("/world/bounties", json={
-        "agent_id": poster, "title": "Lapsing job", "description": "d",
-        "reward": 20, "claim_window_hours": 1}, headers=_auth(poster))
-    bid = r.json()["id"]
+    bid = client.post("/world/bounties", json={
+        "agent_id": poster, "title": "t", "description": "d", "reward": 20},
+        headers=_auth(poster)).json()["id"]
     r = client.post(f"/world/bounties/{bid}/claim", json={
-        "agent_id": hunter, "submission": "work"}, headers=_auth(hunter))
+        "agent_id": hunter}, headers=_auth(hunter))
     assert r.status_code == 200, r.text
-    # time-travel past the 1h window; a board read triggers the sweep
     b = _d.world_agents.bounties[bid]
-    b["expires_at"] = (datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat()
-    client.get("/world/bounties")
+    b["stall_deadline"] = (datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat()
+    client.get("/world/bounties")  # board read triggers sweep
     b = _d.world_agents.bounties[bid]
     assert b["status"] == "open", b
-    assert b.get("hunter_id") is None
-    # sniper can now claim it
+    assert b.get("hunter_id") is None and b["failed_claims"] == 1
+    assert hunter in b["lapsed_hunters"]
+    # stalled hunter is barred from reclaiming this bounty
     r = client.post(f"/world/bounties/{bid}/claim", json={
-        "agent_id": sniper, "submission": "better"}, headers=_auth(sniper))
+        "agent_id": hunter}, headers=_auth(hunter))
+    assert r.status_code == 400, r.text
+    # sniper gets a fresh reserve with a fresh 24h work clock
+    r = client.post(f"/world/bounties/{bid}/claim", json={
+        "agent_id": sniper}, headers=_auth(sniper))
     assert r.status_code == 200, r.text
+    assert r.json()["work_deadline"] is not None
 
 
-def test_expired_bounty_cannot_be_claimed():
-    # The snipe bug: claim_bounty must sweep first so a past-deadline
-    # bounty reads expired, never open.
+def test_two_lapses_pause_then_relist():
+    # Second lapsed claim pauses the bounty; poster relists or cancels.
+    from datetime import datetime, timedelta, timezone
+    from dail.api import dail as _d
+    poster, h1, h2 = _uid("p"), _uid("h1"), _uid("h2")
+    _make(poster); _make(h1); _make(h2)
+    bid = client.post("/world/bounties", json={
+        "agent_id": poster, "title": "t", "description": "d", "reward": 20},
+        headers=_auth(poster)).json()["id"]
+    for h in (h1, h2):
+        r = client.post(f"/world/bounties/{bid}/claim", json={
+            "agent_id": h}, headers=_auth(h))
+        assert r.status_code == 200, r.text
+        b = _d.world_agents.bounties[bid]
+        b["stall_deadline"] = (datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat()
+        client.get("/world/bounties")
+    b = _d.world_agents.bounties[bid]
+    assert b["status"] == "paused", b
+    assert b["failed_claims"] == 2
+    # paused bounties cannot be claimed
+    r = client.post(f"/world/bounties/{bid}/claim", json={
+        "agent_id": h1}, headers=_auth(h1))
+    assert r.status_code == 409, r.text
+    # poster relists: open again, counters reset, listing clock kept
+    lexp = b["listing_expires_at"]
+    r = client.post(f"/world/bounties/{bid}/relist", json={
+        "agent_id": poster}, headers=_auth(poster))
+    assert r.status_code == 200, r.text
+    b = r.json()
+    assert b["status"] == "open" and b["failed_claims"] == 0
+    assert b["listing_expires_at"] == lexp
+    # and a paused bounty can also just be cancelled (escrow refunded)
+    bid2 = client.post("/world/bounties", json={
+        "agent_id": poster, "title": "t2", "description": "d", "reward": 20},
+        headers=_auth(poster)).json()["id"]
+    h3, h4 = _uid("h3"), _uid("h4")
+    _make(h3); _make(h4)
+    for h in (h3, h4):
+        r = client.post(f"/world/bounties/{bid2}/claim", json={
+            "agent_id": h}, headers=_auth(h))
+        assert r.status_code == 200, r.text
+        b = _d.world_agents.bounties[bid2]
+        b["stall_deadline"] = (datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat()
+        client.get("/world/bounties")
+    assert _d.world_agents.bounties[bid2]["status"] == "paused"
+    r = client.post(f"/world/bounties/{bid2}/cancel", json={
+        "agent_id": poster}, headers=_auth(poster))
+    assert r.status_code == 200 and r.json()["status"] == "cancelled"
+    assert _bal(poster) == 80  # bid2's 20 refunded; bid's 20 still escrowed
+
+
+def test_work_deadline_lapse():
+    # Hunter reserves but never submits past the work window: lapse, even
+    # though the 4h stall limit hasn't been touched in this scenario.
     from datetime import datetime, timedelta, timezone
     from dail.api import dail as _d
     poster, hunter = _uid("p"), _uid("h")
     _make(poster); _make(hunter)
-    r = client.post("/world/bounties", json={
-        "agent_id": poster, "title": "Dead job", "description": "d",
-        "reward": 20, "claim_window_hours": 1}, headers=_auth(poster))
-    bid = r.json()["id"]
-    _d.world_agents.bounties[bid]["expires_at"] = (
-        datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat()
-    # claim directly by ID without a prior board read: must still fail
+    bid = client.post("/world/bounties", json={
+        "agent_id": poster, "title": "t", "description": "d", "reward": 20,
+        "work_window_hours": 1}, headers=_auth(poster)).json()["id"]
     r = client.post(f"/world/bounties/{bid}/claim", json={
-        "agent_id": hunter, "submission": "late"}, headers=_auth(hunter))
+        "agent_id": hunter}, headers=_auth(hunter))
+    assert r.status_code == 200, r.text
+    b = _d.world_agents.bounties[bid]
+    # work deadline (1h) is past; push the 4h stall deadline out so only the
+    # work-deadline path can fire
+    b["work_deadline"] = (datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat()
+    b["stall_deadline"] = (datetime.now(timezone.utc) + timedelta(hours=3)).isoformat()
+    client.get("/world/bounties")
+    b = _d.world_agents.bounties[bid]
+    assert b["status"] == "open", b
+    assert hunter in b["lapsed_hunters"]
+
+
+def test_extension_suspends_timers_and_approve_extends():
+    from datetime import datetime, timedelta, timezone
+    from dail.api import dail as _d
+    poster, hunter = _uid("p"), _uid("h")
+    _make(poster); _make(hunter)
+    bid = client.post("/world/bounties", json={
+        "agent_id": poster, "title": "t", "description": "d", "reward": 20},
+        headers=_auth(poster)).json()["id"]
+    client.post(f"/world/bounties/{bid}/claim", json={
+        "agent_id": hunter}, headers=_auth(hunter))
+    b = _d.world_agents.bounties[bid]
+    wd0 = b["work_deadline"]
+    # blow the stall deadline, then request an extension: pending request
+    # suspends the lapse timers
+    b["stall_deadline"] = (datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat()
+    r = client.post(f"/world/bounties/{bid}/request-extension", json={
+        "agent_id": hunter, "reason": "need more time for research",
+        "extra_hours": 10}, headers=_auth(hunter))
+    assert r.status_code == 200, r.text
+    assert r.json()["extension_request"]["status"] == "pending"
+    client.get("/world/bounties")
+    b = _d.world_agents.bounties[bid]
+    assert b["status"] == "claimed", b  # timers suspended: no lapse
+    # poster approves: work_deadline pushed out by 10h
+    r = client.post(f"/world/bounties/{bid}/extension/approve", json={
+        "agent_id": poster}, headers=_auth(poster))
+    assert r.status_code == 200, r.text
+    b = r.json()
+    assert b["extension_request"]["status"] == "approved"
+    wd1 = datetime.fromisoformat(b["work_deadline"])
+    assert abs((wd1 - datetime.fromisoformat(wd0)).total_seconds() - 10 * 3600) < 60
+    # second request denied: timers resume, blown stall deadline lapses it
+    r = client.post(f"/world/bounties/{bid}/request-extension", json={
+        "agent_id": hunter, "reason": "still stuck", "extra_hours": 5},
+        headers=_auth(hunter))
+    assert r.status_code == 200, r.text
+    r = client.post(f"/world/bounties/{bid}/extension/deny", json={
+        "agent_id": poster}, headers=_auth(poster))
+    assert r.status_code == 200, r.text
+    client.get("/world/bounties")
+    b = _d.world_agents.bounties[bid]
+    assert b["status"] == "open", b
+    assert hunter in b["lapsed_hunters"]
+
+
+def test_extension_cumulative_cap_72h():
+    poster, hunter = _uid("p"), _uid("h")
+    _make(poster); _make(hunter)
+    bid = client.post("/world/bounties", json={
+        "agent_id": poster, "title": "t", "description": "d", "reward": 20},
+        headers=_auth(poster)).json()["id"]
+    client.post(f"/world/bounties/{bid}/claim", json={
+        "agent_id": hunter}, headers=_auth(hunter))
+    client.post(f"/world/bounties/{bid}/request-extension", json={
+        "agent_id": hunter, "reason": "big job", "extra_hours": 72},
+        headers=_auth(hunter))
+    r = client.post(f"/world/bounties/{bid}/extension/approve", json={
+        "agent_id": poster}, headers=_auth(poster))
+    assert r.status_code == 200, r.text
+    # cumulative extra would exceed 72h: rejected
+    client.post(f"/world/bounties/{bid}/request-extension", json={
+        "agent_id": hunter, "reason": "more", "extra_hours": 1},
+        headers=_auth(hunter))
+    r = client.post(f"/world/bounties/{bid}/extension/approve", json={
+        "agent_id": poster}, headers=_auth(poster))
+    assert r.status_code == 400, r.text
+    # non-hunter cannot request; non-poster cannot approve
+    stranger = _uid("s"); _make(stranger)
+    r = client.post(f"/world/bounties/{bid}/request-extension", json={
+        "agent_id": stranger, "reason": "x", "extra_hours": 1},
+        headers=_auth(stranger))
+    assert r.status_code == 403, r.text
+
+
+def test_withdraw_after_72h_no_review():
+    # Submitted work the poster ignores for 72h: hunter withdraws, bounty
+    # reopens, hunter may reclaim (not barred).
+    from datetime import datetime, timedelta, timezone
+    from dail.api import dail as _d
+    poster, hunter = _uid("p"), _uid("h")
+    _make(poster); _make(hunter)
+    bid = client.post("/world/bounties", json={
+        "agent_id": poster, "title": "t", "description": "d", "reward": 20},
+        headers=_auth(poster)).json()["id"]
+    client.post(f"/world/bounties/{bid}/claim", json={
+        "agent_id": hunter, "submission": "work"}, headers=_auth(hunter))
+    # too early: poster still has review time
+    r = client.post(f"/world/bounties/{bid}/withdraw", json={
+        "agent_id": hunter}, headers=_auth(hunter))
+    assert r.status_code == 400, r.text
+    b = _d.world_agents.bounties[bid]
+    b["review_deadline"] = (datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat()
+    r = client.post(f"/world/bounties/{bid}/withdraw", json={
+        "agent_id": hunter}, headers=_auth(hunter))
+    assert r.status_code == 200, r.text
+    b = r.json()
+    assert b["status"] == "open" and b["submission"] is None
+    assert hunter not in b.get("lapsed_hunters", [])
+    # hunter may reclaim
+    r = client.post(f"/world/bounties/{bid}/claim", json={
+        "agent_id": hunter}, headers=_auth(hunter))
+    assert r.status_code == 200, r.text
+
+
+def test_raise_topup_escrow_clock_untouched():
+    poster, stranger = _uid("p"), _uid("s")
+    _make(poster); _make(stranger)
+    bid = client.post("/world/bounties", json={
+        "agent_id": poster, "title": "t", "description": "d", "reward": 20},
+        headers=_auth(poster)).json()["id"]
+    lexp0 = _d_world()[bid]["listing_expires_at"]
+    assert _bal(poster) == 80
+    r = client.post(f"/world/bounties/{bid}/raise", json={
+        "agent_id": poster, "amount": 15}, headers=_auth(poster))
+    assert r.status_code == 200, r.text
+    b = r.json()
+    assert b["reward"] == 35
+    assert b["listing_expires_at"] == lexp0  # clock untouched
+    assert _bal(poster) == 65  # 100 - 20 - 15
+    # second raise works (unique idempotency key per raise)
+    r = client.post(f"/world/bounties/{bid}/raise", json={
+        "agent_id": poster, "amount": 5}, headers=_auth(poster))
+    assert r.status_code == 200 and r.json()["reward"] == 40
+    # stranger cannot raise
+    r = client.post(f"/world/bounties/{bid}/raise", json={
+        "agent_id": stranger, "amount": 5}, headers=_auth(stranger))
+    assert r.status_code == 403, r.text
+    # cannot raise a claimed bounty
+    hunter = _uid("h"); _make(hunter)
+    client.post(f"/world/bounties/{bid}/claim", json={
+        "agent_id": hunter}, headers=_auth(hunter))
+    r = client.post(f"/world/bounties/{bid}/raise", json={
+        "agent_id": poster, "amount": 5}, headers=_auth(poster))
+    assert r.status_code == 400, r.text
+
+
+def _d_world():
+    from dail.api import dail as _d
+    return _d.world_agents.bounties
+
+
+def test_listing_warning_and_expiry():
+    # Poster warned <24h before listing expiry; past expiry the bounty
+    # expires and escrow returns to the poster.
+    from datetime import datetime, timedelta, timezone
+    from dail.api import dail as _d
+    poster = _uid("p"); _make(poster)
+    bid = client.post("/world/bounties", json={
+        "agent_id": poster, "title": "t", "description": "d", "reward": 20},
+        headers=_auth(poster)).json()["id"]
+    b = _d.world_agents.bounties[bid]
+    b["listing_expires_at"] = (datetime.now(timezone.utc) + timedelta(hours=12)).isoformat()
+    client.get("/world/bounties")
+    b = _d.world_agents.bounties[bid]
+    assert b["warned_listing"] is True
+    notifs = client.get(f"/world/notifications/{poster}",
+                        headers=_auth(poster)).json()["notifications"]
+    assert any(n.get("type") == "bounty_expiring" and n.get("bounty_id") == bid
+               for n in notifs), notifs
+    # warning fires only once
+    n0 = len(notifs)
+    client.get("/world/bounties")
+    notifs = client.get(f"/world/notifications/{poster}",
+                        headers=_auth(poster)).json()["notifications"]
+    assert len([n for n in notifs if n.get("type") == "bounty_expiring"
+                and n.get("bounty_id") == bid]) == 1
+    assert len(notifs) == n0
+    # past expiry: sweep expires it, escrow refunded
+    b["listing_expires_at"] = (datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat()
+    client.get("/world/bounties")
+    b = _d.world_agents.bounties[bid]
+    assert b["status"] == "expired", b
+    assert _bal(poster) == 100
+    # expired bounty cannot be claimed (sweep runs inside claim)
+    hunter = _uid("h"); _make(hunter)
+    r = client.post(f"/world/bounties/{bid}/claim", json={
+        "agent_id": hunter}, headers=_auth(hunter))
     assert r.status_code == 409, r.text
+
+
+def test_lifecycle_v2_migration_grandfathers():
+    # Pre-v2 records (no listing_expires_at key) migrate idempotently:
+    # never expire, retired fields nulled, claimed ones get review clocks
+    # backfilled so nothing instantly expires.
+    from datetime import datetime, timedelta, timezone
+    from dail.api import dail as _d
+    wa = _d.world_agents
+    old_open = {"id": "bnty_old1", "poster_id": "x", "poster_name": "x",
+                "title": "t", "description": "d", "reward": 10,
+                "private_submission": False, "claim_window_hours": 4,
+                "expires_at": "2020-01-01T00:00:00+00:00",
+                "status": "open", "hunter_id": None, "submission": None,
+                "rejected_hunters": [], "created_at": "2020-01-01T00:00:00+00:00",
+                "claimed_at": None, "completed_at": None}
+    old_claimed = dict(old_open, id="bnty_old2", status="claimed",
+                       hunter_id="h", submission="work",
+                       claimed_at="2026-10-01T00:00:00+00:00")
+    wa.bounties["bnty_old1"] = old_open
+    wa.bounties["bnty_old2"] = old_claimed
+    wa._migrate_bounty_lifecycle_v2()
+    b1, b2 = wa.bounties["bnty_old1"], wa.bounties["bnty_old2"]
+    assert b1["listing_expires_at"] is None and b1["expires_at"] is None
+    assert b1["warned_listing"] is True and b1["failed_claims"] == 0
+    assert b1["lapsed_hunters"] == [] and b1["extension_request"] is None
+    # claimed record: review clock backfilled into the future
+    assert b2["submitted_at"] is not None
+    assert datetime.fromisoformat(b2["review_deadline"]) > datetime.now(timezone.utc)
+    assert datetime.fromisoformat(b2["work_deadline"]) > datetime.now(timezone.utc)
+    # idempotent: second run changes nothing
+    snap = {k: dict(v) for k, v in wa.bounties.items() if k.startswith("bnty_old")}
+    wa._migrate_bounty_lifecycle_v2()
+    for k in snap:
+        assert wa.bounties[k] == snap[k], k
+    # grandfathered open bounty never expires, even with a sweep
+    wa.bounties["bnty_old1"]["listing_expires_at"] = None
+    res = wa.sweep_bounties()
+    assert wa.bounties["bnty_old1"]["status"] == "open"
+    del wa.bounties["bnty_old1"]; del wa.bounties["bnty_old2"]

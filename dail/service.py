@@ -195,6 +195,9 @@ class Dail:
         for b in self.world_agents.bounties.values():
             if "private_submission" not in b:
                 b["private_submission"] = "bug" in b.get("title", "").lower()
+        # Migration 2026-10-08 (bounty lifecycle v2): grandfather every
+        # pre-v2 bounty -- see _migrate_bounty_lifecycle_v2.
+        self.world_agents._migrate_bounty_lifecycle_v2()
         self.world_agents.service_trials = kv.get("service_trials", {})
         self.world_agents.bounty_requests = kv.get("bounty_requests", {})
         self.world_agents.bounty_request_seq = kv.get("bounty_request_seq", 0)
@@ -404,8 +407,11 @@ class Dail:
                     b["hunter_id"]=None
                     b["claimed_at"]=None
                     b["submission"]=None
-                    b["expires_at"]=(datetime.now(timezone.utc)+timedelta(
-                        hours=b.get("claim_window_hours") or 4)).isoformat()
+                    b["submitted_at"]=None
+                    b["review_deadline"]=None
+                    b["stall_deadline"]=None
+                    b["work_deadline"]=None
+                    b["extension_request"]=None
                     self.world_agents._notify(b["poster_id"],
                         {"type":"bounty_claim_voided","bounty_id":b["id"],
                          "body":f"Bounty {b['id']} claim voided: the hunter was banned. Bounty is open again."})
@@ -2133,22 +2139,34 @@ class AgentWorld:
     # escrow releases minus the house fee. Drives buy-side demand.
     BOUNTY_MIN_REWARD = 2  # so the hunter always nets >= 1 after the fee floor
 
-    def post_bounty(self, agent_id, title, description, reward, private_submission=False, expires_in_days=DEFAULT_BOUNTY_EXPIRY_DAYS, claim_window_hours=None):
-        # Claim window (Tommy's rule 2026-10-07): hunters get 4h by default,
-        # up to 72h max if the bounty notes otherwise. After the window an
-        # unclaimed bounty expires (escrow back to poster); a claimed-but-
-        # unreviewed one reopens -- it can be sniped.
+    # Listing lifetime for lifecycle v2 (Tommy's spec 2026-10-08): 7 days
+    # fixed from posting. Grandfathered bounties have listing_expires_at=None
+    # and never expire.
+    LISTING_LIFETIME = timedelta(days=7)
+    LISTING_WARNING = timedelta(days=1)
+    # Work phase clocks.
+    STALL_LIMIT = timedelta(hours=4)      # reserve with no submission and no
+                                         # pending extension -> lapse, snipable
+    REVIEW_WINDOW = timedelta(hours=72)   # poster review; then hunter may withdraw
+    MAX_EXTENSION_HOURS = 72             # cumulative extra work time per bounty
+
+    def post_bounty(self, agent_id, title, description, reward, private_submission=False, expires_in_days=DEFAULT_BOUNTY_EXPIRY_DAYS, claim_window_hours=None, work_window_hours=None):
+        # Lifecycle v2 (2026-10-08): expires_in_days / claim_window_hours are
+        # deprecated -- accepted, stored for record, but they no longer drive
+        # behavior. Listing lives LISTING_LIFETIME; the work clock is
+        # work_window_hours ("unless noted"), default 24h.
+        if work_window_hours is not None:
+            try: work_hours = int(work_window_hours)
+            except (TypeError, ValueError): raise ValueError("work_window_hours must be an integer")
+            if not 1 <= work_hours <= 168: raise ValueError("work_window_hours must be 1..168")
+        else:
+            work_hours = 24
         if claim_window_hours is not None:
             try: window_hours = int(claim_window_hours)
             except (TypeError, ValueError): raise ValueError("claim_window_hours must be an integer")
             if not 1 <= window_hours <= 72: raise ValueError("claim_window_hours must be 1..72")
         else:
-            try: expires_in_days=int(expires_in_days)
-            except (TypeError, ValueError): raise ValueError("expires_in_days must be an integer")
-            if not 1 <= expires_in_days <= 90: raise ValueError("expires_in_days must be 1..90")
-            window_hours = min(expires_in_days * 24, 72)
-            if expires_in_days == DEFAULT_BOUNTY_EXPIRY_DAYS:
-                window_hours = 4  # default is 4h, not 30d
+            window_hours = 4
         if agent_id not in self.social.identities: raise KeyError("agent not found")
         title=(title or "").strip(); description=(description or "").strip()
         if not title or len(title) > 120: raise ValueError("title must be 1-120 characters")
@@ -2167,8 +2185,18 @@ class AgentWorld:
             "poster_name":self.social.identities[agent_id].get("name",agent_id),
             "title":title,"description":description,"reward":reward,
             "private_submission":bool(private_submission),
+            # Deprecated fields, stored for record only (no behavior).
             "claim_window_hours":window_hours,
-            "expires_at":(datetime.now(timezone.utc)+timedelta(hours=window_hours)).isoformat(),
+            "expires_at":None,
+            # Lifecycle v2 fields.
+            "listing_expires_at":(datetime.now(timezone.utc)+self.LISTING_LIFETIME).isoformat(),
+            "warned_listing":False,
+            "work_window_hours":work_hours,
+            "work_deadline":None,"stall_deadline":None,
+            "submitted_at":None,"review_deadline":None,
+            "failed_claims":0,"lapsed_hunters":[],
+            "extension_request":None,"extension_hours_used":0,
+            "raise_seq":0,
             "status":"open","hunter_id":None,"submission":None,
             "rejected_hunters":[],
             "created_at":now,"claimed_at":None,"completed_at":None}
@@ -2176,6 +2204,41 @@ class AgentWorld:
         self.audit.append("bounty.posted", {"bounty_id":bid,"agent_id":agent_id,"reward":reward})
         self._notify_bounty_matches(self.bounties[bid])
         return self.bounties[bid]
+
+    def _migrate_bounty_lifecycle_v2(self):
+        """One-time migration 2026-10-08 (bounty lifecycle v2): grandfather
+        every pre-v2 bounty -- listing_expires_at=None means NEVER expires
+        (Tommy's explicit call) -- but the new work-phase logic applies the
+        moment any is claimed. Idempotent: keyed on the absence of the v2
+        marker, so post-migration bounties (which always carry the key) are
+        never touched by a later restart."""
+        mig_now = datetime.now(timezone.utc)
+        for b in self.bounties.values():
+            if "listing_expires_at" not in b:
+                b["listing_expires_at"] = None
+                b["expires_at"] = None  # field retired
+                b["warned_listing"] = True
+                b["failed_claims"] = 0
+                b["lapsed_hunters"] = []
+                b["extension_request"] = None
+                b["extension_hours_used"] = 0
+                b["raise_seq"] = 0
+                b["work_window_hours"] = 24
+                if b.get("status") == "claimed" and "submitted_at" not in b:
+                    if b.get("submission"):
+                        # Old flow always submitted at claim time: backfill so
+                        # nothing instantly expires; poster keeps review time.
+                        b["submitted_at"] = mig_now.isoformat()
+                        b["review_deadline"] = (mig_now + timedelta(hours=72)).isoformat()
+                        b["work_deadline"] = (mig_now + timedelta(hours=24)).isoformat()
+                        b["stall_deadline"] = None
+                    else:
+                        # Defensive: a claimed record with no submission acts
+                        # as a fresh reserve from migration time.
+                        b["submitted_at"] = None
+                        b["review_deadline"] = None
+                        b["work_deadline"] = (mig_now + timedelta(hours=24)).isoformat()
+                        b["stall_deadline"] = (mig_now + timedelta(hours=4)).isoformat()
 
     def _notify_bounty_matches(self, bounty):
         """Re-engagement: when a bounty is posted, notify agents whose profile
@@ -2239,107 +2302,163 @@ class AgentWorld:
             out.append(item)
         return {"bounties":out,"count":len(out)}
 
+    def _lapse_claim(self, b, now):
+        """Work-phase lapse (lifecycle v2): a claimed bounty with no
+        submission blew the 4h stall limit or the work deadline. The claim
+        dies, the bounty reopens snipable, and the hunter is barred from
+        reclaiming THIS bounty. Two lapses pauses the bounty for the poster.
+        Lock-free like the rest of the sweep (callers take _mutation_lock
+        around their own flips; the lock is not reentrant)."""
+        hunter = b.get("hunter_id")
+        b["status"] = "open"
+        b["hunter_id"] = None
+        b["submission"] = None
+        b["claimed_at"] = None
+        b["submitted_at"] = None
+        b["review_deadline"] = None
+        b["stall_deadline"] = None
+        b["work_deadline"] = None
+        b["extension_request"] = None
+        b.pop("settle_failed", None)
+        if hunter:
+            lh = b.setdefault("lapsed_hunters", [])
+            if hunter not in lh:
+                lh.append(hunter)
+        b["failed_claims"] = b.get("failed_claims", 0) + 1
+        self._notify(b["poster_id"],
+            {"type": "bounty_claim_lapsed", "bounty_id": b["id"],
+             "body": f"Bounty {b['id']} claim by {hunter} lapsed with no submission in time; bounty is open again and snipable."})
+        if hunter:
+            self._notify(hunter,
+                {"type": "bounty_claim_lapsed", "bounty_id": b["id"],
+                 "body": f"Your claim on bounty {b['id']} lapsed with no submission in time; the bounty is open again."})
+        self.audit.append("bounty.lapsed",
+                          {"bounty_id": b["id"], "hunter_id": hunter,
+                           "failed_claims": b["failed_claims"]})
+        if b["failed_claims"] >= 2:
+            b["status"] = "paused"
+            self._notify(b["poster_id"],
+                {"type": "bounty_paused", "bounty_id": b["id"],
+                 "body": f"Bounty {b['id']} paused after {b['failed_claims']} lapsed claims. Relist via POST /world/bounties/{b['id']}/relist, or cancel it."})
+            self.audit.append("bounty.paused", {"bounty_id": b["id"]})
+
     def sweep_bounties(self):
-        """Time-based bounty hygiene, run lazily on every board read:
-        - open bounties past expires_at expire (escrow back to poster)
-        - claimed bounties past the claim window (4h default, 72h max) lapse:
-          the claim dies and the bounty reopens -- it can be sniped
-        - claimed bounties past the 7-day review SLA auto-accept (escrow to hunter)
-        Bounties posted before expiry existed get created_at + 30 days.
-        Returns {"expired": n, "reopened": n, "auto_accepted": n}."""
-        now=datetime.now(timezone.utc)
-        expired = 0; reopened = 0; auto_accepted = 0
+        """Time-based bounty hygiene, run lazily on every board read
+        (lifecycle v2, 2026-10-08):
+        LISTING phase (status open or paused, listing_expires_at set):
+        - within 24h of expiry and not yet warned: warn the poster
+        - past expiry: expire (escrow back to poster)
+        - grandfathered bounties (listing_expires_at None) never expire
+        WORK phase (status claimed):
+        - banned hunter: skip (the ban pass handles it)
+        - pending extension: stall/work timers suspended
+        - no submission and past the 4h stall limit or the work deadline:
+          lapse (reopen snipable, hunter barred from reclaiming; 2nd lapse
+          pauses the bounty)
+        - submitted and past the 7-day review SLA: auto-accept (escrow to
+          hunter) -- the final backstop
+        Returns {"expired", "lapsed", "paused", "auto_accepted", "warned"}."""
+        now = datetime.now(timezone.utc)
+        expired = 0; lapsed = 0; paused = 0; auto_accepted = 0; warned = 0
         for b in self.bounties.values():
-            if b["status"]=="claimed" and b.get("claimed_at"):
+            status = b.get("status")
+            # ---- WORK phase ----
+            if status == "claimed" and b.get("claimed_at"):
                 if b.get("hunter_id") in self.banned_ids:
                     # Never auto-pay a banned hunter. The ban pass voids the
                     # claim; this is the backstop if one slips through.
                     continue
-                # Claim window lapsed: the hunter didn't get it reviewed in
-                # time. Claim dies, bounty reopens, anyone can snipe it.
-                try:
-                    exp = b.get("expires_at")
-                    if exp and datetime.fromisoformat(exp) <= now:
-                        hunter = b.get("hunter_id")
-                        b["status"] = "open"
-                        b["hunter_id"] = None
-                        b["claimed_at"] = None
-                        b["submission"] = None
-                        b.pop("settle_failed", None)
-                        # Fresh window for the snipers: otherwise the reopened
-                        # bounty would instantly re-expire on the next sweep.
-                        b["expires_at"] = (now + timedelta(
-                            hours=b.get("claim_window_hours") or 4)).isoformat()
-                        reopened += 1
-                        self._notify(b["poster_id"],
-                            {"type":"bounty_claim_lapsed","bounty_id":b["id"],
-                             "body":f"Bounty {b['id']} claim by {hunter} lapsed after the {b.get('claim_window_hours', '?')}h window with no review; bounty is open again."})
-                        if hunter:
-                            self._notify(hunter,
-                                {"type":"bounty_claim_lapsed","bounty_id":b["id"],
-                                 "body":f"Your claim on bounty {b['id']} lapsed after the claim window with no poster review; the bounty is open again and can be sniped."})
-                        self.audit.append("bounty.claim_lapsed",
-                                          {"bounty_id":b["id"],"hunter_id":hunter})
-                        continue
-                except Exception:
-                    pass
-                try:
-                    if datetime.fromisoformat(b["claimed_at"])+CLAIM_REVIEW_SLA<=now:
+                ext = b.get("extension_request") or {}
+                timers_suspended = ext.get("status") == "pending"
+                if not timers_suspended and not b.get("submitted_at"):
+                    blown = False
+                    try:
+                        sd = b.get("stall_deadline")
+                        if sd and datetime.fromisoformat(sd) <= now:
+                            blown = True
+                    except Exception:
+                        pass
+                    if not blown:
                         try:
-                            self._settle_bounty(b, auto=True)
-                        except Exception as e:
-                            # Never silently drop a settlement failure when real
-                            # DAIL is in escrow. Capture it, preserve the escrow
-                            # (status stays claimed), and surface it for admin
-                            # reconciliation -- do NOT release on uncertainty.
-                            b["settle_failed"] = {
-                                "error": str(e)[:300],
-                                "at": now.isoformat(),
-                            }
-                            self.audit.append("bounty.settle_failed",
-                                              {"bounty_id": b["id"],
-                                               "hunter_id": b.get("hunter_id"),
-                                               "escrow": b.get("reward"),
-                                               "error": str(e)[:300]})
+                            wd = b.get("work_deadline")
+                            if wd and datetime.fromisoformat(wd) <= now:
+                                blown = True
+                        except Exception:
+                            pass
+                    if blown:
+                        self._lapse_claim(b, now)
+                        lapsed += 1
+                        if b["status"] == "paused":
+                            paused += 1
+                        continue
+                # 7-day review SLA: submitted work the poster never reviewed
+                # auto-accepts. The hunter earned it.
+                if b.get("submitted_at"):
+                    try:
+                        if datetime.fromisoformat(b["claimed_at"]) + CLAIM_REVIEW_SLA <= now:
+                            try:
+                                self._settle_bounty(b, auto=True)
+                            except Exception as e:
+                                # Never silently drop a settlement failure when real
+                                # DAIL is in escrow. Capture it, preserve the escrow
+                                # (status stays claimed), and surface it for admin
+                                # reconciliation -- do NOT release on uncertainty.
+                                b["settle_failed"] = {
+                                    "error": str(e)[:300],
+                                    "at": now.isoformat(),
+                                }
+                                self.audit.append("bounty.settle_failed",
+                                                  {"bounty_id": b["id"],
+                                                   "hunter_id": b.get("hunter_id"),
+                                                   "escrow": b.get("reward"),
+                                                   "error": str(e)[:300]})
+                                self._notify(b["poster_id"],
+                                    {"type": "bounty_settle_failed",
+                                     "bounty_id": b["id"],
+                                     "body": f"Bounty {b['id']} auto-settlement FAILED ({str(e)[:120]}). Escrow of {b.get('reward')} DAIL is preserved; admin reconciliation required."})
+                                continue
+                            auto_accepted += 1
                             self._notify(b["poster_id"],
-                                {"type": "bounty_settle_failed",
-                                 "bounty_id": b["id"],
-                                 "body": f"Bounty {b['id']} auto-settlement FAILED ({str(e)[:120]}). Escrow of {b.get('reward')} DAIL is preserved; admin reconciliation required."})
-                            continue
-                        auto_accepted += 1
-                        self._notify(b["poster_id"],
-                            {"type":"bounty_auto_accepted","bounty_id":b["id"],
-                             "body":f"Bounty {b['id']} auto-accepted after the 7-day review SLA; escrow released to {b['hunter_id']}."})
-                except Exception:
-                    pass
+                                {"type": "bounty_auto_accepted", "bounty_id": b["id"],
+                                 "body": f"Bounty {b['id']} auto-accepted after the 7-day review SLA; escrow released to {b['hunter_id']}."})
+                    except Exception:
+                        pass
                 continue
-            if b["status"]!="open":
+            # ---- LISTING phase ----
+            if status not in ("open", "paused"):
                 continue
-            exp=b.get("expires_at")
-            if not exp and b.get("created_at"):
-                try:
-                    exp=(datetime.fromisoformat(b["created_at"])+timedelta(days=DEFAULT_BOUNTY_EXPIRY_DAYS)).isoformat()
-                    b["expires_at"]=exp
-                except Exception:
-                    continue
-            if not exp:
-                continue
+            lexp = b.get("listing_expires_at")
+            if not lexp:
+                continue  # grandfathered: never expires
             try:
-                if datetime.fromisoformat(exp)<=now:
+                exp_dt = datetime.fromisoformat(lexp)
+            except Exception:
+                continue
+            if exp_dt <= now:
+                try:
                     self.ledger.transfer(f"escrow:{b['id']}", b["poster_id"],
                                          b["reward"], kind="escrow_refund",
                                          idem=f"bounty-expire:{b['id']}")
                     self._sync_balance(b["poster_id"])
-                    b["status"]="expired"
+                    b["status"] = "expired"
                     expired += 1
-                    self._notify(b["poster_id"], 
-                        {"type":"bounty_expired","bounty_id":b["id"],
-                         "body":f"Bounty {b['id']} expired with no claims; {b['reward']} DAIL escrow returned."})
-                    self.audit.append("bounty.expired", {"bounty_id":b["id"]})
-            except Exception:
-                pass
+                    self._notify(b["poster_id"],
+                        {"type": "bounty_expired", "bounty_id": b["id"],
+                         "body": f"Bounty {b['id']} expired with no claims; {b['reward']} DAIL escrow returned."})
+                    self.audit.append("bounty.expired", {"bounty_id": b["id"]})
+                except Exception:
+                    pass
+                continue
+            if not b.get("warned_listing") and exp_dt - now <= self.LISTING_WARNING:
+                b["warned_listing"] = True
+                warned += 1
+                self._notify(b["poster_id"],
+                    {"type": "bounty_expiring", "bounty_id": b["id"],
+                     "body": f"Bounty {b['id']} expires in less than 24h with no claims. Edit it, raise the reward, or let it expire (escrow returns to you)."})
+                self.audit.append("bounty.expiring_warned", {"bounty_id": b["id"]})
         self._save_kv()
-        return {"expired": expired, "reopened": reopened, "auto_accepted": auto_accepted}
+        return {"expired": expired, "lapsed": lapsed, "paused": paused,
+                "auto_accepted": auto_accepted, "warned": warned}
 
     def edit_bounty(self, agent_id, bounty_id, title=None, description=None):
         """Poster-only edit of an open bounty's title/description. No more
@@ -2368,6 +2487,11 @@ class AgentWorld:
         b["hunter_id"]=None
         b["submission"]=None
         b["claimed_at"]=None
+        b["submitted_at"]=None
+        b["review_deadline"]=None
+        b["stall_deadline"]=None
+        b["work_deadline"]=None
+        b["extension_request"]=None
         self._save_kv()
         self._notify(b["poster_id"], 
             {"type":"claim_released","bounty_id":bounty_id,
@@ -2404,7 +2528,11 @@ class AgentWorld:
             raise PermissionError("not_poster_or_hunter")
         return {"bounty_id": bounty_id, "submission": b.get("submission")}
 
-    def claim_bounty(self, hunter_id, bounty_id, submission):
+    def claim_bounty(self, hunter_id, bounty_id, submission=None):
+        # Lifecycle v2 (2026-10-08): a claim is a RESERVE. Submission is
+        # optional -- omit it to reserve, then POST /submit with the work.
+        # A non-blank submission here is an atomic claim+submit (preserves the
+        # old one-shot flow).
         # Sweep first: an expired bounty must read expired, never "open".
         # Without this, a past-deadline bounty could be sniped by ID and the
         # 7-day SLA would pay out escrow meant for the poster.
@@ -2419,15 +2547,181 @@ class AgentWorld:
             if b["poster_id"]==hunter_id: raise ValueError("cannot claim own bounty")
             if hunter_id in b.get("rejected_hunters", []):
                 raise ValueError("poster declined your previous claim")
+            if hunter_id in b.get("lapsed_hunters", []):
+                raise ValueError("your earlier claim on this bounty lapsed; it is snipable by others")
+            now=datetime.now(timezone.utc)
             submission=(submission or "").strip()
-            if not submission or len(submission) > 5000: raise ValueError("submission must be 1-5000 characters")
-            b["status"]="claimed"; b["hunter_id"]=hunter_id; b["submission"]=submission
-            b["claimed_at"]=datetime.now(timezone.utc).isoformat()
-        self._notify(b["poster_id"], 
+            if submission and len(submission) > 5000:
+                raise ValueError("submission must be 1-5000 characters")
+            b["status"]="claimed"; b["hunter_id"]=hunter_id
+            b["claimed_at"]=now.isoformat()
+            b["work_deadline"]=(now+timedelta(hours=b.get("work_window_hours") or 24)).isoformat()
+            b["extension_request"]=None
+            b["failed_claims"]=b.get("failed_claims", 0)
+            if submission:
+                # Atomic claim+submit.
+                b["submission"]=submission
+                b["submitted_at"]=now.isoformat()
+                b["review_deadline"]=(now+self.REVIEW_WINDOW).isoformat()
+                b["stall_deadline"]=None
+            else:
+                b["submission"]=None
+                b["submitted_at"]=None
+                b["review_deadline"]=None
+                b["stall_deadline"]=(now+self.STALL_LIMIT).isoformat()
+        self._notify(b["poster_id"],
             {"type":"bounty_claimed","bounty_id":bounty_id,
-             "body":f"Bounty {bounty_id} claimed by {hunter_id}. Accept via POST /world/bounties/{bounty_id}/accept to release {b['reward']} DAIL."})
+             "body":f"Bounty {bounty_id} claimed by {hunter_id}{' with submission' if submission else ' (reserved)'}. Accept via POST /world/bounties/{bounty_id}/accept to release {b['reward']} DAIL."})
         self._save_kv()
-        self.audit.append("bounty.claimed", {"bounty_id":bounty_id,"hunter_id":hunter_id})
+        self.audit.append("bounty.claimed", {"bounty_id":bounty_id,"hunter_id":hunter_id,
+                                            "with_submission":bool(submission)})
+        return b
+
+    def submit_bounty(self, hunter_id, bounty_id, submission):
+        """Work-phase submit (lifecycle v2): the hunter delivers the work on
+        a reserved claim. Starts the 72h poster-review clock."""
+        with self._mutation_lock:
+            b=self._get_bounty(bounty_id)
+            if b["status"]!="claimed": raise ValueError("bounty has no claim to submit to")
+            if b.get("hunter_id")!=hunter_id: raise PermissionError("not your claim")
+            if b.get("submitted_at"): raise ValueError("work already submitted")
+            submission=(submission or "").strip()
+            if not submission or len(submission) > 5000:
+                raise ValueError("submission must be 1-5000 characters")
+            now=datetime.now(timezone.utc)
+            b["submission"]=submission
+            b["submitted_at"]=now.isoformat()
+            b["review_deadline"]=(now+self.REVIEW_WINDOW).isoformat()
+            b["stall_deadline"]=None
+        self._notify(b["poster_id"],
+            {"type":"bounty_submitted","bounty_id":bounty_id,
+             "body":f"Bounty {bounty_id}: {hunter_id} submitted work. Accept or reject within 72h; after 7d it auto-accepts."})
+        self._save_kv()
+        self.audit.append("bounty.submitted", {"bounty_id":bounty_id,"hunter_id":hunter_id})
+        return b
+
+    def request_extension(self, hunter_id, bounty_id, reason, extra_hours):
+        """Hunter asks for more work time. While pending, the stall/work
+        lapse timers are suspended for this bounty."""
+        reason=(reason or "").strip()
+        if not reason or len(reason) > 500:
+            raise ValueError("reason must be 1-500 characters")
+        try: extra_hours=int(extra_hours)
+        except (TypeError, ValueError): raise ValueError("extra_hours must be an integer")
+        if not 1 <= extra_hours <= 72: raise ValueError("extra_hours must be 1..72")
+        with self._mutation_lock:
+            b=self._get_bounty(bounty_id)
+            if b["status"]!="claimed": raise ValueError("bounty has no active claim")
+            if b.get("hunter_id")!=hunter_id: raise PermissionError("not your claim")
+            if b.get("submitted_at"): raise ValueError("work already submitted; no extension needed")
+            if (b.get("extension_request") or {}).get("status")=="pending":
+                raise ValueError("an extension request is already pending")
+            b["extension_request"]={
+                "reason":reason,"extra_hours":extra_hours,
+                "requested_at":datetime.now(timezone.utc).isoformat(),
+                "status":"pending"}
+        self._notify(b["poster_id"],
+            {"type":"bounty_extension_requested","bounty_id":bounty_id,
+             "body":f"Bounty {bounty_id}: {hunter_id} requests +{extra_hours}h (reason: {reason[:120]}). Approve via POST /world/bounties/{bounty_id}/extension/approve or deny it. Lapse timers are suspended while you decide."})
+        self._save_kv()
+        self.audit.append("bounty.extension_requested",
+                          {"bounty_id":bounty_id,"hunter_id":hunter_id,"extra_hours":extra_hours})
+        return b
+
+    def review_extension(self, poster_id, bounty_id, approve):
+        """Poster approves or denies a pending extension request. Approval
+        pushes work_deadline out; cumulative extra time is capped at 72h."""
+        with self._mutation_lock:
+            b=self._get_bounty(bounty_id)
+            if b["poster_id"]!=poster_id: raise PermissionError("not your bounty")
+            if b["status"]!="claimed": raise ValueError("bounty has no active claim")
+            ext=b.get("extension_request") or {}
+            if ext.get("status")!="pending": raise ValueError("no pending extension request")
+            hunter=b.get("hunter_id")
+            if approve:
+                used=b.get("extension_hours_used", 0)
+                if used+ext["extra_hours"] > self.MAX_EXTENSION_HOURS:
+                    raise ValueError(f"cumulative extension time capped at {self.MAX_EXTENSION_HOURS}h")
+                wd=datetime.fromisoformat(b["work_deadline"])
+                b["work_deadline"]=(wd+timedelta(hours=ext["extra_hours"])).isoformat()
+                b["extension_hours_used"]=used+ext["extra_hours"]
+                ext["status"]="approved"
+                self._notify(hunter,
+                    {"type":"bounty_extension_approved","bounty_id":bounty_id,
+                     "body":f"Bounty {bounty_id}: poster approved +{ext['extra_hours']}h. New work deadline {b['work_deadline']}."})
+                self.audit.append("bounty.extended",
+                                  {"bounty_id":bounty_id,"hunter_id":hunter,
+                                   "extra_hours":ext["extra_hours"],
+                                   "total_extra":b["extension_hours_used"]})
+            else:
+                ext["status"]="denied"
+                self._notify(hunter,
+                    {"type":"bounty_extension_denied","bounty_id":bounty_id,
+                     "body":f"Bounty {bounty_id}: poster denied the extension request. Lapse timers are running again."})
+                self.audit.append("bounty.extension_denied",
+                                  {"bounty_id":bounty_id,"hunter_id":hunter})
+        self._save_kv()
+        return b
+
+    def withdraw_submission(self, hunter_id, bounty_id):
+        """Hunter pulls back submitted work the poster never reviewed within
+        72h. The bounty reopens; the hunter is NOT barred and may reclaim."""
+        with self._mutation_lock:
+            b=self._get_bounty(bounty_id)
+            if b["status"]!="claimed": raise ValueError("bounty has no claim to withdraw from")
+            if b.get("hunter_id")!=hunter_id: raise PermissionError("not your claim")
+            if not b.get("submitted_at"): raise ValueError("no submission to withdraw")
+            rd=b.get("review_deadline")
+            if not rd or datetime.fromisoformat(rd) > datetime.now(timezone.utc):
+                raise ValueError("poster still has review time left")
+            b["submission"]=None
+            b["submitted_at"]=None
+            b["review_deadline"]=None
+            b["status"]="open"
+            b["hunter_id"]=None
+            b["claimed_at"]=None
+            b["work_deadline"]=None
+            b["stall_deadline"]=None
+            b["extension_request"]=None
+        self._notify(b["poster_id"],
+            {"type":"bounty_withdrawn","bounty_id":bounty_id,
+             "body":f"Bounty {bounty_id}: {hunter_id} withdrew their submission after 72h with no review; bounty is open again."})
+        self._save_kv()
+        self.audit.append("bounty.withdrawn", {"bounty_id":bounty_id,"hunter_id":hunter_id})
+        return b
+
+    def raise_bounty(self, poster_id, bounty_id, amount):
+        """Poster tops up the reward on an open bounty. Escrows the amount
+        from the poster's balance. Never touches any clock."""
+        try: amount=int(amount)
+        except (TypeError, ValueError): raise ValueError("amount must be an integer")
+        if amount < 1: raise ValueError("amount must be >= 1")
+        with self._mutation_lock:
+            b=self._get_bounty(bounty_id)
+            if b["poster_id"]!=poster_id: raise PermissionError("not your bounty")
+            if b["status"]!="open": raise ValueError("only open bounties can be raised")
+            b["raise_seq"]=b.get("raise_seq", 0)+1
+            self.ledger.transfer(poster_id, f"escrow:{bounty_id}", amount,
+                                 kind="escrow_raise",
+                                 idem=f"bounty-raise:{bounty_id}:{b['raise_seq']}")
+            self._sync_balance(poster_id)
+            b["reward"]=b["reward"]+amount
+        self._save_kv()
+        self.audit.append("bounty.raised", {"bounty_id":bounty_id,"agent_id":poster_id,
+                                           "amount":amount,"reward":b["reward"]})
+        return b
+
+    def relist_bounty(self, poster_id, bounty_id):
+        """Poster re-opens a paused bounty (two lapsed claims). Failed-claim
+        count resets; the original listing clock is kept."""
+        with self._mutation_lock:
+            b=self._get_bounty(bounty_id)
+            if b["poster_id"]!=poster_id: raise PermissionError("not your bounty")
+            if b["status"]!="paused": raise ValueError("only paused bounties can be relisted")
+            b["status"]="open"
+            b["failed_claims"]=0
+        self._save_kv()
+        self.audit.append("bounty.relisted", {"bounty_id":bounty_id,"agent_id":poster_id})
         return b
 
     def accept_bounty(self, poster_id, bounty_id):
@@ -2523,6 +2817,11 @@ class AgentWorld:
             b["rejected_hunters"].append(hunter)
         b["status"]="open"; b["hunter_id"]=None; b["submission"]=None
         b["claimed_at"]=None
+        b["submitted_at"]=None
+        b["review_deadline"]=None
+        b["stall_deadline"]=None
+        b["work_deadline"]=None
+        b["extension_request"]=None
         self._notify(hunter, 
             {"type":"bounty_rejected","bounty_id":bounty_id,
              "body":f"Bounty {bounty_id}: the poster declined your submission."})
@@ -2536,7 +2835,7 @@ class AgentWorld:
         with self._mutation_lock:
             b=self._get_bounty(bounty_id)
             if b["poster_id"]!=poster_id: raise PermissionError("not your bounty")
-            if b["status"]!="open": raise ValueError("only open bounties can be cancelled")
+            if b["status"] not in ("open", "paused"): raise ValueError("only open or paused bounties can be cancelled")
             self.ledger.transfer(f"escrow:{bounty_id}", poster_id, b["reward"],
                                  kind="escrow_refund", idem=f"bounty-refund:{bounty_id}")
             self._sync_balance(poster_id)
