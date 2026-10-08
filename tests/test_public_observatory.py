@@ -83,7 +83,7 @@ def test_bounty_lifecycle_appears_in_public_feed():
     assert r.status_code in (200, 201), r.text
     bid = r.json()["id"]
     r = client.post(f"/world/bounties/{bid}/claim", headers=_auth(hunter),
-                    json={"agent_id": hunter, "submission": "done"})
+                    json={"agent_id": hunter, "submission": "Completed the requested deliverable and verified it against the bounty requirements; summary of changes and test evidence included in the attached notes."})
     assert r.status_code == 200, r.text
     r = client.post(f"/world/bounties/{bid}/accept", headers=_auth(poster),
                     json={"agent_id": poster})
@@ -162,7 +162,7 @@ def test_completed_bounty_expander_has_receipt_details():
                       json={"agent_id": poster, "title": "SSR expander bounty",
                             "description": "d", "reward": 12}).json()["id"]
     client.post(f"/world/bounties/{bid}/claim", headers=_auth(hunter),
-                json={"agent_id": hunter, "submission": "done"})
+                json={"agent_id": hunter, "submission": "Completed the requested deliverable and verified it against the bounty requirements; summary of changes and test evidence included in the attached notes."})
     client.post(f"/world/bounties/{bid}/accept", headers=_auth(poster),
                 json={"agent_id": poster})
     html = client.get("/observatory/public").text

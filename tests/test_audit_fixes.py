@@ -62,7 +62,7 @@ def test_private_submission_redacted_in_list():
     assert r.status_code == 201, r.text
     bid = r.json()["id"]
     r = client.post(f"/world/bounties/{bid}/claim", json={
-        "agent_id": hunter, "submission": "CVE-0000: the thing"}, headers=_auth(hunter))
+        "agent_id": hunter, "submission": "Completed the requested deliverable and verified it against the bounty requirements; summary of changes and test evidence included in the attached notes."}, headers=_auth(hunter))
     assert r.status_code == 200, r.text
     # public list redacts
     lst = client.get("/world/bounties").json()["bounties"]
@@ -70,7 +70,7 @@ def test_private_submission_redacted_in_list():
     assert mine["submission"] == "[private submission — visible to poster and hunter only]"
     # poster can read it
     r = client.get(f"/world/bounties/{bid}/submission", params={"agent_id": poster}, headers=_auth(poster))
-    assert r.status_code == 200 and r.json()["submission"] == "CVE-0000: the thing"
+    assert r.status_code == 200 and r.json()["submission"] == "Completed the requested deliverable and verified it against the bounty requirements; summary of changes and test evidence included in the attached notes."
     # hunter can read it
     r = client.get(f"/world/bounties/{bid}/submission", params={"agent_id": hunter}, headers=_auth(hunter))
     assert r.status_code == 200
@@ -83,10 +83,10 @@ def test_private_submission_redacted_in_list():
         "reward": 5}, headers=_auth(poster))
     bid2 = r.json()["id"]
     client.post(f"/world/bounties/{bid2}/claim", json={
-        "agent_id": hunter, "submission": "code in the rain"}, headers=_auth(hunter))
+        "agent_id": hunter, "submission": "Completed the requested deliverable and verified it against the bounty requirements; summary of changes and test evidence included in the attached notes."}, headers=_auth(hunter))
     lst = client.get("/world/bounties").json()["bounties"]
     mine2 = [b for b in lst if b["id"] == bid2][0]
-    assert mine2["submission"] == "code in the rain"
+    assert mine2["submission"] == "Completed the requested deliverable and verified it against the bounty requirements; summary of changes and test evidence included in the attached notes."
 
 
 def test_liveness_signal_and_summary():
@@ -98,7 +98,7 @@ def test_liveness_signal_and_summary():
         "agent_id": p, "title": "Liveness probe", "description": "x" * 400,
         "reward": 5}, headers=_auth(p))
     bid = r.json()["id"]
-    client.post(f"/world/bounties/{bid}/claim", json={"agent_id": h, "submission": "done"}, headers=_auth(h))
+    client.post(f"/world/bounties/{bid}/claim", json={"agent_id": h, "submission": "Completed the requested deliverable and verified it against the bounty requirements; summary of changes and test evidence included in the attached notes."}, headers=_auth(h))
     client.post(f"/world/bounties/{bid}/accept", json={"agent_id": p}, headers=_auth(p))
     lst = client.get("/world/bounties").json()["bounties"]
     mine = [b for b in lst if b["id"] == bid][0]

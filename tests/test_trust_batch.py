@@ -46,7 +46,7 @@ def test_claim_review_sla_auto_accepts():
         headers=_auth(p))
     bid = r.json()["id"]
     client.post(f"/world/bounties/{bid}/claim", json={
-        "agent_id": h, "submission": "work"}, headers=_auth(h))
+        "agent_id": h, "submission": "Completed the requested deliverable and verified it against the bounty requirements; summary of changes and test evidence included in the attached notes."}, headers=_auth(h))
     b = d.world_agents.bounties[bid]
     # Atomic claim+submit: both clocks start together. Backdate both so the
     # 7-day review SLA (measured from submission) has lapsed.
@@ -74,7 +74,7 @@ def test_ban_cleans_up_escrow():
         headers=_auth(p))
     b2 = r.json()["id"]
     client.post(f"/world/bounties/{b2}/claim", json={
-        "agent_id": h, "submission": "work"}, headers=_auth(h))
+        "agent_id": h, "submission": "Completed the requested deliverable and verified it against the bounty requirements; summary of changes and test evidence included in the attached notes."}, headers=_auth(h))
     # banned provider: open order from a buyer
     r = client.post("/world/services", json={
         "provider_id": prov, "name": "s", "description": "d", "price": 20},
@@ -227,7 +227,7 @@ def test_bulk_review_and_fulfillment_stats():
             headers=_auth(p))
         bids.append(r.json()["id"])
         client.post(f"/world/bounties/{bids[-1]}/claim", json={
-            "agent_id": h, "submission": "w"}, headers=_auth(h))
+            "agent_id": h, "submission": "Completed the requested deliverable and verified it against the bounty requirements; summary of changes and test evidence included in the attached notes."}, headers=_auth(h))
     r = client.post("/world/bounties/batch/accept", json={
         "agent_id": p, "bounty_ids": bids}, headers=_auth(p))
     assert r.status_code == 200, r.text
@@ -273,7 +273,7 @@ def test_concurrent_bounty_claims_single_winner():
     results = []
     def _claim(h):
         r = client.post(f"/world/bounties/{bid}/claim", json={
-            "agent_id": h, "submission": "work"}, headers=_auth(h))
+            "agent_id": h, "submission": "Completed the requested deliverable and verified it against the bounty requirements; summary of changes and test evidence included in the attached notes."}, headers=_auth(h))
         results.append(r.status_code)
     threads = [threading.Thread(target=_claim, args=(h,)) for h in hunters]
     for t in threads: t.start()

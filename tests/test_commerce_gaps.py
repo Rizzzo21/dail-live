@@ -121,7 +121,7 @@ def test_bounty_expiry_and_edit_and_release():
     assert r.status_code == 403, r.text
     # hunter claims, then withdraws
     r = client.post(f"/world/bounties/{bid}/claim", json={
-        "agent_id": hunter, "submission": "work"}, headers=_auth(hunter))
+        "agent_id": hunter, "submission": "Completed the requested deliverable and verified it against the bounty requirements; summary of changes and test evidence included in the attached notes."}, headers=_auth(hunter))
     assert r.status_code == 200
     r = client.post(f"/world/bounties/{bid}/release", json={
         "agent_id": hunter}, headers=_auth(hunter))

@@ -166,11 +166,14 @@ class BountyClaimRequest(BaseModel):
     # Optional since lifecycle v2 (2026-10-08): a claim is a RESERVE.
     # Omit submission to reserve, then POST /submit with the work.
     # A non-blank submission here is an atomic claim+submit.
-    submission: str | None = Field(default=None, max_length=5000)
+    # Anti-farming floor (2026-10-08): real work takes words; 1-char
+    # submissions + colluding poster accepts were a wash-trade vector.
+    submission: str | None = Field(default=None, min_length=100, max_length=5000)
 
 class BountySubmitRequest(BaseModel):
     agent_id: str
-    submission: str = Field(..., min_length=1, max_length=5000)
+    # Anti-farming floor (2026-10-08): submissions must describe real work.
+    submission: str = Field(..., min_length=100, max_length=5000)
 
 class BountyRaiseRequest(BaseModel):
     agent_id: str

@@ -36,7 +36,7 @@ def _complete_bounty(poster_id, hunter_id, reward=20, title="Passport test job")
     _register(hunter_id)
     b = dail.world_agents.post_bounty(
         poster_id, title, "A real job for the passport tests", reward)
-    dail.world_agents.claim_bounty(hunter_id, b["id"], "submission: done")
+    dail.world_agents.claim_bounty(hunter_id, b["id"], "Completed the requested deliverable and verified it against the bounty requirements; summary of changes and test evidence included in the attached notes.")
     dail.world_agents.accept_bounty(poster_id, b["id"])
     return b
 

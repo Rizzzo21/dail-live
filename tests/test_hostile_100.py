@@ -83,7 +83,7 @@ def test_hostile_100_agents():
             # 1. Race bounty claims (3 attempts).
             for b in bounty_ids[i % 10::10][:3] or bounty_ids[:3]:
                 r = client.post(f"/world/bounties/{b}/claim", json={
-                    "agent_id": a, "submission": "work"}, headers=_auth(a))
+                    "agent_id": a, "submission": "Completed the requested deliverable and verified it against the bounty requirements; summary of changes and test evidence included in the attached notes."}, headers=_auth(a))
                 if r.status_code == 200:
                     with _lock:
                         results["claim_wins"] += 1

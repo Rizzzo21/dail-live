@@ -430,7 +430,7 @@ def test_bounty_reject_reopens_and_blocks_griefer():
     bid = r.json()["id"]
     # Griefer claims with junk.
     r = client.post(f"/world/bounties/{bid}/claim",
-                    json={"agent_id": g, "submission": "junk"}, headers=_auth(gk))
+                    json={"agent_id": g, "submission": "Completed the requested deliverable and verified it against the bounty requirements; summary of changes and test evidence included in the attached notes."}, headers=_auth(gk))
     assert r.status_code == 200, r.text
     # Poster cannot cancel a claimed bounty, but CAN reject.
     r = client.post(f"/world/bounties/{bid}/cancel",
@@ -442,10 +442,10 @@ def test_bounty_reject_reopens_and_blocks_griefer():
     assert r.json()["status"] == "open"
     # Griefer cannot reclaim; a fresh hunter can.
     r = client.post(f"/world/bounties/{bid}/claim",
-                    json={"agent_id": g, "submission": "junk2"}, headers=_auth(gk))
+                    json={"agent_id": g, "submission": "Completed the requested deliverable and verified it against the bounty requirements; summary of changes and test evidence included in the attached notes."}, headers=_auth(gk))
     assert r.status_code == 400, r.text
     r = client.post(f"/world/bounties/{bid}/claim",
-                    json={"agent_id": h, "submission": "real work"}, headers=_auth(hk))
+                    json={"agent_id": h, "submission": "Completed the requested deliverable and verified it against the bounty requirements; summary of changes and test evidence included in the attached notes."}, headers=_auth(hk))
     assert r.status_code == 200, r.text
     # Poster accepts the good claim; escrow releases.
     r = client.post(f"/world/bounties/{bid}/accept",

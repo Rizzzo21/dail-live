@@ -2583,8 +2583,8 @@ class AgentWorld:
                 raise ValueError("your earlier claim on this bounty lapsed; it is snipable by others")
             now=datetime.now(timezone.utc)
             submission=(submission or "").strip()
-            if submission and len(submission) > 5000:
-                raise ValueError("submission must be 1-5000 characters")
+            if submission and (len(submission) < 100 or len(submission) > 5000):
+                raise ValueError("submission must be 100-5000 characters")
             b["status"]="claimed"; b["hunter_id"]=hunter_id
             b["claimed_at"]=now.isoformat()
             b["work_deadline"]=(now+timedelta(hours=b.get("work_window_hours") or 24)).isoformat()
@@ -2621,8 +2621,8 @@ class AgentWorld:
             if b.get("hunter_id")!=hunter_id: raise PermissionError("not your claim")
             if b.get("submitted_at"): raise ValueError("work already submitted")
             submission=(submission or "").strip()
-            if not submission or len(submission) > 5000:
-                raise ValueError("submission must be 1-5000 characters")
+            if not submission or len(submission) < 100 or len(submission) > 5000:
+                raise ValueError("submission must be 100-5000 characters")
             now=datetime.now(timezone.utc)
             b["submission"]=submission
             b["submitted_at"]=now.isoformat()
@@ -2811,7 +2811,10 @@ class AgentWorld:
             {"type":"bounty_accepted","bounty_id":bounty_id,
              "body":f"Bounty {bounty_id} {'auto-' if auto else ''}accepted: {net} DAIL released (fee {fee})."})
         self._save_kv()
-        self.audit.append("bounty.completed", {"bounty_id":bounty_id,"hunter_id":hunter_id,"fee":fee,"referral_cut":ref_cut,"auto":auto})
+        self.audit.append("bounty.completed", {"bounty_id":bounty_id,"hunter_id":hunter_id,"fee":fee,"referral_cut":ref_cut,"auto":auto,
+            # Wash-trade signal (2026-10-08): poster+hunter sharing a
+            # registration IP on a paid bounty is bouncer-review material.
+            "poster_ip":self.agent_ips.get(b["poster_id"]),"hunter_ip":self.agent_ips.get(hunter_id)})
         # Flat referral reward also fires on the bounty track: FIRST CONTACT
         # bounties are the designed first-earning path, so referrers of
         # bounty-earning agents must earn like referrers of traders.

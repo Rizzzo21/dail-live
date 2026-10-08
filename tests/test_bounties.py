@@ -59,7 +59,7 @@ def test_bounty_full_lifecycle():
     assert any(x["id"] == b["id"] for x in r.json()["bounties"])
     # claim
     r = client.post(f"/world/bounties/{b['id']}/claim", json={
-        "agent_id": hunter, "submission": "<svg>...</svg>"}, headers=_auth(hunter))
+        "agent_id": hunter, "submission": "Completed the requested deliverable and verified it against the bounty requirements; summary of changes and test evidence included in the attached notes."}, headers=_auth(hunter))
     assert r.status_code == 200, r.text
     assert r.json()["status"] == "claimed"
     # accept: hunter nets 45, treasury takes 5 (10%)
@@ -100,17 +100,17 @@ def test_bounty_guards():
         headers=_auth(poster)).json()["id"]
     # cannot claim own bounty
     r = client.post(f"/world/bounties/{bid}/claim", json={
-        "agent_id": poster, "submission": "mine"}, headers=_auth(poster))
+        "agent_id": poster, "submission": "Completed the requested deliverable and verified it against the bounty requirements; summary of changes and test evidence included in the attached notes."}, headers=_auth(poster))
     assert r.status_code == 400
     # stranger cannot accept
     client.post(f"/world/bounties/{bid}/claim", json={
-        "agent_id": hunter, "submission": "work"}, headers=_auth(hunter))
+        "agent_id": hunter, "submission": "Completed the requested deliverable and verified it against the bounty requirements; summary of changes and test evidence included in the attached notes."}, headers=_auth(hunter))
     r = client.post(f"/world/bounties/{bid}/accept",
                     json={"agent_id": stranger}, headers=_auth(stranger))
     assert r.status_code == 403
     # cannot claim twice (409: lost the race / already taken)
     r = client.post(f"/world/bounties/{bid}/claim", json={
-        "agent_id": stranger, "submission": "late"}, headers=_auth(stranger))
+        "agent_id": stranger, "submission": "Completed the requested deliverable and verified it against the bounty requirements; summary of changes and test evidence included in the attached notes."}, headers=_auth(stranger))
     assert r.status_code == 409
 
 
@@ -127,7 +127,7 @@ def test_ban_hunter_voids_claim_reopens_bounty():
     assert r.status_code == 201, r.text
     bid = r.json()["id"]
     r = client.post(f"/world/bounties/{bid}/claim", json={
-        "agent_id": hunter, "submission": "done"}, headers=_auth(hunter))
+        "agent_id": hunter, "submission": "Completed the requested deliverable and verified it against the bounty requirements; summary of changes and test evidence included in the attached notes."}, headers=_auth(hunter))
     assert r.status_code == 200, r.text
     _d.ban_agent(hunter, "test")
     b = _d.world_agents.bounties[bid]
@@ -168,7 +168,7 @@ def test_referral_reward_fires_on_bounty_track():
     assert r.status_code == 201, r.text
     bid = r.json()["id"]
     r = client.post(f"/world/bounties/{bid}/claim", json={
-        "agent_id": hunter, "submission": "report"}, headers=_auth(hunter))
+        "agent_id": hunter, "submission": "Completed the requested deliverable and verified it against the bounty requirements; summary of changes and test evidence included in the attached notes."}, headers=_auth(hunter))
     assert r.status_code == 200, r.text
     bal_before = client.get(f"/ledger/{referrer}",
                             headers=_auth(referrer)).json()["balance"]
@@ -257,13 +257,13 @@ def test_reserve_claim_then_submit():
     assert b["status"] == "claimed" and b["submitted_at"] is None
     assert b["stall_deadline"] is not None and b["work_deadline"] is not None
     r = client.post(f"/world/bounties/{bid}/submit", json={
-        "agent_id": hunter, "submission": "the work"}, headers=_auth(hunter))
+        "agent_id": hunter, "submission": "Completed the requested deliverable and verified it against the bounty requirements; summary of changes and test evidence included in the attached notes."}, headers=_auth(hunter))
     assert r.status_code == 200, r.text
     b = r.json()
     assert b["submitted_at"] is not None and b["review_deadline"] is not None
     assert b["stall_deadline"] is None
     r = client.post(f"/world/bounties/{bid}/submit", json={
-        "agent_id": hunter, "submission": "again"}, headers=_auth(hunter))
+        "agent_id": hunter, "submission": "Completed the requested deliverable and verified it against the bounty requirements; summary of changes and test evidence included in the attached notes."}, headers=_auth(hunter))
     assert r.status_code == 400, r.text
 
 
@@ -275,7 +275,7 @@ def test_atomic_claim_with_submission():
         "agent_id": poster, "title": "t", "description": "d", "reward": 20},
         headers=_auth(poster)).json()["id"]
     r = client.post(f"/world/bounties/{bid}/claim", json={
-        "agent_id": hunter, "submission": "done already"}, headers=_auth(hunter))
+        "agent_id": hunter, "submission": "Completed the requested deliverable and verified it against the bounty requirements; summary of changes and test evidence included in the attached notes."}, headers=_auth(hunter))
     assert r.status_code == 200, r.text
     b = r.json()
     assert b["submitted_at"] == b["claimed_at"]
@@ -477,7 +477,7 @@ def test_withdraw_after_72h_no_review():
         "agent_id": poster, "title": "t", "description": "d", "reward": 20},
         headers=_auth(poster)).json()["id"]
     client.post(f"/world/bounties/{bid}/claim", json={
-        "agent_id": hunter, "submission": "work"}, headers=_auth(hunter))
+        "agent_id": hunter, "submission": "Completed the requested deliverable and verified it against the bounty requirements; summary of changes and test evidence included in the attached notes."}, headers=_auth(hunter))
     # too early: poster still has review time
     r = client.post(f"/world/bounties/{bid}/withdraw", json={
         "agent_id": hunter}, headers=_auth(hunter))
@@ -587,7 +587,7 @@ def test_lifecycle_v2_migration_grandfathers():
                 "rejected_hunters": [], "created_at": "2020-01-01T00:00:00+00:00",
                 "claimed_at": None, "completed_at": None}
     old_claimed = dict(old_open, id="bnty_old2", status="claimed",
-                       hunter_id="h", submission="work",
+                       hunter_id="h", submission="Completed the requested deliverable and verified it against the bounty requirements; summary of changes and test evidence included in the attached notes.",
                        claimed_at="2026-10-01T00:00:00+00:00")
     wa.bounties["bnty_old1"] = old_open
     wa.bounties["bnty_old2"] = old_claimed
@@ -634,7 +634,7 @@ def test_accept_requires_submission():
     assert _bal(hunter) == hb0  # no payout without work
     # After the hunter submits, accept works as before.
     r = client.post(f"/world/bounties/{bid}/submit", json={
-        "agent_id": hunter, "submission": "the work"}, headers=_auth(hunter))
+        "agent_id": hunter, "submission": "Completed the requested deliverable and verified it against the bounty requirements; summary of changes and test evidence included in the attached notes."}, headers=_auth(hunter))
     assert r.status_code == 200
     r = client.post(f"/world/bounties/{bid}/accept",
                     json={"agent_id": poster}, headers=_auth(poster))
@@ -738,10 +738,71 @@ def test_release_claim_clears_settle_failed():
         "agent_id": poster, "title": "t", "description": "d", "reward": 20},
         headers=_auth(poster)).json()["id"]
     client.post(f"/world/bounties/{bid}/claim",
-                json={"agent_id": hunter, "submission": "work"},
+                json={"agent_id": hunter, "submission": "Completed the requested deliverable and verified it against the bounty requirements; summary of changes and test evidence included in the attached notes."},
                 headers=_auth(hunter))
     wa.bounties[bid]["settle_failed"] = {"error": "x", "at": "y"}
     r = client.post(f"/world/bounties/{bid}/release",
                     json={"agent_id": hunter}, headers=_auth(hunter))
     assert r.status_code == 200
     assert wa.bounties[bid].get("settle_failed") is None
+
+
+def test_submission_minimum_length_enforced():
+    # Anti-farming floor (2026-10-08): 1-char submissions + colluding
+    # poster accepts were a wash-trade vector. Submissions <100 chars
+    # are rejected at both claim and submit.
+    from dail.api import dail as _d
+    wa = _d.world_agents
+    poster, hunter = _uid("p"), _uid("h")
+    _make(poster); _make(hunter)
+    bid = client.post("/world/bounties", json={
+        "agent_id": poster, "title": "t", "description": "d", "reward": 20},
+        headers=_auth(poster)).json()["id"]
+    # claim with a short submission -> 422
+    r = client.post(f"/world/bounties/{bid}/claim",
+                    json={"agent_id": hunter, "submission": "x" * 50},
+                    headers=_auth(hunter))
+    assert r.status_code == 422, r.text
+    # bare reserve still works
+    r = client.post(f"/world/bounties/{bid}/claim",
+                    json={"agent_id": hunter}, headers=_auth(hunter))
+    assert r.status_code == 200, r.text
+    # submit with a short submission -> 422
+    r = client.post(f"/world/bounties/{bid}/submit",
+                    json={"agent_id": hunter, "submission": "short"},
+                    headers=_auth(hunter))
+    assert r.status_code == 422, r.text
+    # exactly 100 chars is accepted
+    ok = "y" * 100
+    r = client.post(f"/world/bounties/{bid}/submit",
+                    json={"agent_id": hunter, "submission": ok},
+                    headers=_auth(hunter))
+    assert r.status_code == 200, r.text
+    assert wa.bounties[bid]["submission"] == ok
+
+
+def test_accept_audit_logs_poster_and_hunter_ips():
+    # Wash-trade signal: the bounty.completed audit event carries both
+    # registration IPs so the bouncer can flag same-IP poster/hunter pairs.
+    from dail.api import dail as _d
+    wa = _d.world_agents
+    poster, hunter = _uid("p"), _uid("h")
+    _make(poster); _make(hunter)
+    wa.agent_ips[poster] = "203.0.113.7"
+    wa.agent_ips[hunter] = "203.0.113.7"
+    bid = client.post("/world/bounties", json={
+        "agent_id": poster, "title": "t", "description": "d", "reward": 20},
+        headers=_auth(poster)).json()["id"]
+    before = len(_d.audit.events)
+    client.post(f"/world/bounties/{bid}/claim",
+                json={"agent_id": hunter,
+                      "submission": "z" * 150}, headers=_auth(hunter))
+    r = client.post(f"/world/bounties/{bid}/accept",
+                    json={"agent_id": poster}, headers=_auth(poster))
+    assert r.status_code == 200, r.text
+    completed = [e for e in _d.audit.events[before:]
+                 if e["event"] == "bounty.completed" and e["payload"]["bounty_id"] == bid]
+    assert completed, "bounty.completed audit event missing"
+    payload = completed[-1]["payload"]
+    assert payload["poster_ip"] == "203.0.113.7"
+    assert payload["hunter_ip"] == "203.0.113.7"
