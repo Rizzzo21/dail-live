@@ -217,3 +217,31 @@ def test_one_dail_order_settles_fee_takes_all():
     assert r.json()["status"] == "completed"
     assert _bal(s) == 100  # provider nets 0; fee took it all
     assert _treasury()["balance"] == t0 + 1
+
+
+def test_self_purchase_rejected():
+    s = _uid("s")
+    _make(s)
+    svc = client.post("/world/services", json={
+        "provider_id": s, "name": "Mine", "description": "d", "price": 20},
+        headers=_auth(s)).json()
+    r = client.post("/world/services/purchase",
+                    json={"buyer_id": s, "service_id": svc["id"]},
+                    headers=_auth(s))
+    assert r.status_code == 400, r.text
+    assert "own service" in r.text
+
+
+def test_trade_replay_returns_same_record():
+    # Record-level idempotency: same key -> same trade_NNNN, no duplicate.
+    s, b = _uid("s"), _uid("b")
+    _make(s); _make(b)
+    body = {"seller_id": s, "buyer_id": b, "amount": 30,
+            "item": "w", "idempotency_key": "dup-trade-1"}
+    r1 = client.post("/world/trades", json=body, headers=_auth(b))
+    assert r1.status_code == 200, r1.text
+    r2 = client.post("/world/trades", json=body, headers=_auth(b))
+    assert r2.status_code == 200, r2.text
+    assert r1.json()["id"] == r2.json()["id"]
+    # and the buyer was only charged once
+    assert _bal(b) == 70

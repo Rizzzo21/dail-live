@@ -19,9 +19,18 @@ class Ledger:
             self.persist(tx)
         return tx
 
+    def _clean_idem(self, idem):
+        # Defensive: a blank/whitespace idempotency key must never become a
+        # real key. "   " is truthy as a string, so without this, unrelated
+        # calls sharing a blank key would collide on e.g. "   :principal".
+        if isinstance(idem, str):
+            idem = idem.strip()
+        return idem or None
+
     def credit(self, account, amount, kind="credit", idem=None):
         if amount <= 0:
             raise LedgerError("amount must be positive")
+        idem = self._clean_idem(idem)
         if idem and idem in self.idempotency:
             return self.transactions[self.idempotency[idem]]
         txid = f"tx_{len(self.transactions)+1:06d}"
@@ -37,6 +46,7 @@ class Ledger:
     def transfer(self, source, destination, amount, kind="payment", idem=None):
         if amount <= 0:
             raise LedgerError("amount must be positive")
+        idem = self._clean_idem(idem)
         if idem and idem in self.idempotency:
             return self.transactions[self.idempotency[idem]]
         if self.balances[source] < amount:

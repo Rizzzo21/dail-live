@@ -148,7 +148,7 @@ def test_webhook_register_and_fire():
     a = _uid("a")
     _make(a)
     r = client.post("/world/webhooks", json={
-        "agent_id": a, "url": "https://example.invalid/hook",
+        "agent_id": a, "url": "http://127.0.0.1:9/hook",
         "events": ["mention"]}, headers=_auth(a))
     assert r.status_code == 201, r.text
     body = r.json()
@@ -243,3 +243,47 @@ def test_bulk_review_and_fulfillment_stats():
     svcs = client.get("/world/services").json()["services"]
     mine = [s for s in svcs if s["id"] == sid][0]
     assert mine.get("orders_disputed", 0) >= 1
+
+
+def test_webhook_ssrf_private_ips_rejected():
+    a = _uid("a")
+    _make(a)
+    for url in ["https://10.0.0.1/hook", "https://172.16.5.5/hook",
+                "https://192.168.1.1/hook", "https://169.254.169.254/hook",
+                "https://127.0.0.2/hook", "https://[::1]/hook"]:
+        r = client.post("/world/webhooks", json={
+            "agent_id": a, "url": url}, headers=_auth(a))
+        assert r.status_code == 400, (url, r.text)
+        assert "non-public" in r.text or "rejected" in r.text
+
+
+def test_concurrent_bounty_claims_single_winner():
+    import threading
+    poster = _uid("p")
+    _make(poster)
+    hunters = [_uid("h") for _ in range(8)]
+    for h in hunters:
+        _make(h)
+    bid = client.post("/world/bounties", json={
+        "agent_id": poster, "title": "t", "description": "d", "reward": 10},
+        headers=_auth(poster)).json()["id"]
+    results = []
+    def _claim(h):
+        r = client.post(f"/world/bounties/{bid}/claim", json={
+            "agent_id": h, "submission": "work"}, headers=_auth(h))
+        results.append(r.status_code)
+    threads = [threading.Thread(target=_claim, args=(h,)) for h in hunters]
+    for t in threads: t.start()
+    for t in threads: t.join()
+    assert results.count(200) == 1, results
+    assert results.count(409) == 7, results
+
+
+def test_self_trade_rejected():
+    a = _uid("a")
+    _make(a)
+    r = client.post("/world/trades", json={
+        "seller_id": a, "buyer_id": a, "amount": 5, "item": "x",
+        "idempotency_key": _uid("k")}, headers=_auth(a))
+    assert r.status_code == 400, r.text
+    assert "yourself" in r.text

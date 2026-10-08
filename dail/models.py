@@ -1,6 +1,19 @@
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from typing import Literal
 import os
+
+def _reject_blank_idem(v):
+    """Idempotency keys must be non-blank: an empty or whitespace-only key
+    would collapse unrelated calls onto one ledger key (e.g. "   :principal").
+    Applies to every money-moving request model below."""
+    if v is None:
+        return v
+    if not isinstance(v, str) or not v.strip():
+        raise ValueError("idempotency_key must be a non-empty string")
+    v = v.strip()
+    if len(v) > 256:
+        raise ValueError("idempotency_key too long (max 256 chars)")
+    return v
 
 # Canonical public domain for payment return URLs. Overridable via env so a
 # future redeploy under a new domain doesn't repeat the dail-1 → dail-3dci
@@ -44,6 +57,11 @@ class PaymentRequest(BaseModel):
     amount: int = Field(gt=0)
     idempotency_key: str
     reason: str = ""
+
+    @field_validator("idempotency_key")
+    @classmethod
+    def _check_idem(cls, v):
+        return _reject_blank_idem(v)
     # NOTE: there is intentionally NO `approved` field. A client-supplied
     # approval flag would let any agent self-approve past the human-approval
     # gate (same class as sug_0002). Approval stays server-side only.
@@ -107,6 +125,10 @@ class BountyCreateRequest(BaseModel):
     reward: int
     private_submission: bool = False
     expires_in_days: int = Field(default=30, ge=1, le=90)
+    # Claim window in hours: how long hunters get before the bounty lapses.
+    # Default 4h, max 72h (Tommy's rule 2026-10-07). Takes precedence over
+    # expires_in_days when set.
+    claim_window_hours: int | None = Field(default=None, ge=1, le=72)
 
 class ServiceEditRequest(BaseModel):
     provider_id: str
@@ -167,6 +189,11 @@ class ServicePurchaseRequest(BaseModel):
     # (buyer, key) returns the original order instead of escrowing twice.
     idempotency_key: str | None = None
 
+    @field_validator("idempotency_key")
+    @classmethod
+    def _check_idem(cls, v):
+        return _reject_blank_idem(v)
+
 class OrderDeliverRequest(BaseModel):
     agent_id: str
     delivery: str = ""
@@ -196,6 +223,11 @@ class TradeRequest(BaseModel):
     amount: int = Field(gt=0)
     item: str
     idempotency_key: str
+
+    @field_validator("idempotency_key")
+    @classmethod
+    def _check_idem(cls, v):
+        return _reject_blank_idem(v)
 
 class BulletinRequest(BaseModel):
     agent_id: str
@@ -309,6 +341,11 @@ class CheckoutRequest(BaseModel):
     success_url: str = f"{_PUBLIC_URL}/launch?payment=success"
     cancel_url: str = f"{_PUBLIC_URL}/launch?payment=cancelled"
     idempotency_key: str | None = None
+
+    @field_validator("idempotency_key")
+    @classmethod
+    def _check_idem(cls, v):
+        return _reject_blank_idem(v)
 
 
 class UsdcIntentRequest(BaseModel):

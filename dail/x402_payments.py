@@ -353,7 +353,7 @@ class X402Payments:
                                     "usdc_base_units": units,
                                     "amount_dail": dail_amount,
                                     "transaction": tx.id})
-            self.dail.world_agents.notifications.setdefault(agent_id, []).append(
+            self.dail.world_agents._notify(agent_id,
                 {"type": "topup_credited", "rail": "x402", "payment_id": pid,
                  "tx_hash": tx_hash, "amount_dail": dail_amount,
                  "transaction_id": tx.id})

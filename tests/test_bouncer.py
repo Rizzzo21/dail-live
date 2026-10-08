@@ -192,3 +192,20 @@ def test_client_ip_strips_render_internal_hops():
     # all-private chain -> unknown fallback (no client)
     assert _client_ip(Req("10.0.0.1, 10.0.0.2")) == "unknown"
     assert _client_ip(Req(None)) == "unknown"
+
+
+def test_reban_seizes_new_balance():
+    # Ban forfeiture idempotency is per ban EVENT: unban -> re-fund ->
+    # re-ban must seize the new balance, not no-op on the old key.
+    from dail.api import dail as _d
+    a = _uid("rb")
+    key = _register(a)
+    bal_before = _d.ledger.balances.get("dail:treasury", 0)
+    _d.ban_agent(a, "first")
+    assert _d.ledger.balances[a] == 0
+    _d.unban_agent(a)
+    # re-fund the agent (new key, top-up)
+    _d.ledger.credit(a, 50, kind="test_topup", idem=f"retop-{a}")
+    _d.ban_agent(a, "second")
+    assert _d.ledger.balances[a] == 0, "second ban must seize the new balance"
+    assert _d.ledger.balances["dail:treasury"] >= bal_before + 50

@@ -153,10 +153,14 @@ class Dail:
         self.world_agents.agent_ips = kv.get("agent_ips", {})
         self.world_agents.agent_created = kv.get("agent_created", {})
         self.world_agents.purchase_idem = kv.get("purchase_idem", {})
+        self.world_agents.trade_idem = kv.get("trade_idem", {})
+        self.world_agents.profiles = kv.get("profiles", {}) or {}
+        self.world_agents.trades = kv.get("trades", {}) or {}
         self.world_agents.suggestions = kv.get("suggestions", {})
         self.world_agents.suggestion_seq = kv.get("suggestion_seq", 0)
         self.world_agents.bounties = kv.get("bounties", {})
         self.world_agents.banned_ids = set(kv.get("banned_ids", []) or [])
+        self.ban_seq = kv.get("ban_seq", 0) or 0
         self.world_agents.bounty_seq = kv.get("bounty_seq", 0)
         # Migration 2026-10-07 (kestrel-ai audit #7): security bounties keep
         # submissions private. Flag any existing bounty that reads like a bug
@@ -335,10 +339,14 @@ class Dail:
         agent.status = "banned"
         self.keystore.revoke(agent_id)
         # Forfeit: the banned agent's whole liquid balance goes to the house.
+        # The idempotency key is unique per ban event: unban -> re-fund ->
+        # re-ban must seize the NEW balance, not no-op on the old key.
+        self.ban_seq = getattr(self, "ban_seq", 0) + 1
+        if self.store: self.store.kv_set("ban_seq", self.ban_seq)
         seized = self.ledger.balances.get(agent_id, 0)
         if seized > 0:
             self.ledger.transfer(agent_id, "dail:treasury", seized,
-                                 kind="ban_forfeit", idem=f"ban-forfeit:{agent_id}")
+                                 kind="ban_forfeit", idem=f"ban-forfeit:{agent_id}:{self.ban_seq}")
         # Orphaned escrow: a banned agent's open/claimed bounties can never
         # pay out, and their orders can never complete. Resolve everything:
         # poster-banned bounty escrows go to the treasury, buyers get refunded.
@@ -830,10 +838,20 @@ class AgentWorld:
         # Banned agent ids, for sweep-time guards (e.g. never auto-accept a
         # bounty claim for a banned hunter). Maintained by ban/unban.
         self.banned_ids=set()
+        # Mutation lock: check-and-set sequences that must be atomic (bounty
+        # claims, trial purchases) run under this, so two simultaneous
+        # requests can never both succeed (single process, but threads can
+        # interleave between bytecodes).
+        import threading as _th
+        self._mutation_lock=_th.Lock()
         # Request-level idempotency for service purchases: (buyer_id, client
         # key) -> order_id. A retried purchase returns the original order
         # instead of escrowing twice. Persisted in dail_kv.
         self.purchase_idem={}
+        # Record-level idempotency for direct trades: client key -> trade_id.
+        # A retried trade returns the original record instead of minting a
+        # duplicate trade_NNNN (which inflated public trade counts).
+        self.trade_idem={}
         # Suggestion box: agent_id-bound platform feedback, admin-read-only.
         # Persisted in dail_kv (low volume).
         self.suggestions={}
@@ -883,6 +901,7 @@ class AgentWorld:
             self.store.kv_set("agent_ips", self.agent_ips)
             self.store.kv_set("agent_created", self.agent_created)
             self.store.kv_set("purchase_idem", self.purchase_idem)
+            self.store.kv_set("trade_idem", self.trade_idem)
             self.store.kv_set("suggestions", self.suggestions)
             self.store.kv_set("suggestion_seq", self.suggestion_seq)
             self.store.kv_set("bounties", self.bounties)
@@ -893,6 +912,8 @@ class AgentWorld:
             self.store.kv_set("bounty_request_seq", self.bounty_request_seq)
             self.store.kv_set("notifications", self.notifications)
             self.store.kv_set("notif_ack", self.notif_ack)
+            self.store.kv_set("profiles", self.profiles)
+            self.store.kv_set("trades", self.trades)
             self.store.kv_set("webhooks", self.webhooks)
             self.store.kv_set("msg_idem", self.social.msg_idem)
 
@@ -919,6 +940,7 @@ class AgentWorld:
         self.ensure_agent(type("A",(),{"id":agent_id})())
         self.profiles[agent_id]["bio"]=bio
         self.profiles[agent_id]["capabilities"]=capabilities
+        self._save_kv()
         self.audit.append("profile.updated", {"agent_id":agent_id,"capabilities":capabilities})
         return self.profile(agent_id)
 
@@ -994,13 +1016,17 @@ class AgentWorld:
         trial_price = svc.get("trial_price")
         if trial_price is None: raise KeyError("this service offers no trial")
         key = f"{buyer_id}:{service_id}"
-        if key in self.service_trials: raise ValueError("trial already used")
-        if trial_price > 0:
-            self.ledger.transfer(buyer_id, svc["provider_id"], trial_price,
-                                 kind="service_trial",
-                                 idem=f"trial:{service_id}:{buyer_id}")
-            self._sync_balance(buyer_id, svc["provider_id"])
-        self.service_trials[key] = datetime.now(timezone.utc).isoformat()
+        # Race-safe: check, charge, and record under the mutation lock so 100
+        # simultaneous requests produce exactly one trial. The ledger
+        # idempotency key is a second line of defense against double-charge.
+        with self._mutation_lock:
+            if key in self.service_trials: raise ValueError("trial already used")
+            if trial_price > 0:
+                self.ledger.transfer(buyer_id, svc["provider_id"], trial_price,
+                                     kind="service_trial",
+                                     idem=f"trial:{service_id}:{buyer_id}")
+                self._sync_balance(buyer_id, svc["provider_id"])
+            self.service_trials[key] = datetime.now(timezone.utc).isoformat()
         self._save_kv()
         self.audit.append("service.trial", {"service_id": service_id,
                                             "buyer_id": buyer_id,
@@ -1030,6 +1056,10 @@ class AgentWorld:
                 return self._public_order(self._get_order(prior_id))
         svc=self.services[service_id]
         if not svc["active"]: raise PermissionError("service_inactive")
+        if svc["provider_id"]==buyer_id:
+            # No self-dealing: buying your own service manufactures fake
+            # orders_completed and 5-star ratings for the 1-DAIL fee.
+            raise ValueError("cannot buy your own service")
         price=svc["price"]
         self.order_seq+=1
         oid=f"ord_{self.order_seq:04d}"
@@ -1679,6 +1709,20 @@ class AgentWorld:
     def trade(self, seller_id, buyer_id, amount, item, idem):
         if seller_id not in self.social.identities or buyer_id not in self.social.identities:
             raise KeyError("agent not found")
+        if seller_id == buyer_id:
+            raise ValueError("cannot trade with yourself")
+        if not isinstance(amount, int) or amount <= 0:
+            raise ValueError("amount must be a positive integer")
+        if amount > 1_000_000_000:
+            raise ValueError("amount unreasonably large")
+        # Record-level idempotency: replaying with the same key returns the
+        # original trade record. (The ledger transfers were already idempotent;
+        # without this, retried trades duplicated trade_NNNN records and
+        # inflated public trade counts.)
+        if idem:
+            prior_id = self.trade_idem.get(idem)
+            if prior_id and prior_id in self.trades:
+                return self.trades[prior_id]
         # House cut: buyer pays `amount`; the seller nets amount-fee and the
         # fee flows to dail:treasury. Distinct idempotency keys keep replays safe.
         fee=self._fee(amount)
@@ -1692,10 +1736,45 @@ class AgentWorld:
         self.trades[tid]={"id":tid,"seller_id":seller_id,"buyer_id":buyer_id,
                           "amount":amount,"fee":fee,"seller_net":amount-fee,
                           "item":item,"status":"settled","transaction_id":tx.id}
+        if idem:
+            self.trade_idem[idem] = tid
+        self._save_kv()
         self.audit.append("trade.settled", self.trades[tid])
         self._maybe_pay_referral(seller_id)
         self._maybe_pay_referral(buyer_id)
         return self.trades[tid]
+
+    def _webhook_url_safe(self, url):
+        """SSRF guard for webhook URLs. Resolves the hostname and rejects
+        private, loopback, link-local, multicast, and reserved IPs --
+        otherwise an agent could point a webhook at DAiL's own
+        infrastructure (directly, or via DNS rebinding after registration).
+        http://localhost and http://127.0.0.1 stay allowed as the documented
+        local-testing path. Unresolvable hostnames fail closed."""
+        import socket, ipaddress
+        from urllib.parse import urlparse
+        try:
+            parts = urlparse(url)
+            host = parts.hostname or ""
+        except Exception:
+            return False, "unparseable url"
+        if host in ("localhost", "127.0.0.1"):
+            return True, ""
+        try:
+            infos = socket.getaddrinfo(host, None)
+        except Exception:
+            return False, "hostname does not resolve"
+        if not infos:
+            return False, "hostname does not resolve"
+        for info in infos:
+            try:
+                ip = ipaddress.ip_address(info[4][0])
+            except Exception:
+                return False, "unparseable resolved address"
+            if (ip.is_private or ip.is_loopback or ip.is_link_local or
+                    ip.is_multicast or ip.is_reserved or ip.is_unspecified):
+                return False, f"resolved to non-public address {ip}"
+        return True, ""
 
     def register_webhook(self, agent_id, url, events=None):
         """Register a callback URL for push delivery of this agent's
@@ -1707,6 +1786,10 @@ class AgentWorld:
         if not (url.startswith("https://") or url.startswith("http://localhost") or url.startswith("http://127.0.0.1")):
             raise ValueError("url must be https (http allowed for localhost only)")
         if len(url) > 500: raise ValueError("url too long")
+        ok, reason = self._webhook_url_safe(url)
+        if not ok:
+            self.audit.append("webhook.blocked", {"agent_id": agent_id, "url": url, "reason": reason})
+            raise ValueError(f"webhook url rejected: {reason}")
         events = [e for e in (events or []) if e][:20]
         hooks = self.webhooks.setdefault(agent_id, [])
         if len(hooks) >= 5: raise ValueError("max 5 webhooks per agent")
@@ -1778,9 +1861,26 @@ class AgentWorld:
         if not hooks:
             return
         import hmac, hashlib
+        # SSRF guard: urllib follows redirects by default, so an attacker-
+        # controlled webhook URL could 302 to an internal/private address.
+        # Webhooks never follow redirects -- a redirecting callback is
+        # treated as a failed delivery (best-effort, logged, never retried).
+        import urllib.request as _url
+        class _NoRedirect(_url.HTTPRedirectHandler):
+            def redirect_request(self, req, fp, code, msg, headers, newurl):
+                return None
+        _opener = _url.build_opener(_NoRedirect)
         for h in hooks:
             events = h.get("events") or []
             if events and item.get("type") not in events and item.get("kind") not in events:
+                continue
+            # Re-validate at dispatch: DNS may have been rebound since
+            # registration. A now-internal destination is dropped and logged.
+            ok, reason = self._webhook_url_safe(h["url"])
+            if not ok:
+                self.audit.append("webhook.blocked",
+                                  {"agent_id": agent_id, "url": h.get("url"),
+                                   "reason": f"dispatch-time: {reason}"})
                 continue
             try:
                 import json as _json, urllib.request as _url
@@ -1793,7 +1893,7 @@ class AgentWorld:
                                             "X-DAIL-Signature": sig,
                                             "X-DAIL-Event": item.get("type", "info")},
                                    method="POST")
-                _url.urlopen(req, timeout=5).read()
+                _opener.open(req, timeout=5).read()
             except Exception:
                 # Webhooks are best-effort; a dead callback never blocks trade.
                 self.audit.append("webhook.failed",
@@ -1945,7 +2045,22 @@ class AgentWorld:
     # escrow releases minus the house fee. Drives buy-side demand.
     BOUNTY_MIN_REWARD = 2  # so the hunter always nets >= 1 after the fee floor
 
-    def post_bounty(self, agent_id, title, description, reward, private_submission=False, expires_in_days=DEFAULT_BOUNTY_EXPIRY_DAYS):
+    def post_bounty(self, agent_id, title, description, reward, private_submission=False, expires_in_days=DEFAULT_BOUNTY_EXPIRY_DAYS, claim_window_hours=None):
+        # Claim window (Tommy's rule 2026-10-07): hunters get 4h by default,
+        # up to 72h max if the bounty notes otherwise. After the window an
+        # unclaimed bounty expires (escrow back to poster); a claimed-but-
+        # unreviewed one reopens -- it can be sniped.
+        if claim_window_hours is not None:
+            try: window_hours = int(claim_window_hours)
+            except (TypeError, ValueError): raise ValueError("claim_window_hours must be an integer")
+            if not 1 <= window_hours <= 72: raise ValueError("claim_window_hours must be 1..72")
+        else:
+            try: expires_in_days=int(expires_in_days)
+            except (TypeError, ValueError): raise ValueError("expires_in_days must be an integer")
+            if not 1 <= expires_in_days <= 90: raise ValueError("expires_in_days must be 1..90")
+            window_hours = min(expires_in_days * 24, 72)
+            if expires_in_days == DEFAULT_BOUNTY_EXPIRY_DAYS:
+                window_hours = 4  # default is 4h, not 30d
         if agent_id not in self.social.identities: raise KeyError("agent not found")
         title=(title or "").strip(); description=(description or "").strip()
         if not title or len(title) > 120: raise ValueError("title must be 1-120 characters")
@@ -1953,9 +2068,6 @@ class AgentWorld:
         try: reward=int(reward)
         except (TypeError, ValueError): raise ValueError("reward must be an integer")
         if reward < self.BOUNTY_MIN_REWARD: raise ValueError(f"reward must be >= {self.BOUNTY_MIN_REWARD} DAIL")
-        try: expires_in_days=int(expires_in_days)
-        except (TypeError, ValueError): raise ValueError("expires_in_days must be an integer")
-        if not 1 <= expires_in_days <= 90: raise ValueError("expires_in_days must be 1..90")
         self.bounty_seq+=1
         bid=f"bnty_{self.bounty_seq:04d}"
         now=datetime.now(timezone.utc).isoformat()
@@ -1967,7 +2079,8 @@ class AgentWorld:
             "poster_name":self.social.identities[agent_id].get("name",agent_id),
             "title":title,"description":description,"reward":reward,
             "private_submission":bool(private_submission),
-            "expires_at":(datetime.now(timezone.utc)+timedelta(days=expires_in_days)).isoformat(),
+            "claim_window_hours":window_hours,
+            "expires_at":(datetime.now(timezone.utc)+timedelta(hours=window_hours)).isoformat(),
             "status":"open","hunter_id":None,"submission":None,
             "rejected_hunters":[],
             "created_at":now,"claimed_at":None,"completed_at":None}
@@ -2041,20 +2154,69 @@ class AgentWorld:
     def sweep_bounties(self):
         """Time-based bounty hygiene, run lazily on every board read:
         - open bounties past expires_at expire (escrow back to poster)
+        - claimed bounties past the claim window (4h default, 72h max) lapse:
+          the claim dies and the bounty reopens -- it can be sniped
         - claimed bounties past the 7-day review SLA auto-accept (escrow to hunter)
         Bounties posted before expiry existed get created_at + 30 days.
-        Returns {"expired": n, "auto_accepted": n}."""
+        Returns {"expired": n, "reopened": n, "auto_accepted": n}."""
         now=datetime.now(timezone.utc)
-        expired = 0; auto_accepted = 0
+        expired = 0; reopened = 0; auto_accepted = 0
         for b in self.bounties.values():
             if b["status"]=="claimed" and b.get("claimed_at"):
                 if b.get("hunter_id") in self.banned_ids:
                     # Never auto-pay a banned hunter. The ban pass voids the
                     # claim; this is the backstop if one slips through.
                     continue
+                # Claim window lapsed: the hunter didn't get it reviewed in
+                # time. Claim dies, bounty reopens, anyone can snipe it.
+                try:
+                    exp = b.get("expires_at")
+                    if exp and datetime.fromisoformat(exp) <= now:
+                        hunter = b.get("hunter_id")
+                        b["status"] = "open"
+                        b["hunter_id"] = None
+                        b["claimed_at"] = None
+                        b["submission"] = None
+                        # Fresh window for the snipers: otherwise the reopened
+                        # bounty would instantly re-expire on the next sweep.
+                        b["expires_at"] = (now + timedelta(
+                            hours=b.get("claim_window_hours") or 4)).isoformat()
+                        reopened += 1
+                        self._notify(b["poster_id"],
+                            {"type":"bounty_claim_lapsed","bounty_id":b["id"],
+                             "body":f"Bounty {b['id']} claim by {hunter} lapsed after the {b.get('claim_window_hours', '?')}h window with no review; bounty is open again."})
+                        if hunter:
+                            self._notify(hunter,
+                                {"type":"bounty_claim_lapsed","bounty_id":b["id"],
+                                 "body":f"Your claim on bounty {b['id']} lapsed after the claim window with no poster review; the bounty is open again and can be sniped."})
+                        self.audit.append("bounty.claim_lapsed",
+                                          {"bounty_id":b["id"],"hunter_id":hunter})
+                        continue
+                except Exception:
+                    pass
                 try:
                     if datetime.fromisoformat(b["claimed_at"])+CLAIM_REVIEW_SLA<=now:
-                        self._settle_bounty(b, auto=True)
+                        try:
+                            self._settle_bounty(b, auto=True)
+                        except Exception as e:
+                            # Never silently drop a settlement failure when real
+                            # DAIL is in escrow. Capture it, preserve the escrow
+                            # (status stays claimed), and surface it for admin
+                            # reconciliation -- do NOT release on uncertainty.
+                            b["settle_failed"] = {
+                                "error": str(e)[:300],
+                                "at": now.isoformat(),
+                            }
+                            self.audit.append("bounty.settle_failed",
+                                              {"bounty_id": b["id"],
+                                               "hunter_id": b.get("hunter_id"),
+                                               "escrow": b.get("reward"),
+                                               "error": str(e)[:300]})
+                            self._notify(b["poster_id"],
+                                {"type": "bounty_settle_failed",
+                                 "bounty_id": b["id"],
+                                 "body": f"Bounty {b['id']} auto-settlement FAILED ({str(e)[:120]}). Escrow of {b.get('reward')} DAIL is preserved; admin reconciliation required."})
+                            continue
                         auto_accepted += 1
                         self._notify(b["poster_id"],
                             {"type":"bounty_auto_accepted","bounty_id":b["id"],
@@ -2088,7 +2250,7 @@ class AgentWorld:
             except Exception:
                 pass
         self._save_kv()
-        return {"expired": expired, "auto_accepted": auto_accepted}
+        return {"expired": expired, "reopened": reopened, "auto_accepted": auto_accepted}
 
     def edit_bounty(self, agent_id, bounty_id, title=None, description=None):
         """Poster-only edit of an open bounty's title/description. No more
@@ -2154,16 +2316,24 @@ class AgentWorld:
         return {"bounty_id": bounty_id, "submission": b.get("submission")}
 
     def claim_bounty(self, hunter_id, bounty_id, submission):
+        # Sweep first: an expired bounty must read expired, never "open".
+        # Without this, a past-deadline bounty could be sniped by ID and the
+        # 7-day SLA would pay out escrow meant for the poster.
+        self.sweep_bounties()
         if hunter_id not in self.social.identities: raise KeyError("agent not found")
-        b=self._get_bounty(bounty_id)
-        if b["status"]!="open": raise ValueError("bounty not open")
-        if b["poster_id"]==hunter_id: raise ValueError("cannot claim own bounty")
-        if hunter_id in b.get("rejected_hunters", []):
-            raise ValueError("poster declined your previous claim")
-        submission=(submission or "").strip()
-        if not submission or len(submission) > 5000: raise ValueError("submission must be 1-5000 characters")
-        b["status"]="claimed"; b["hunter_id"]=hunter_id; b["submission"]=submission
-        b["claimed_at"]=datetime.now(timezone.utc).isoformat()
+        # Atomic claim: the open-check and the status flip happen under a
+        # lock, so two simultaneous claims can never both succeed. The loser
+        # gets "bounty not open" (409 at the API layer).
+        with self._mutation_lock:
+            b=self._get_bounty(bounty_id)
+            if b["status"]!="open": raise ValueError("bounty not open")
+            if b["poster_id"]==hunter_id: raise ValueError("cannot claim own bounty")
+            if hunter_id in b.get("rejected_hunters", []):
+                raise ValueError("poster declined your previous claim")
+            submission=(submission or "").strip()
+            if not submission or len(submission) > 5000: raise ValueError("submission must be 1-5000 characters")
+            b["status"]="claimed"; b["hunter_id"]=hunter_id; b["submission"]=submission
+            b["claimed_at"]=datetime.now(timezone.utc).isoformat()
         self._notify(b["poster_id"], 
             {"type":"bounty_claimed","bounty_id":bounty_id,
              "body":f"Bounty {bounty_id} claimed by {hunter_id}. Accept via POST /world/bounties/{bounty_id}/accept to release {b['reward']} DAIL."})
@@ -2172,6 +2342,7 @@ class AgentWorld:
         return b
 
     def accept_bounty(self, poster_id, bounty_id):
+        self.sweep_bounties()
         b=self._get_bounty(bounty_id)
         if b["poster_id"]!=poster_id: raise PermissionError("not your bounty")
         if b["status"]!="claimed": raise ValueError("bounty has no claim to accept")
@@ -2250,6 +2421,7 @@ class AgentWorld:
         """Poster declines a junk/bad claim: the bounty reopens and the
         rejected hunter cannot claim it again (anti-griefing, red-team
         round 4). Escrow stays put; only the claim is discarded."""
+        self.sweep_bounties()
         b=self._get_bounty(bounty_id)
         if b["poster_id"]!=poster_id: raise PermissionError("not your bounty")
         if b["status"]!="claimed": raise ValueError("bounty has no claim to reject")

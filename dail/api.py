@@ -457,6 +457,7 @@ def bouncer_sweeps_run(request: Request):
     b = dail.world_agents.sweep_bounties()
     return {"orders_auto_released": released,
             "bounties_expired": b["expired"],
+            "bounties_reopened": b["reopened"],
             "bounties_auto_accepted": b["auto_accepted"]}
 
 @app.get("/bouncer/agents/ips")
@@ -1188,7 +1189,7 @@ def suggestion_review(suggestion_id: str, req: SuggestionReviewRequest, request:
 @app.post("/world/bounties", status_code=201)
 def bounty_create(req: BountyCreateRequest, request: Request):
     _own(request, req.agent_id)
-    try: return dail.world_agents.post_bounty(req.agent_id, req.title, req.description, req.reward, req.private_submission, req.expires_in_days)
+    try: return dail.world_agents.post_bounty(req.agent_id, req.title, req.description, req.reward, req.private_submission, req.expires_in_days, req.claim_window_hours)
     except KeyError as e: raise HTTPException(404,str(e))
     except (ValueError, LedgerError) as e: raise HTTPException(400,str(e))
 
@@ -1240,7 +1241,11 @@ def bounty_claim(bounty_id: str, req: BountyClaimRequest, request: Request):
     _own(request, req.agent_id)
     try: return dail.world_agents.claim_bounty(req.agent_id, bounty_id, req.submission)
     except KeyError as e: raise HTTPException(404,str(e))
-    except (ValueError, LedgerError) as e: raise HTTPException(400,str(e))
+    except ValueError as e:
+        # Lost a claim race (or bounty already taken): 409, not 400.
+        if "bounty not open" in str(e): raise HTTPException(409, str(e))
+        raise HTTPException(400,str(e))
+    except LedgerError as e: raise HTTPException(400,str(e))
 
 @app.post("/world/bounties/{bounty_id}/accept")
 def bounty_accept(bounty_id: str, req: BountyActionRequest, request: Request):
@@ -1277,6 +1282,22 @@ def admin_referrals_held(request: Request):
     """List referral rewards held for wash-trade review. Admin-only."""
     _require_admin(request)
     return {"held": dail.world_agents.held_referrals()}
+
+
+@app.get("/admin/bounties/failed-settlements")
+def admin_failed_settlements(request: Request):
+    """Bounties whose auto-settlement failed: escrow preserved, admin
+    reconciliation required. Admin-only."""
+    _require_admin(request)
+    failed = [b for b in dail.world_agents.bounties.values()
+              if isinstance(b, dict) and b.get("settle_failed")]
+    return {"failed": [
+        {"bounty_id": b["id"], "poster_id": b.get("poster_id"),
+         "hunter_id": b.get("hunter_id"), "escrow": b.get("reward"),
+         "expected_recipient": b.get("hunter_id"),
+         "failure_reason": b["settle_failed"].get("error"),
+         "failed_at": b["settle_failed"].get("at")}
+        for b in failed]}
 
 
 @app.post("/admin/referrals/release")
@@ -1331,6 +1352,7 @@ def world_service_purchase(req: ServicePurchaseRequest, request: Request):
     except KeyError as e: raise HTTPException(404, str(e))
     except PermissionError as e: raise HTTPException(403, str(e))
     except LedgerError as e: raise HTTPException(400, str(e))
+    except ValueError as e: raise HTTPException(400, str(e))
 
 @app.post("/world/services/{service_id}/trial")
 def world_service_trial(service_id: str, req: ServiceTrialRequest, request: Request):
@@ -1371,6 +1393,7 @@ def world_trade(req: TradeRequest, request: Request):
         raise HTTPException(403, "only_the_buyer_can_initiate_a_trade")
     try: return dail.world_agents.trade(req.seller_id, req.buyer_id, req.amount, req.item, req.idempotency_key)
     except KeyError as e: raise HTTPException(404, str(e))
+    except ValueError as e: raise HTTPException(400, str(e))
     except LedgerError as e: raise HTTPException(400, str(e))
 
 @app.get("/treasury")

@@ -325,13 +325,13 @@ class UsdcPayments:
                                    {"intent_id": intent_id, "agent_id": agent_id,
                                     "tx_hash": tx_hash, "usdc_base_units": usdc_units,
                                     "amount_dail": dail_amount, "transaction": tx.id})
-            self.dail.world_agents.notifications.setdefault(agent_id, []).append(
-                {"type": "topup_credited", "rail": "usdc", "intent_id": intent_id,
-                 "tx_hash": tx_hash, "amount_dail": dail_amount,
-                 "transaction_id": tx.id})
             if updated == 0:
                 return {"received": True, "duplicate": True,
                         **self._intent_view({**record, "status": "paid"})}
+            self.dail.world_agents._notify(agent_id,
+                {"type": "topup_credited", "rail": "usdc", "intent_id": intent_id,
+                 "tx_hash": tx_hash, "amount_dail": dail_amount,
+                 "transaction_id": tx.id})
             return {"received": True, "duplicate": False,
                     "intent_id": intent_id, "agent_id": agent_id,
                     "tx_hash": tx_hash, "credited_dail": dail_amount,

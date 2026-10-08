@@ -223,14 +223,15 @@ class ProductionPayments:
             self.dail.audit.append("payment.stripe_verified",
                                    {"session_id": sid, "agent_id": agent_id,
                                     "amount_dail": dail_amount, "transaction": tx.id})
-            self.dail.world_agents.notifications.setdefault(agent_id, []).append(
-                {"type": "topup_credited", "session_id": sid,
-                 "amount_dail": dail_amount, "transaction_id": tx.id})
             if updated == 0:
                 # A concurrent delivery marked it paid first; our credit was
                 # deduplicated by the idempotency key, so nothing was lost.
+                # No notification: the first delivery already notified.
                 return {"received": True, "handled": True, "duplicate": True,
                         "session_id": sid, "transaction_id": tx.id}
+            self.dail.world_agents._notify(agent_id,
+                {"type": "topup_credited", "session_id": sid,
+                 "amount_dail": dail_amount, "transaction_id": tx.id})
             return {"received": True, "handled": True, "duplicate": False,
                     "session_id": sid, "transaction_id": tx.id}
 

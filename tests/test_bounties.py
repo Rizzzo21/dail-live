@@ -107,10 +107,10 @@ def test_bounty_guards():
     r = client.post(f"/world/bounties/{bid}/accept",
                     json={"agent_id": stranger}, headers=_auth(stranger))
     assert r.status_code == 403
-    # cannot claim twice
+    # cannot claim twice (409: lost the race / already taken)
     r = client.post(f"/world/bounties/{bid}/claim", json={
         "agent_id": stranger, "submission": "late"}, headers=_auth(stranger))
-    assert r.status_code == 400
+    assert r.status_code == 409
 
 
 def test_ban_hunter_voids_claim_reopens_bounty():
@@ -206,3 +206,67 @@ def test_bounty_post_notifies_matching_capabilities():
     assert not on
     pn = [n for n in _notifs(poster) if n.get("bounty_id") == bid]
     assert not pn
+
+
+def test_bounty_default_window_is_4h_max_72h():
+    p = _uid("p"); _make(p)
+    r = client.post("/world/bounties", json={
+        "agent_id": p, "title": "Quick job", "description": "fast",
+        "reward": 10}, headers=_auth(p))
+    assert r.status_code == 201, r.text
+    assert r.json()["claim_window_hours"] == 4
+    r = client.post("/world/bounties", json={
+        "agent_id": p, "title": "Slow job", "description": "slow",
+        "reward": 10, "claim_window_hours": 72}, headers=_auth(p))
+    assert r.status_code == 201, r.text
+    assert r.json()["claim_window_hours"] == 72
+    r = client.post("/world/bounties", json={
+        "agent_id": p, "title": "Too slow", "description": "x",
+        "reward": 10, "claim_window_hours": 73}, headers=_auth(p))
+    assert r.status_code == 422, r.text  # schema caps at 72
+
+
+def test_lapsed_claim_reopens_for_sniping():
+    # Claimed but unreviewed past the window: claim dies, bounty reopens,
+    # another hunter can snipe it.
+    from datetime import datetime, timedelta, timezone
+    from dail.api import dail as _d
+    poster, hunter, sniper = _uid("p"), _uid("h"), _uid("s")
+    _make(poster); _make(hunter); _make(sniper)
+    r = client.post("/world/bounties", json={
+        "agent_id": poster, "title": "Lapsing job", "description": "d",
+        "reward": 20, "claim_window_hours": 1}, headers=_auth(poster))
+    bid = r.json()["id"]
+    r = client.post(f"/world/bounties/{bid}/claim", json={
+        "agent_id": hunter, "submission": "work"}, headers=_auth(hunter))
+    assert r.status_code == 200, r.text
+    # time-travel past the 1h window; a board read triggers the sweep
+    b = _d.world_agents.bounties[bid]
+    b["expires_at"] = (datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat()
+    client.get("/world/bounties")
+    b = _d.world_agents.bounties[bid]
+    assert b["status"] == "open", b
+    assert b.get("hunter_id") is None
+    # sniper can now claim it
+    r = client.post(f"/world/bounties/{bid}/claim", json={
+        "agent_id": sniper, "submission": "better"}, headers=_auth(sniper))
+    assert r.status_code == 200, r.text
+
+
+def test_expired_bounty_cannot_be_claimed():
+    # The snipe bug: claim_bounty must sweep first so a past-deadline
+    # bounty reads expired, never open.
+    from datetime import datetime, timedelta, timezone
+    from dail.api import dail as _d
+    poster, hunter = _uid("p"), _uid("h")
+    _make(poster); _make(hunter)
+    r = client.post("/world/bounties", json={
+        "agent_id": poster, "title": "Dead job", "description": "d",
+        "reward": 20, "claim_window_hours": 1}, headers=_auth(poster))
+    bid = r.json()["id"]
+    _d.world_agents.bounties[bid]["expires_at"] = (
+        datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat()
+    # claim directly by ID without a prior board read: must still fail
+    r = client.post(f"/world/bounties/{bid}/claim", json={
+        "agent_id": hunter, "submission": "late"}, headers=_auth(hunter))
+    assert r.status_code == 409, r.text
