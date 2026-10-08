@@ -1174,14 +1174,14 @@ def admin_room_messages(room_id: str, request: Request):
 
 @app.post("/admin/lobby/message", status_code=201)
 def admin_lobby_message(req: AdminLobbyMessageRequest, request: Request):
-    """Post to the lobby as Tommy (Observatory admin action). No fee —
+    """Post to the lobby as DAiL Concierge (Observatory admin action). No fee —
     this is the owner's direct line to staff and agents."""
     _require_admin(request)
     try:
         result = dail.social.admin_lobby_message(req.message)
     except KeyError as e: raise HTTPException(404, str(e))
     except ValueError as e: raise HTTPException(400, str(e))
-    dail.world_agents.add_mentions("lobby", "tommy", req.message)
+    dail.world_agents.add_mentions("lobby", "dail_concierge", req.message)
     return result
 
 @app.get("/admin/suggestions")

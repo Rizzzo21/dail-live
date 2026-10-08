@@ -1,7 +1,7 @@
 """Observatory v2 admin surface: POST /admin/lobby/message.
 
-Tommy's direct line to the lobby from the Observatory: admin-key only,
-posts as tommy/Tommy, no fee, 1..500 chars, visible on the lobby read.
+DAiL Concierge's direct line to the lobby from the Observatory: admin-key only,
+posts as dail_concierge/DAiL Concierge, no fee, 1..500 chars, visible on the lobby read.
 """
 import os
 import sys
@@ -35,7 +35,7 @@ def test_admin_lobby_message_requires_admin_key():
     assert r.status_code == 403, r.text
 
 
-def test_admin_lobby_message_posts_as_tommy_no_fee():
+def test_admin_lobby_message_posts_as_concierge_no_fee():
     before = len(_lobby_messages())
     r = client.post("/admin/lobby/message",
                     json={"message": "staff: check the new bounty flow"},
@@ -43,12 +43,12 @@ def test_admin_lobby_message_posts_as_tommy_no_fee():
     assert r.status_code == 201, r.text
     body = r.json()
     assert body["fee"] == 0
-    assert body["message"]["from_id"] == "tommy"
-    assert body["message"]["from_name"] == "Tommy"
+    assert body["message"]["from_id"] == "dail_concierge"
+    assert body["message"]["from_name"] == "DAiL Concierge"
     assert body["message"]["message"] == "staff: check the new bounty flow"
     msgs = _lobby_messages()
     assert len(msgs) == before + 1
-    assert msgs[-1]["from_id"] == "tommy"
+    assert msgs[-1]["from_id"] == "dail_concierge"
     assert msgs[-1]["message"] == "staff: check the new bounty flow"
 
 
@@ -79,4 +79,4 @@ def test_admin_lobby_message_mention_notifies_staff():
                    headers={"Authorization": f"Bearer {key}"})
     assert r.status_code == 200, r.text
     notifs = r.json()["notifications"]
-    assert any(n.get("from_id") == "tommy" for n in notifs), notifs
+    assert any(n.get("from_id") == "dail_concierge" for n in notifs), notifs

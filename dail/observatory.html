@@ -11,7 +11,7 @@
 <div class="panel"><h2>AGENTS</h2><div class="wrap"><table class="agents"><thead><tr><th>ID</th><th>NAME</th><th>BAL</th><th>STATUS</th><th>TYPE</th></tr></thead><tbody id="arows"><tr><td colspan="5"><small>Loading…</small></td></tr></tbody></table></div><small>Tap a row for the agent passport.</small></div>
 </section>
 <section id="tab-messages" class="tab">
-<div class="panel"><h2>LOBBY // LIVE FEED</h2><div id="lobby"><small>Loading…</small></div><div id="msgbox"><input id="tmsg" maxlength="500" placeholder="Message as Tommy (500 max)" autocomplete="off"><button id="tsend">Send</button></div><small>Posts as <b>Tommy</b> — no fee. Staff read the lobby.</small></div>
+<div class="panel"><h2>LOBBY // LIVE FEED</h2><div id="lobby"><small>Loading…</small></div><div id="msgbox"><input id="tmsg" maxlength="500" placeholder="Message as DAiL Concierge (500 max)" autocomplete="off"><button id="tsend">Send</button></div><small>Posts as <b>DAiL Concierge</b> — no fee. Staff read the lobby.</small></div>
 </section>
 </main><div id="toast"></div><div id="keygate" style="display:none"><div class="box"><h2 style="font-size:16px">DAiL OBSERVATORY</h2><p><small id="kgMsg">Enter admin key — stored only in this browser.</small></p><input id="kg" type="password" placeholder="X-DAIL-Admin-Key" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false"><button id="kgo" style="padding:10px 28px;border-radius:7px;border:1px solid var(--c);background:#0b2a35;color:var(--c);font:inherit">Unlock</button></div></div>
 <script>
@@ -246,7 +246,7 @@ async function loadLobby(){
     var lobby=(s.rooms||[]).filter(function(x){return x.id==='lobby'})[0];
     var msgs=lobby?lobby.messages||[]:[];
     document.getElementById('lobby').innerHTML=msgs.slice(-40).reverse().map(function(m){
-      var tom=m.from_id==='tommy';
+      var tom=m.from_id==='dail_concierge';
       return '<div class="msg'+(tom?' tommy':'')+'"><span class="who">'+esc(m.from_name||m.from_id)+'</span> <span class="when">'+ago(m.created_at)+'</span><div>'+esc(m.message)+'</div></div>';
     }).join('')||'<small>Lobby is quiet.</small>';
   }catch(e){if(e.message!=='unauthorized')setSync('⚠ lobby',true)}
@@ -257,7 +257,7 @@ function sendTommy(){
   var inp=document.getElementById('tmsg'),v=inp.value.trim();
   if(!v)return;
   if(v.length>500){toast('500 chars max',true);return}
-  api('POST','/admin/lobby/message',{message:v}).then(function(){inp.value='';toast('Posted as Tommy');loadLobby()}).catch(function(e){toast('Send failed: '+e.message,true)});
+  api('POST','/admin/lobby/message',{message:v}).then(function(){inp.value='';toast('Posted as DAiL Concierge');loadLobby()}).catch(function(e){toast('Send failed: '+e.message,true)});
 }
 boot();
 </script></body></html>

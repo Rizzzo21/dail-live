@@ -866,17 +866,17 @@ class SocialWorld:
         return result
 
     def admin_lobby_message(self, message):
-        """Post to the lobby as Tommy (Observatory admin action). No fee,
+        """Post to the lobby as DAiL Concierge (Observatory admin action). No fee,
         no agent identity required — the sender is fixed server-side."""
         message=(message or "").strip()
         if not message: raise ValueError("message cannot be empty")
         if len(message)>500: raise ValueError("message must be 1-500 characters")
         r=self.rooms.get("lobby")
         if r is None: raise KeyError("lobby not found")
-        item={"from_id":"tommy","from_name":"Tommy","message":message,
+        item={"from_id":"dail_concierge","from_name":"DAiL Concierge","message":message,
               "created_at":datetime.now(timezone.utc).isoformat()}
         r["messages"].append(item)
-        self.audit.append("room.message",{"room_id":"lobby","agent_id":"tommy","message_length":len(message)})
+        self.audit.append("room.message",{"room_id":"lobby","agent_id":"dail_concierge","message_length":len(message)})
         # Same 200-cap persistence as normal lobby messages.
         if self.store and self.store.enabled:
             self.store.kv_set("lobby_messages", r["messages"][-200:])
