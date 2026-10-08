@@ -12,14 +12,37 @@ class SafeWallet:
     Withdrawal secrets are stored only as SHA-256 hashes and are returned once.
     """
 
-    def __init__(self, ledger, audit, admin_key=None):
+    def __init__(self, ledger, audit, admin_key=None, store=None):
         self.ledger = ledger
         self.audit = audit
         self.admin_key = admin_key
+        self.store = store
         self.receive_address = f"dail-safe-{secrets.token_urlsafe(18)}"
         self._withdrawal_key_hash = None
         self._withdrawal_key_id = None
         self._key_version = 0
+        # Withdrawal keys must survive restarts: the hash (never the raw key)
+        # is persisted to KV. Without this, a deploy silently breaks
+        # /safe/withdraw until an admin notices (2026-10-07).
+        try:
+            saved = (self.store.kv_get("safe_withdrawal_key", {}) or {}) if self.store else {}
+            if saved.get("hash"):
+                self._withdrawal_key_hash = saved["hash"]
+                self._withdrawal_key_id = saved.get("key_id")
+                self._key_version = int(saved.get("version", 0) or 0)
+        except Exception:
+            pass
+
+    def _persist_key(self):
+        if self.store:
+            try:
+                self.store.kv_set("safe_withdrawal_key", {
+                    "hash": self._withdrawal_key_hash,
+                    "key_id": self._withdrawal_key_id,
+                    "version": self._key_version,
+                })
+            except Exception:
+                pass
 
     @property
     def balance(self):
@@ -57,6 +80,7 @@ class SafeWallet:
         self._withdrawal_key_hash = hashlib.sha256(raw.encode()).hexdigest()
         self._withdrawal_key_id = f"wdkey_{secrets.token_hex(6)}"
         self._key_version += 1
+        self._persist_key()
         self.audit.append("safe.withdrawal_key.created", {
             "key_id": self._withdrawal_key_id,
             "version": self._key_version,
@@ -74,6 +98,7 @@ class SafeWallet:
         old_id = self._withdrawal_key_id
         self._withdrawal_key_hash = None
         self._withdrawal_key_id = None
+        self._persist_key()
         self.audit.append("safe.withdrawal_key.revoked", {"key_id": old_id})
         return {"revoked": True, "key_id": old_id}
 

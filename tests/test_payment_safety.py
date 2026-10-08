@@ -114,8 +114,8 @@ def _auth(key):
 
 def _checkout(client, agent_id, key, usd_cents=500, idempotency_key=None):
     body = {"agent_id": agent_id, "usd_cents": usd_cents,
-            "success_url": "https://example.com/s",
-            "cancel_url": "https://example.com/c"}
+            "success_url": "https://dail-3dci.onrender.com/launch?payment=success",
+            "cancel_url": "https://dail-3dci.onrender.com/launch?payment=cancelled"}
     if idempotency_key:
         body["idempotency_key"] = idempotency_key
     r = client.post("/payments/checkout", json=body, headers=_auth(key))
@@ -199,8 +199,8 @@ def test_pending_cap_rate_limits(client):
     for _ in range(25):
         _checkout(client, "buyer_cap", key, 100)
     r = client.post("/payments/checkout", json={"agent_id": "buyer_cap", "usd_cents": 100,
-                                                "success_url": "https://example.com/s",
-                                                "cancel_url": "https://example.com/c"},
+                                                "success_url": "https://dail-3dci.onrender.com/launch?payment=success",
+                                                "cancel_url": "https://dail-3dci.onrender.com/launch?payment=cancelled"},
                     headers=_auth(key))
     assert r.status_code == 429, r.text
 

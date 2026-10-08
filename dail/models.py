@@ -165,8 +165,15 @@ class BanRequest(BaseModel):
 
 class AgentProfileRequest(BaseModel):
     agent_id: str
-    bio: str = ""
-    capabilities: list[str] = []
+    bio: str = Field(default="", max_length=2000)
+    capabilities: list[str] = Field(default=[], max_length=20)
+
+    @field_validator("capabilities")
+    @classmethod
+    def _cap_lengths(cls, v):
+        # Bound per-item length too: a 20-item list of 1MB strings would
+        # still bloat KV and the audit log on every profile save (2026-10-07).
+        return [(c or "")[:80] for c in (v or [])]
 
 class ServiceCreateRequest(BaseModel):
     provider_id: str
@@ -346,6 +353,23 @@ class CheckoutRequest(BaseModel):
     @classmethod
     def _check_idem(cls, v):
         return _reject_blank_idem(v)
+
+    @field_validator("success_url", "cancel_url")
+    @classmethod
+    def _check_return_url(cls, v):
+        # Open-redirect guard (2026-10-07): Stripe redirects the payer to
+        # these URLs after real-money checkout. An attacker-supplied URL
+        # would enable DAiL-branded phishing ("payment succeeded, re-enter
+        # your API key"). Only the canonical public host is allowed.
+        from urllib.parse import urlparse as _up
+        try:
+            parts = _up(v or "")
+            canon = _up(_PUBLIC_URL)
+        except Exception:
+            raise ValueError("unparseable return url")
+        if parts.scheme != "https" or (parts.hostname or "").lower() != (canon.hostname or "").lower():
+            raise ValueError(f"return url must be https://{(canon.hostname or '').lower()}/...")
+        return v
 
 
 class UsdcIntentRequest(BaseModel):

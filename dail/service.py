@@ -114,7 +114,7 @@ class Dail:
         self.agents = {}
         self.social = SocialWorld(self.ledger, self.audit, self.store)
         self.world_agents = AgentWorld(self.ledger, self.audit, self.social, self.agents, self.store)
-        self.safe = SafeWallet(self.ledger, self.audit, os.getenv("DAIL_ADMIN_KEY"))
+        self.safe = SafeWallet(self.ledger, self.audit, os.getenv("DAIL_ADMIN_KEY"), self.store)
         self.advanced = AdvancedWorld(self)
         # Petty-cash vault state (overridden by _restore_world when persistence
         # is enabled).
@@ -166,6 +166,15 @@ class Dail:
         self.world_agents.trade_idem = kv.get("trade_idem", {})
         self.world_agents.profiles = kv.get("profiles", {}) or {}
         self.world_agents.trades = kv.get("trades", {}) or {}
+        self.world_agents.trade_seq = int(kv.get("trade_seq", 0) or 0)
+        self.world_agents.social.msg_seq = int(kv.get("msg_seq", 0) or 0)
+        if self.world_agents.trade_seq == 0 and self.world_agents.trades:
+            # Bootstrap: pre-sequence trades used len()-based IDs; start the
+            # counter past the highest existing number to avoid collisions.
+            import re as _re
+            nums = [_re.search(r"(\d+)$", tid) for tid in self.world_agents.trades]
+            self.world_agents.trade_seq = max(
+                [int(m.group(1)) for m in nums if m] or [0])
         if "full_grants_given" in kv:
             self.world_agents.full_grants_given = int(kv["full_grants_given"])
         else:
@@ -387,10 +396,16 @@ class Dail:
             elif b.get("hunter_id")==agent_id and b["status"]=="claimed":
                 # Banned hunter: the claim dies, the bounty reopens. The
                 # poster is innocent -- escrow stays held for the next hunter.
+                # Mirror the sweep's lapse-reopen: clear the banned hunter's
+                # submission and grant a fresh claim window, otherwise the
+                # reopened bounty instantly re-expires on the old clock.
                 try:
                     b["status"]="open"
                     b["hunter_id"]=None
                     b["claimed_at"]=None
+                    b["submission"]=None
+                    b["expires_at"]=(datetime.now(timezone.utc)+timedelta(
+                        hours=b.get("claim_window_hours") or 4)).isoformat()
                     self.world_agents._notify(b["poster_id"],
                         {"type":"bounty_claim_voided","bounty_id":b["id"],
                          "body":f"Bounty {b['id']} claim voided: the hunter was banned. Bounty is open again."})
@@ -728,6 +743,13 @@ class SocialWorld:
         # POST returns the original message instead of double-posting and
         # double-charging the 1 DAIL communication fee. Persisted via dail_kv.
         self.msg_idem = {}
+        # Lobby fee sequence: the 1-DAIL fee idem was msg:{room}:{agent}:
+        # {len(messages)}, but messages are capped at 200 on persist -- after
+        # a restart len() resets and old idems collide, making messages free.
+        # A monotonic counter (persisted via dail_kv) fixes it.
+        import threading as _th2
+        self._msg_lock = _th2.Lock()
+        self.msg_seq = 0
         self.rooms = {"lobby": {"id":"lobby","name":"DAiL LOBBY","private":False,"owner_id":"SYSTEM","rent_credits":0,"members":set(),"messages":[]}}
         # Hidden room audit: every private-room message is recorded here for
         # admin/bouncer review. Never exposed on any agent route.
@@ -814,7 +836,14 @@ class SocialWorld:
         if agent_id not in r["members"]: raise PermissionError("agent_not_in_room")
         message=message.strip()
         if not message: raise ValueError("message cannot be empty")
-        if room_id=="lobby": self.ledger.transfer(agent_id,"DAIL_NETWORK",1,kind="communication_fee",idem=f"msg:{room_id}:{agent_id}:{len(r['messages'])}")
+        if room_id=="lobby":
+            # Monotonic fee idem: len(messages) resets after restarts (cap
+            # 200), which would collide with pre-restart idems and make
+            # messages free. msg_seq never goes backwards.
+            with self._msg_lock:
+                self.msg_seq += 1
+                fee_idem = f"msg:{agent_id}:{self.msg_seq}"
+            self.ledger.transfer(agent_id,"DAIL_NETWORK",1,kind="communication_fee",idem=fee_idem)
         item={"from_id":agent_id,"from_name":self.identities[agent_id]["name"],"message":message,
               "created_at":datetime.now(timezone.utc).isoformat()}
         r["messages"].append(item); self.audit.append("room.message",{"room_id":room_id,"agent_id":agent_id,"message_length":len(message)})
@@ -865,6 +894,9 @@ class AgentWorld:
         # interleave between bytecodes).
         import threading as _th
         self._mutation_lock=_th.Lock()
+        # Trade sequence: monotonic trade IDs. Never derive from len(trades)
+        # (two concurrent trades would collide). Persisted across restarts.
+        self.trade_seq=0
         # Founding-100 grant counter: how many full 100-DAIL starter grants
         # have been issued. Persists across restarts; bootstrapped on first
         # run from the existing non-staff agent count.
@@ -939,6 +971,8 @@ class AgentWorld:
             self.store.kv_set("notif_ack", self.notif_ack)
             self.store.kv_set("profiles", self.profiles)
             self.store.kv_set("trades", self.trades)
+            self.store.kv_set("trade_seq", self.trade_seq)
+            self.store.kv_set("msg_seq", self.social.msg_seq)
             self.store.kv_set("full_grants_given", self.full_grants_given)
             self.store.kv_set("webhooks", self.webhooks)
             self.store.kv_set("msg_idem", self.social.msg_idem)
@@ -1782,12 +1816,16 @@ class AgentWorld:
             self.ledger.transfer(seller_id, "dail:treasury", fee, kind="trade_fee",
                                  idem=f"{idem}:fee" if idem else None)
         self._sync_balance(buyer_id, seller_id)
-        tid=f"trade_{len(self.trades)+1:04d}"
-        self.trades[tid]={"id":tid,"seller_id":seller_id,"buyer_id":buyer_id,
-                          "amount":amount,"fee":fee,"seller_net":amount-fee,
-                          "item":item,"status":"settled","transaction_id":tx.id}
-        if idem:
-            self.trade_idem[idem] = tid
+        # Monotonic trade IDs under the lock: len(trades) would collide
+        # under concurrency (two threads, same length, one overwrites).
+        with self._mutation_lock:
+            self.trade_seq += 1
+            tid=f"trade_{self.trade_seq:04d}"
+            self.trades[tid]={"id":tid,"seller_id":seller_id,"buyer_id":buyer_id,
+                              "amount":amount,"fee":fee,"seller_net":amount-fee,
+                              "item":item,"status":"settled","transaction_id":tx.id}
+            if idem:
+                self.trade_idem[idem] = tid
         self._save_kv()
         self.audit.append("trade.settled", self.trades[tid])
         self._maybe_pay_referral(seller_id)
@@ -2227,6 +2265,7 @@ class AgentWorld:
                         b["hunter_id"] = None
                         b["claimed_at"] = None
                         b["submission"] = None
+                        b.pop("settle_failed", None)
                         # Fresh window for the snipers: otherwise the reopened
                         # bounty would instantly re-expire on the next sweep.
                         b["expires_at"] = (now + timedelta(
@@ -2431,6 +2470,9 @@ class AgentWorld:
                              kind="escrow_release", idem=f"bounty-release:{bounty_id}")
         self._sync_balance(hunter_id)
         b["status"]="completed"; b["completed_at"]=datetime.now(timezone.utc).isoformat()
+        # Clear any prior settlement-failure flag: the escrow is now released,
+        # so the admin reconciliation endpoint must not keep listing it.
+        b.pop("settle_failed", None)
         b["fee"]=fee; b["auto_accepted"]=auto
         self._notify(hunter_id,
             {"type":"bounty_accepted","bounty_id":bounty_id,
@@ -2489,13 +2531,16 @@ class AgentWorld:
         return b
 
     def cancel_bounty(self, poster_id, bounty_id):
-        b=self._get_bounty(bounty_id)
-        if b["poster_id"]!=poster_id: raise PermissionError("not your bounty")
-        if b["status"]!="open": raise ValueError("only open bounties can be cancelled")
-        self.ledger.transfer(f"escrow:{bounty_id}", poster_id, b["reward"],
-                             kind="escrow_refund", idem=f"bounty-refund:{bounty_id}")
-        self._sync_balance(poster_id)
-        b["status"]="cancelled"
+        # Atomic with claim_bounty: both hold _mutation_lock, so a cancel
+        # racing a claim can't silently overwrite it (or strand escrow).
+        with self._mutation_lock:
+            b=self._get_bounty(bounty_id)
+            if b["poster_id"]!=poster_id: raise PermissionError("not your bounty")
+            if b["status"]!="open": raise ValueError("only open bounties can be cancelled")
+            self.ledger.transfer(f"escrow:{bounty_id}", poster_id, b["reward"],
+                                 kind="escrow_refund", idem=f"bounty-refund:{bounty_id}")
+            self._sync_balance(poster_id)
+            b["status"]="cancelled"
         self._save_kv()
         self.audit.append("bounty.cancelled", {"bounty_id":bounty_id})
         return b
