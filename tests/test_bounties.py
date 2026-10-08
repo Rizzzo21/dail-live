@@ -1,5 +1,6 @@
 import sys
 import os
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
 os.environ.pop("DAIL_REAL_PAYMENTS", None)
@@ -609,3 +610,138 @@ def test_lifecycle_v2_migration_grandfathers():
     res = wa.sweep_bounties()
     assert wa.bounties["bnty_old1"]["status"] == "open"
     del wa.bounties["bnty_old1"]; del wa.bounties["bnty_old2"]
+
+
+# ---------------------------------------------------------------------------
+# Regression tests: bug-hunt audit on lifecycle v2 (2026-10-08)
+# ---------------------------------------------------------------------------
+
+def test_accept_requires_submission():
+    # A bare reserve (no work delivered) must NOT release escrow on accept.
+    # Pre-v2 this was structurally impossible (claim required a submission).
+    poster, hunter = _uid("p"), _uid("h")
+    _make(poster); _make(hunter)
+    hb0 = _bal(hunter)
+    bid = client.post("/world/bounties", json={
+        "agent_id": poster, "title": "t", "description": "d", "reward": 20},
+        headers=_auth(poster)).json()["id"]
+    r = client.post(f"/world/bounties/{bid}/claim", json={
+        "agent_id": hunter}, headers=_auth(hunter))
+    assert r.status_code == 200
+    r = client.post(f"/world/bounties/{bid}/accept",
+                    json={"agent_id": poster}, headers=_auth(poster))
+    assert r.status_code == 400, r.text
+    assert _bal(hunter) == hb0  # no payout without work
+    # After the hunter submits, accept works as before.
+    r = client.post(f"/world/bounties/{bid}/submit", json={
+        "agent_id": hunter, "submission": "the work"}, headers=_auth(hunter))
+    assert r.status_code == 200
+    r = client.post(f"/world/bounties/{bid}/accept",
+                    json={"agent_id": poster}, headers=_auth(poster))
+    assert r.status_code == 200 and r.json()["status"] == "completed"
+    assert _bal(hunter) == hb0 + 18  # 20 minus the 10% fee
+
+
+def test_bounty_seq_unique_under_concurrency():
+    # Concurrent posts must never mint duplicate bnty_NNNN ids (record
+    # overwrite + idem-deduped escrow = underfunded bounty).
+    import threading
+    poster = _uid("p")
+    _make(poster)
+    ids, errs = [], []
+    def do_post(i):
+        try:
+            r = client.post("/world/bounties", json={
+                "agent_id": poster, "title": f"t{i}", "description": "d",
+                "reward": 2}, headers=_auth(poster))
+            assert r.status_code == 201, r.text
+            ids.append(r.json()["id"])
+        except Exception as e:  # noqa: BLE001
+            errs.append(str(e))
+    ts = [threading.Thread(target=do_post, args=(i,)) for i in range(20)]
+    for t in ts: t.start()
+    for t in ts: t.join()
+    assert not errs, errs
+    assert len(ids) == 20 and len(set(ids)) == 20
+
+
+def test_extension_cap_resets_on_new_claim():
+    # Hunter A burns the 72h cumulative extension cap, then lapses. Hunter B's
+    # fresh claim must get a full cap, not A's leftovers.
+    from dail.api import dail as _d
+    wa = _d.world_agents
+    poster, ha, hb = _uid("p"), _uid("ha"), _uid("hb")
+    _make(poster); _make(ha); _make(hb)
+    bid = client.post("/world/bounties", json={
+        "agent_id": poster, "title": "t", "description": "d", "reward": 20},
+        headers=_auth(poster)).json()["id"]
+    client.post(f"/world/bounties/{bid}/claim", json={"agent_id": ha},
+                headers=_auth(ha))
+    client.post(f"/world/bounties/{bid}/request-extension",
+                json={"agent_id": ha, "reason": "need time", "extra_hours": 72},
+                headers=_auth(ha))
+    r = client.post(f"/world/bounties/{bid}/extension/approve",
+                    json={"agent_id": poster}, headers=_auth(poster))
+    assert r.status_code == 200
+    # Force A's claim to lapse.
+    wa.bounties[bid]["stall_deadline"] = (
+        datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat()
+    wa.sweep_bounties()
+    assert wa.bounties[bid]["status"] == "open"
+    # Hunter B claims and gets a full extension cap.
+    r = client.post(f"/world/bounties/{bid}/claim", json={"agent_id": hb},
+                    headers=_auth(hb))
+    assert r.status_code == 200
+    assert wa.bounties[bid]["extension_hours_used"] == 0
+    client.post(f"/world/bounties/{bid}/request-extension",
+                json={"agent_id": hb, "reason": "need time", "extra_hours": 10},
+                headers=_auth(hb))
+    r = client.post(f"/world/bounties/{bid}/extension/approve",
+                    json={"agent_id": poster}, headers=_auth(poster))
+    assert r.status_code == 200, r.text
+
+
+def test_auto_accept_measured_from_submission():
+    # The 7-day review SLA runs from submission, not claim: a hunter who
+    # submits late must not shorten the poster's review window.
+    from dail.api import dail as _d
+    wa = _d.world_agents
+    poster, hunter = _uid("p"), _uid("h")
+    _make(poster); _make(hunter)
+    bid = client.post("/world/bounties", json={
+        "agent_id": poster, "title": "t", "description": "d", "reward": 20},
+        headers=_auth(poster)).json()["id"]
+    client.post(f"/world/bounties/{bid}/claim", json={"agent_id": hunter},
+                headers=_auth(hunter))
+    b = wa.bounties[bid]
+    b["claimed_at"] = (datetime.now(timezone.utc) - timedelta(days=8)).isoformat()
+    b["submitted_at"] = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
+    b["submission"] = "late work"
+    b["review_deadline"] = (datetime.now(timezone.utc) + timedelta(hours=71)).isoformat()
+    wa.sweep_bounties()
+    # Submitted 1h ago: must still be awaiting review, not auto-accepted.
+    assert wa.bounties[bid]["status"] == "claimed"
+    # And it DOES auto-accept 7 days after submission.
+    b["submitted_at"] = (datetime.now(timezone.utc) - timedelta(days=8)).isoformat()
+    wa.sweep_bounties()
+    assert wa.bounties[bid]["status"] == "completed"
+
+
+def test_release_claim_clears_settle_failed():
+    # A stale settlement-failure flag must not linger on a reopened bounty and
+    # pollute the admin reconciliation endpoint.
+    from dail.api import dail as _d
+    wa = _d.world_agents
+    poster, hunter = _uid("p"), _uid("h")
+    _make(poster); _make(hunter)
+    bid = client.post("/world/bounties", json={
+        "agent_id": poster, "title": "t", "description": "d", "reward": 20},
+        headers=_auth(poster)).json()["id"]
+    client.post(f"/world/bounties/{bid}/claim",
+                json={"agent_id": hunter, "submission": "work"},
+                headers=_auth(hunter))
+    wa.bounties[bid]["settle_failed"] = {"error": "x", "at": "y"}
+    r = client.post(f"/world/bounties/{bid}/release",
+                    json={"agent_id": hunter}, headers=_auth(hunter))
+    assert r.status_code == 200
+    assert wa.bounties[bid].get("settle_failed") is None

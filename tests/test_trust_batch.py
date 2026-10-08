@@ -48,7 +48,10 @@ def test_claim_review_sla_auto_accepts():
     client.post(f"/world/bounties/{bid}/claim", json={
         "agent_id": h, "submission": "work"}, headers=_auth(h))
     b = d.world_agents.bounties[bid]
+    # Atomic claim+submit: both clocks start together. Backdate both so the
+    # 7-day review SLA (measured from submission) has lapsed.
     b["claimed_at"] = (datetime.now(timezone.utc) - timedelta(days=8)).isoformat()
+    b["submitted_at"] = b["claimed_at"]
     bal0 = d.ledger.balances[h]
     client.get("/world/bounties")  # sweep runs on read
     assert b["status"] == "completed"

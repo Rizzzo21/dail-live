@@ -2174,8 +2174,14 @@ class AgentWorld:
         try: reward=int(reward)
         except (TypeError, ValueError): raise ValueError("reward must be an integer")
         if reward < self.BOUNTY_MIN_REWARD: raise ValueError(f"reward must be >= {self.BOUNTY_MIN_REWARD} DAIL")
-        self.bounty_seq+=1
-        bid=f"bnty_{self.bounty_seq:04d}"
+        # Bounty IDs must be unique even under concurrent posts: the increment
+        # and the read happen atomically under the mutation lock, otherwise
+        # two threads can mint the same bnty_NNNN -- one record overwrites
+        # the other and its escrow transfer is idem-deduped away (underfunded
+        # bounty, stranded escrow).
+        with self._mutation_lock:
+            self.bounty_seq+=1
+            bid=f"bnty_{self.bounty_seq:04d}"
         now=datetime.now(timezone.utc).isoformat()
         # Escrow first: no bounty without a funded reward.
         self.ledger.transfer(agent_id, f"escrow:{bid}", reward,
@@ -2392,10 +2398,15 @@ class AgentWorld:
                             paused += 1
                         continue
                 # 7-day review SLA: submitted work the poster never reviewed
-                # auto-accepts. The hunter earned it.
+                # auto-accepts. The hunter earned it. Measured from SUBMISSION,
+                # not claim: a hunter who submits late in the work window must
+                # not shorten the poster's review time (with max extensions a
+                # claim can be 4 days old at submit; the poster still gets the
+                # full 7 days to review).
                 if b.get("submitted_at"):
                     try:
-                        if datetime.fromisoformat(b["claimed_at"]) + CLAIM_REVIEW_SLA <= now:
+                        review_base = b.get("submitted_at") or b["claimed_at"]
+                        if datetime.fromisoformat(review_base) + CLAIM_REVIEW_SLA <= now:
                             try:
                                 self._settle_bounty(b, auto=True)
                             except Exception as e:
@@ -2492,6 +2503,10 @@ class AgentWorld:
         b["stall_deadline"]=None
         b["work_deadline"]=None
         b["extension_request"]=None
+        # A released claim is gone: a stale settlement-failure flag would
+        # otherwise linger on an open bounty and pollute the admin
+        # reconciliation endpoint.
+        b.pop("settle_failed", None)
         self._save_kv()
         self._notify(b["poster_id"], 
             {"type":"claim_released","bounty_id":bounty_id,
@@ -2557,6 +2572,9 @@ class AgentWorld:
             b["claimed_at"]=now.isoformat()
             b["work_deadline"]=(now+timedelta(hours=b.get("work_window_hours") or 24)).isoformat()
             b["extension_request"]=None
+            # A new claim is a new hunter: the cumulative extension cap must
+            # not inherit the previous hunter's used hours.
+            b["extension_hours_used"]=0
             b["failed_claims"]=b.get("failed_claims", 0)
             if submission:
                 # Atomic claim+submit.
@@ -2729,6 +2747,10 @@ class AgentWorld:
         b=self._get_bounty(bounty_id)
         if b["poster_id"]!=poster_id: raise PermissionError("not your bounty")
         if b["status"]!="claimed": raise ValueError("bounty has no claim to accept")
+        # Lifecycle v2: a claim may be a bare reserve with no work delivered.
+        # Never release escrow without a submission (pre-v2 this was
+        # structurally impossible -- claim required a submission).
+        if not b.get("submitted_at"): raise ValueError("bounty has no submission to accept")
         return self._settle_bounty(b, auto=False)
 
     def _settle_bounty(self, b, auto=False):
