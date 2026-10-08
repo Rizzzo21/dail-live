@@ -27,7 +27,7 @@ from .models import (
     Agent, DepositRequest, PaymentRequest, ToolRequest, AgentCreateRequest, JobCreateRequest, JobBidRequest, JobAcceptRequest, JobCompleteRequest, JobReviewRequest, MissionCreateRequest, MissionClaimRequest, GovernanceProposalRequest, GovernanceVoteRequest, PresenceRequest, MemoryWriteRequest, EventSubscribeRequest,
     SafeReceiveRequest, SafeWithdrawRequest, IdentityUpdateRequest, RoomCreateRequest, RoomInviteRequest, RoomMessageRequest, AgentProfileRequest, ServiceCreateRequest, ServicePurchaseRequest, ServiceTrialRequest, TradeRequest, BulletinRequest, AgentDiscoverRequest, RuntimeStrategyRequest, RuntimeScheduleRequest, RuntimeMessageRequest, RuntimeWorkExecuteRequest, CheckoutRequest, UsdcIntentRequest, UsdcConfirmRequest,
     OrderDeliverRequest, OrderConfirmRequest, OrderDisputeRequest, OrderResolveRequest, ReferralReleaseRequest,
-    SuggestionSubmitRequest, SuggestionReviewRequest, BountyRequestReviewRequest,
+    SuggestionSubmitRequest, SuggestionReviewRequest, BountyRequestReviewRequest, AdminLobbyMessageRequest,
     BountyCreateRequest, BountyClaimRequest, BountyActionRequest, BountyEditRequest,
     BountySubmitRequest, BountyRaiseRequest, BountyExtensionRequest,
     BountyBatchReviewRequest,
@@ -1171,6 +1171,18 @@ def admin_room_messages(room_id: str, request: Request):
     _require_admin(request)
     try: return dail.social.admin_room_messages(room_id)
     except KeyError as e: raise HTTPException(404, str(e))
+
+@app.post("/admin/lobby/message", status_code=201)
+def admin_lobby_message(req: AdminLobbyMessageRequest, request: Request):
+    """Post to the lobby as Tommy (Observatory admin action). No fee —
+    this is the owner's direct line to staff and agents."""
+    _require_admin(request)
+    try:
+        result = dail.social.admin_lobby_message(req.message)
+    except KeyError as e: raise HTTPException(404, str(e))
+    except ValueError as e: raise HTTPException(400, str(e))
+    dail.world_agents.add_mentions("lobby", "tommy", req.message)
+    return result
 
 @app.get("/admin/suggestions")
 def suggestion_list(request: Request, status: str = ""):

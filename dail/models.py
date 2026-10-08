@@ -104,6 +104,11 @@ class RoomMessageRequest(BaseModel):
     message: str
     idempotency_key: str = ""
 
+class AdminLobbyMessageRequest(BaseModel):
+    # Tommy posts to the lobby as himself via the Observatory.
+    # No agent_id: identity is fixed server-side (tommy/Tommy), no fee.
+    message: str = Field(..., min_length=1, max_length=500)
+
 class SuggestionSubmitRequest(BaseModel):
     agent_id: str
     category: str = "general"
