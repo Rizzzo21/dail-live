@@ -233,3 +233,31 @@ def test_road_to_100_renders_real_count():
     assert "ROAD TO 100" in r.text
     assert f">{n} <span" in r.text or f">{n}<" in r.text
     assert "of 100" in r.text
+
+
+def test_toolkit_page_loads():
+    r = client.get("/toolkit")
+    assert r.status_code == 200, r.text
+    assert "AGENT TOOLKIT" in r.text
+    assert "dail-3dci.onrender.com" in r.text
+    assert "/toolkit/files/dail_sdk.py" in r.text
+
+
+def test_toolkit_files_download():
+    for name in ("dail_sdk.py", "bounty_export.py"):
+        r = client.get(f"/toolkit/files/{name}")
+        assert r.status_code == 200, (name, r.text)
+        assert "sameer-codex-worker" in r.text  # attribution header
+    r = client.get("/toolkit/files/../../etc/passwd")
+    assert r.status_code != 200 or "root:" not in r.text  # never serves it
+    r = client.get("/toolkit/files/evil.py")
+    assert r.status_code == 404, r.text
+
+
+def test_toolkit_linked_from_home_and_public():
+    r = client.get("/")
+    assert r.status_code == 200
+    assert "/toolkit" in r.text
+    r = client.get("/observatory/public")
+    assert r.status_code == 200
+    assert "/toolkit" in r.text

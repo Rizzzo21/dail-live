@@ -116,6 +116,12 @@ class PettyPayRequest(BaseModel):
     amount: int = Field(..., ge=1, le=100)
     task: str = Field(..., min_length=10, max_length=500)
 
+class PettyCommissionRequest(BaseModel):
+    # DAiL Concierge opens a commission: funds held until work is done.
+    agent_id: str
+    amount: int = Field(..., ge=1, le=100)
+    task: str = Field(..., min_length=10, max_length=500)
+
 class SuggestionSubmitRequest(BaseModel):
     agent_id: str
     category: str = "general"

@@ -19,7 +19,7 @@ Authentication:
 """
 from fastapi import FastAPI, HTTPException, Header, Request
 from pydantic import BaseModel
-from fastapi.responses import HTMLResponse, Response, PlainTextResponse, JSONResponse
+from fastapi.responses import HTMLResponse, Response, PlainTextResponse, JSONResponse, FileResponse
 import os, hmac, json, html, ipaddress
 from datetime import datetime, timezone
 from pathlib import Path
@@ -33,7 +33,7 @@ from .models import (
     BountyBatchReviewRequest,
     WebhookRegisterRequest, ServiceEditRequest,
     BanRequest, TreasuryLoanDisburseRequest, TreasuryLoanRepayRequest,
-    VaultMintRequest, VaultDisburseRequest, PettyPayRequest,
+    VaultMintRequest, VaultDisburseRequest, PettyPayRequest, PettyCommissionRequest,
     X402TopupRequest,
 )
 from .service import Dail
@@ -86,8 +86,10 @@ _PUBLIC_GET = {
     "/observatory/public", "/observatory/public/data",
     "/bring-your-agent", "/request-bounty", "/status", "/status/data",
     "/vault/status",
+    "/toolkit",
 }
-_PUBLIC_GET_PREFIXES = ("/world/profile/", "/passport/", "/receipts/")  # public reads
+_PUBLIC_GET_PREFIXES = ("/world/profile/", "/passport/", "/receipts/",
+                        "/toolkit/files/")  # public reads
 # Handlers that carry their own auth (Stripe signature / withdrawal capability):
 _CUSTOM_AUTH = {("POST", "/payments/webhook"), ("POST", "/safe/withdraw")}
 # Admin-only:
@@ -534,6 +536,26 @@ def bring_your_agent():
                      ("DAIL IN THE WILD", s["external_dail"])])
     with open("dail/bring_your_agent.html", "r", encoding="utf-8") as f:
         return f.read().replace("<!--SSR_STATS-->", stats)
+
+
+@app.get("/toolkit", response_class=HTMLResponse, include_in_schema=False)
+def toolkit():
+    # Public resource hub for agents: community SDKs, scripts, MCP adapter,
+    # API surface, quickstart essentials. Real artifacts only.
+    with open("dail/toolkit.html", "r", encoding="utf-8") as f:
+        return f.read()
+
+
+@app.get("/toolkit/files/{name}", include_in_schema=False)
+def toolkit_file(name: str):
+    # Downloadable community tools. Whitelist — no path traversal.
+    allowed = {"dail_sdk.py": "toolkit/dail_sdk.py",
+               "bounty_export.py": "toolkit/bounty_export.py"}
+    path = allowed.get(name)
+    if path is None:
+        raise HTTPException(404, "no such toolkit file")
+    return FileResponse(path, media_type="text/x-python",
+                        filename=name)
 
 
 @app.get("/observatory/public", response_class=HTMLResponse, include_in_schema=False)
@@ -1580,6 +1602,48 @@ def admin_petty_pay(req: PettyPayRequest, request: Request):
         return {"tx": tx.id, "to": tx.to_account, "amount": tx.amount,
                 "task": tx.memo,
                 "petty_balance": dail.petty_status()["balance"]}
+    except KeyError as e:
+        raise HTTPException(404, str(e))
+    except LedgerError as e:
+        raise HTTPException(400, str(e))
+
+@app.post("/admin/petty/commission", status_code=201)
+def admin_petty_commission_open(req: PettyCommissionRequest, request: Request):
+    """Admin-only: open a commission — funds move petty -> hold; the agent
+    is paid only when the commission is completed."""
+    _require_admin(request)
+    try:
+        rec = dail.petty_commission_open(req.agent_id, req.amount, req.task)
+        return {"commission": rec,
+                "petty_available": dail.petty_status()["available_balance"]}
+    except KeyError as e:
+        raise HTTPException(404, str(e))
+    except LedgerError as e:
+        raise HTTPException(400, str(e))
+
+
+@app.post("/admin/petty/commission/{cid}/complete", status_code=200)
+def admin_petty_commission_complete(cid: str, request: Request):
+    """Admin-only: release held commission funds to the agent."""
+    _require_admin(request)
+    try:
+        rec = dail.petty_commission_complete(cid)
+        return {"commission": rec,
+                "petty_available": dail.petty_status()["available_balance"]}
+    except KeyError as e:
+        raise HTTPException(404, str(e))
+    except LedgerError as e:
+        raise HTTPException(400, str(e))
+
+
+@app.post("/admin/petty/commission/{cid}/cancel", status_code=200)
+def admin_petty_commission_cancel(cid: str, request: Request):
+    """Admin-only: cancel a commission — held funds return to the pot."""
+    _require_admin(request)
+    try:
+        rec = dail.petty_commission_cancel(cid)
+        return {"commission": rec,
+                "petty_available": dail.petty_status()["available_balance"]}
     except KeyError as e:
         raise HTTPException(404, str(e))
     except LedgerError as e:

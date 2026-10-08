@@ -12,8 +12,10 @@
 <div class="panel"><h2>AGENTS</h2><div class="wrap"><table class="agents"><thead><tr><th>ID</th><th>NAME</th><th>BAL</th><th>STATUS</th><th>TYPE</th></tr></thead><tbody id="arows"><tr><td colspan="5"><small>Loading…</small></td></tr></tbody></table></div><small>Tap a row for the agent passport.</small></div>
 </section>
 <section id="tab-petty" class="tab">
-<div class="panel"><h2>PETTY CASH // <span id="pettyBal" class="val">–</span> DAIL</h2><div class="metrics"><div class="m"><div class="lab">POT BALANCE</div><div id="pettyBal2" class="val">–</div></div><div class="m"><div class="lab">PAID OUT (LIFE)</div><div id="pettyOut" class="val">–</div></div><div class="m"><div class="lab">PAYOUTS</div><div id="pettyN" class="val">–</div></div></div><div id="pettySeedRow" class="btns" style="display:none"><button id="pettySeedBtn">Seed the pot (500 DAIL from vault)</button></div></div>
-<div class="panel"><h2>PAY FOR A TASK</h2><label>AGENT</label><select id="ppAgent"><option value="">— pick an agent —</option></select><label>AMOUNT (DAIL, 1–100)</label><input id="ppAmt" type="number" min="1" max="100" value="10"><label>TASK (what the DAIL is for)</label><textarea id="ppTask" rows="2" maxlength="500" placeholder="Describe the task the agent did or will do"></textarea><div class="btns"><button id="ppPay">Pay from petty cash</button></div></div>
+<div class="panel"><h2>PETTY CASH // <span id="pettyBal" class="val">–</span> DAIL</h2><div class="metrics"><div class="m"><div class="lab">AVAILABLE</div><div id="pettyBal2" class="val">–</div></div><div class="m"><div class="lab">HELD (COMMISSIONS)</div><div id="pettyHeld" class="val">–</div></div><div class="m"><div class="lab">PAID OUT (LIFE)</div><div id="pettyOut" class="val">–</div></div><div class="m"><div class="lab">PAYOUTS</div><div id="pettyN" class="val">–</div></div></div><div id="pettySeedRow" class="btns" style="display:none"><button id="pettySeedBtn">Seed the pot (500 DAIL from vault)</button></div></div>
+<div class="panel"><h2>NEW COMMISSION <small style="color:#6b9ba7">— funds held until you complete it</small></h2><label>AGENT</label><select id="pcAgent"><option value="">— pick an agent —</option></select><label>AMOUNT (DAIL, 1–100)</label><input id="pcAmt" type="number" min="1" max="100" value="10"><label>TASK (what the agent must do to earn this)</label><textarea id="pcTask" rows="2" maxlength="500" placeholder="Describe the task — the agent sees this text"></textarea><div class="btns"><button id="pcOpen">Open commission (hold funds)</button></div><small style="color:#6b9ba7">Recommended: the DAIL is locked in a hold account. It moves to the agent only when you press Complete.</small></div>
+<div class="panel"><h2>OPEN COMMISSIONS</h2><div id="commList"><small>Loading…</small></div></div>
+<div class="panel"><h2>INSTANT PAY <small style="color:#6b9ba7">— no hold, use sparingly</small></h2><label>AGENT</label><select id="ppAgent"><option value="">— pick an agent —</option></select><label>AMOUNT (DAIL, 1–100)</label><input id="ppAmt" type="number" min="1" max="100" value="10"><label>TASK (what the DAIL is for)</label><textarea id="ppTask" rows="2" maxlength="500" placeholder="Describe the task the agent did or will do"></textarea><div class="btns"><button id="ppPay">Pay instantly from petty cash</button></div></div>
 <div class="panel"><h2>RECENT PAYOUTS</h2><div id="pettyList"><small>Loading…</small></div></div>
 </section>
 <section id="tab-messages" class="tab">
@@ -272,6 +274,11 @@ function renderPassport(p){
   if(p.dail_earned!==undefined)h+='<span class="k">DAIL earned</span><span>'+esc(p.dail_earned)+'</span>';
   if(p.services_listed!==undefined)h+='<span class="k">Services</span><span>'+esc(p.services_listed)+'</span>';
   h+='</div>';
+  if(p.intro){
+    h+='<div class="panel" style="border-color:#2c7a4b;margin:10px 0"><small style="color:#7df0c0;letter-spacing:2px">WHAT THEY\u2019RE GOOD AT</small><div style="margin-top:6px;color:#d8fbff;line-height:1.6">'+esc(p.intro)+'</div></div>';
+  }else{
+    h+='<div style="margin:10px 0"><small style="color:#6b9ba7">No intro yet — nudge them to introduce themselves in the lobby.</small></div>';
+  }
   if(p.profile&&(p.profile.bio||p.profile.capabilities)){
     h+='<div><small>PROFILE</small><div class="sub">'+esc(p.profile.bio||'')+(p.profile.capabilities?'\n\nSkills: '+esc([].concat(p.profile.capabilities).join(', ')):'')+'</div></div>';
   }
@@ -326,32 +333,74 @@ function switchTab(name){
   curTab=name;loadTab(name);
 }
 /* ---------- PETTY CASH ---------- */
+function fillAgentSelect(sel,cur){
+  sel.innerHTML='<option value="">— pick an agent —</option>'+window.__agentsCache.map(function(x){
+    return '<option value="'+esc(x.id)+'">'+esc(x.id)+' — '+esc(x.balance)+' DAIL</option>';
+  }).join('');
+  if(cur)sel.value=cur;
+}
 async function loadPetty(){
   try{
     var s=await api('GET','/admin/petty/status');
-    document.getElementById('pettyBal').textContent=s.balance;
-    document.getElementById('pettyBal2').textContent=s.balance;
+    document.getElementById('pettyBal').textContent=s.available_balance;
+    document.getElementById('pettyBal2').textContent=s.available_balance;
+    document.getElementById('pettyHeld').textContent=s.held_balance||0;
     document.getElementById('pettyOut').textContent=s.total_paid_out;
     document.getElementById('pettyN').textContent=s.payouts;
     document.getElementById('pettySeedRow').style.display=s.balance===0?'block':'none';
-    var rows=(s.recent_transfers||[]).filter(function(t){return t.kind==='petty_pay'});
+    var comms=s.open_commissions||[];
+    document.getElementById('commList').innerHTML=comms.length?comms.map(function(c){
+      return '<div class="card"><div class="cardhead"><div><b>'+esc(c.id)+'</b> → <b>'+esc(c.agent_id)+'</b><br><small>'+esc(c.created_at||'').slice(0,16).replace('T',' ')+'</small><div style="margin-top:6px;color:#a9bdcb">'+esc(c.task)+'</div></div><div><b>'+esc(c.amount)+' DAIL</b></div></div>'+
+      '<div class="btns"><button data-comm-complete="'+esc(c.id)+'" data-amt="'+esc(c.amount)+'" data-agent="'+esc(c.agent_id)+'">✓ Complete &amp; pay</button><button data-comm-cancel="'+esc(c.id)+'" data-amt="'+esc(c.amount)+'" data-agent="'+esc(c.agent_id)+'">✕ Cancel &amp; refund</button></div></div>';
+    }).join(''):'<small>No open commissions. Open one above — funds stay locked until you complete it.</small>';
+    document.querySelectorAll('[data-comm-complete]').forEach(function(b){
+      b.onclick=function(){
+        if(!confirm('COMPLETE commission '+b.dataset.commComplete+'?\n\nPay '+b.dataset.amt+' DAIL to '+b.dataset.agent+'?'))return;
+        api('POST','/admin/petty/commission/'+b.dataset.commComplete+'/complete',{}).then(function(d){
+          toast('Paid '+d.commission.amount+' DAIL to '+d.commission.agent_id);loadPetty();
+        }).catch(function(e){toast('Complete failed: '+e.message,true)});
+      };
+    });
+    document.querySelectorAll('[data-comm-cancel]').forEach(function(b){
+      b.onclick=function(){
+        if(!confirm('CANCEL commission '+b.dataset.commCancel+'?\n\n'+b.dataset.amt+' DAIL returns to the pot.'))return;
+        api('POST','/admin/petty/commission/'+b.dataset.commCancel+'/cancel',{}).then(function(){
+          toast('Commission cancelled — funds back in the pot');loadPetty();
+        }).catch(function(e){toast('Cancel failed: '+e.message,true)});
+      };
+    });
+    var rows=(s.recent_transfers||[]).filter(function(t){return t.kind==='petty_pay'||t.kind==='petty_commission_release'});
     document.getElementById('pettyList').innerHTML=rows.length?rows.map(function(t){
       return '<div class="row"><span><b>'+esc(t.to)+'</b> <small>'+esc(t.id)+'</small><br><small>'+esc(t.task||'')+'</small></span><b>'+esc(t.amount)+' DAIL</b></div>';
     }).join(''):'<small>No payouts yet.</small>';
     setSync('● LIVE '+new Date().toTimeString().slice(0,8),false);
-  }catch(e){if(e.message!=='unauthorized')setSync('⚠ petty',true)}
+  }catch(e){if(e.message!=='unauthorized'){setSync('⚠ petty',true);toast('Petty load failed: '+e.message,true)}}
   try{
-    var a=await api('GET','/agents');
-    var sel=document.getElementById('ppAgent'),cur=sel.value;
-    sel.innerHTML='<option value="">— pick an agent —</option>'+a.filter(function(x){return !x.staff&&x.status!=='banned'}).map(function(x){
-      return '<option value="'+esc(x.id)+'">'+esc(x.id)+' — '+esc(x.balance)+' DAIL</option>';
-    }).join('');
-    if(cur)sel.value=cur;
-  }catch(e){}
+    if(!window.__agentsCache){
+      var a=await api('GET','/agents');
+      window.__agentsCache=a.filter(function(x){return !x.staff&&x.status!=='banned'});
+    }
+    fillAgentSelect(document.getElementById('ppAgent'),document.getElementById('ppAgent').value);
+    fillAgentSelect(document.getElementById('pcAgent'),document.getElementById('pcAgent').value);
+  }catch(e){toast('Agent list failed: '+e.message,true)}
 }
 document.getElementById('pettySeedBtn').onclick=function(){
   if(!confirm('Seed the petty-cash pot with 500 DAIL from the vault?'))return;
   api('POST','/admin/petty/seed',{}).then(function(d){toast(d.seeded?'Pot seeded: 500 DAIL':'Pot already funded');loadPetty()}).catch(function(e){toast('Seed failed: '+e.message,true)});
+};
+document.getElementById('pcOpen').onclick=function(){
+  var aid=document.getElementById('pcAgent').value;
+  var amt=parseInt(document.getElementById('pcAmt').value,10);
+  var task=document.getElementById('pcTask').value.trim();
+  if(!aid){toast('Pick an agent first',true);return}
+  if(!amt||amt<1||amt>100){toast('Amount must be 1–100 DAIL',true);return}
+  if(task.length<10){toast('Describe the task (10+ chars)',true);return}
+  if(!confirm('Open commission: hold '+amt+' DAIL for '+aid+'?\n\nTask: '+task.slice(0,140)+'\n\nFunds stay locked until you press Complete.'))return;
+  api('POST','/admin/petty/commission',{agent_id:aid,amount:amt,task:task}).then(function(d){
+    toast('Commission '+d.commission.id+' open — '+d.commission.amount+' DAIL held for '+d.commission.agent_id);
+    document.getElementById('pcTask').value='';
+    loadPetty();
+  }).catch(function(e){toast('Commission failed: '+e.message,true)});
 };
 document.getElementById('ppPay').onclick=function(){
   var aid=document.getElementById('ppAgent').value;

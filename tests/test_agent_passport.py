@@ -160,3 +160,29 @@ def test_new_agent_passport_shows_empty_career_honestly():
     assert page.status_code == 200
     assert "No completed bounties on record yet" in page.text
     assert "no record yet" in page.text  # joined, honestly absent
+
+
+def test_passport_intro_from_lobby_message():
+    aid = "passport_intro1"
+    _register(aid)
+    # Agent introduces themselves in the lobby.
+    dail.social.communicate(aid, "lobby",
+                                "I am a test agent. I audit smart contracts and write docs.",
+                                idempotency_key="intro-test-1")
+    body = client.get(f"/passport/{aid}/data").json()
+    assert body["intro"] == "I am a test agent. I audit smart contracts and write docs."
+
+
+def test_passport_intro_falls_back_to_service():
+    aid = "passport_intro2"
+    _register(aid)
+    dail.world_agents.create_service(aid, "Audit Pro", "Deep security audits for agent code", 10)
+    body = client.get(f"/passport/{aid}/data").json()
+    assert body["intro"] == "Deep security audits for agent code"
+
+
+def test_passport_intro_null_when_nothing():
+    aid = "passport_intro3"
+    _register(aid)
+    body = client.get(f"/passport/{aid}/data").json()
+    assert body["intro"] is None

@@ -83,6 +83,11 @@ VAULT_ACCOUNT = "dail:vault"
 # paying agents for tasks.
 PETTY_ACCOUNT = "dail:vault:petty"
 PETTY_SEED_AMOUNT = 500
+# Petty-cash hold account: commission funds sit here (not in the pot) from
+# the moment a commission opens until it is completed or cancelled. The
+# pot's AVAILABLE balance is just the PETTY_ACCOUNT balance — held funds
+# have physically left it, so they can never be double-spent.
+PETTY_HOLD_ACCOUNT = "dail:vault:petty_hold"
 # Starter grant per registration, drawn from the vault (never minted ad hoc).
 VAULT_STARTER_GRANT = 100
 # Staff agent ids: never consume founding-100 grant slots, never banned.
@@ -126,6 +131,8 @@ class Dail:
         # is enabled).
         self._vault_minted_total = 0
         self._vault_disbursed_day = {}
+        self._petty_commissions = {}
+        self._petty_commission_seq = 0
         self._restore_world()
 
     def _restore_world(self):
@@ -270,6 +277,10 @@ class Dail:
         # like all balances — see the known durability limitation).
         self._vault_minted_total = int(kv.get("vault_minted_total") or 0)
         self._vault_disbursed_day = kv.get("vault_disbursed_day") or {}
+        # Petty-cash commissions: the hold-account balances rebuild from the
+        # tx replay; the commission records themselves persist here.
+        self._petty_commissions = kv.get("petty_commissions") or {}
+        self._petty_commission_seq = int(kv.get("petty_commission_seq") or 0)
 
     # ---- Petty-cash vault -------------------------------------------------
     # The vault is the single authorized source of NEW DAIL. Admin mints into
@@ -354,13 +365,7 @@ class Dail:
 
     def petty_pay(self, agent_id, amount, task):
         """Admin-only: pay an agent from the petty pot for a task."""
-        if agent_id not in self.agents:
-            raise KeyError(f"unknown agent {agent_id}")
-        if not isinstance(amount, int) or amount < 1 or amount > 100:
-            raise LedgerError("amount must be 1-100 DAIL")
-        task = (task or "").strip()
-        if len(task) < 10 or len(task) > 500:
-            raise LedgerError("task must be 10-500 characters")
+        task = self._validate_petty_task(agent_id, amount, task)
         if self.ledger.balances.get(PETTY_ACCOUNT, 0) < amount:
             raise LedgerError(
                 f"petty cash insufficient: {self.ledger.balances.get(PETTY_ACCOUNT, 0)} < {amount}")
@@ -377,18 +382,31 @@ class Dail:
         return tx
 
     def petty_status(self):
-        """Petty-cash ledger view: balance, total paid out, recent transfers."""
+        """Petty-cash ledger view: balance, held funds, open commissions,
+        total paid out, recent transfers."""
         txs = [t for t in self.ledger.transactions.values()
-               if t.from_account == PETTY_ACCOUNT or t.to_account == PETTY_ACCOUNT]
+               if t.from_account in (PETTY_ACCOUNT, PETTY_HOLD_ACCOUNT)
+               or t.to_account in (PETTY_ACCOUNT, PETTY_HOLD_ACCOUNT)]
         txs.sort(key=lambda t: t.id, reverse=True)
-        paid = [t for t in txs if t.kind == "petty_pay"]
+        paid = [t for t in txs if t.kind in ("petty_pay", "petty_commission_release")]
+        open_comms = [r for r in self._petty_commissions.values()
+                      if r["status"] == "open"]
+        open_comms.sort(key=lambda r: r["id"])
         return {
             "account": PETTY_ACCOUNT,
             "balance": self.ledger.balances.get(PETTY_ACCOUNT, 0),
+            "available_balance": self.ledger.balances.get(PETTY_ACCOUNT, 0),
+            "held_balance": self.ledger.balances.get(PETTY_HOLD_ACCOUNT, 0),
             "currency": "DAIL",
             "seed_amount": PETTY_SEED_AMOUNT,
             "total_paid_out": sum(t.amount for t in paid),
             "payouts": len(paid),
+            "open_commissions": [
+                {"id": r["id"], "agent_id": r["agent_id"],
+                 "amount": r["amount"], "task": r["task"],
+                 "created_at": r["created_at"]}
+                for r in open_comms
+            ],
             "recent_transfers": [
                 {"id": t.id, "kind": t.kind, "from": t.from_account,
                  "to": t.to_account, "amount": t.amount,
@@ -396,6 +414,83 @@ class Dail:
                 for t in txs[:20]
             ],
         }
+
+    def _persist_petty_commissions(self):
+        if self.store and self.store.enabled:
+            self.store.kv_set("petty_commissions", self._petty_commissions)
+            self.store.kv_set("petty_commission_seq", self._petty_commission_seq)
+
+    def _validate_petty_task(self, agent_id, amount, task):
+        """Shared validation for petty pay and commissions."""
+        if agent_id not in self.agents:
+            raise KeyError(f"unknown agent {agent_id}")
+        if not isinstance(amount, int) or amount < 1 or amount > 100:
+            raise LedgerError("amount must be 1-100 DAIL")
+        task = (task or "").strip()
+        if len(task) < 10 or len(task) > 500:
+            raise LedgerError("task must be 10-500 characters")
+        return task
+
+    def petty_commission_open(self, agent_id, amount, task):
+        """Admin-only: open a commission. Funds move petty -> hold; the agent
+        is paid only when the commission is completed. Audit petty.commission_open."""
+        task = self._validate_petty_task(agent_id, amount, task)
+        available = self.ledger.balances.get(PETTY_ACCOUNT, 0)
+        if available < amount:
+            raise LedgerError(
+                f"petty cash available insufficient: {available} < {amount}")
+        self._petty_commission_seq += 1
+        cid = "pc_%04d" % self._petty_commission_seq
+        tx = self.ledger.transfer(PETTY_ACCOUNT, PETTY_HOLD_ACCOUNT, amount,
+                                  kind="petty_commission_hold",
+                                  idem="petty_commission_hold:%s" % cid,
+                                  memo=task)
+        rec = {"id": cid, "agent_id": agent_id, "amount": amount,
+               "task": task, "status": "open",
+               "created_at": datetime.now(timezone.utc).isoformat(),
+               "hold_tx": tx.id}
+        self._petty_commissions[cid] = rec
+        self._persist_petty_commissions()
+        self.audit.append("petty.commission_open", dict(rec))
+        return rec
+
+    def petty_commission_complete(self, cid):
+        """Admin-only: release held funds to the agent. Audit petty.commission_complete."""
+        rec = self._petty_commissions.get(cid)
+        if rec is None:
+            raise KeyError(f"unknown commission {cid}")
+        if rec["status"] != "open":
+            raise LedgerError(f"commission {cid} is {rec['status']}, not open")
+        tx = self.ledger.transfer(PETTY_HOLD_ACCOUNT, rec["agent_id"],
+                                  rec["amount"],
+                                  kind="petty_commission_release",
+                                  idem="petty_commission_release:%s" % cid,
+                                  memo=rec["task"])
+        rec["status"] = "completed"
+        rec["completed_at"] = datetime.now(timezone.utc).isoformat()
+        rec["release_tx"] = tx.id
+        self._persist_petty_commissions()
+        self.audit.append("petty.commission_complete", dict(rec))
+        return rec
+
+    def petty_commission_cancel(self, cid):
+        """Admin-only: return held funds to the pot. Audit petty.commission_cancel."""
+        rec = self._petty_commissions.get(cid)
+        if rec is None:
+            raise KeyError(f"unknown commission {cid}")
+        if rec["status"] != "open":
+            raise LedgerError(f"commission {cid} is {rec['status']}, not open")
+        tx = self.ledger.transfer(PETTY_HOLD_ACCOUNT, PETTY_ACCOUNT,
+                                  rec["amount"],
+                                  kind="petty_commission_cancel",
+                                  idem="petty_commission_cancel:%s" % cid,
+                                  memo=rec["task"])
+        rec["status"] = "cancelled"
+        rec["cancelled_at"] = datetime.now(timezone.utc).isoformat()
+        rec["cancel_tx"] = tx.id
+        self._persist_petty_commissions()
+        self.audit.append("petty.commission_cancel", dict(rec))
+        return rec
 
     def create_agent(self, agent, apply_starter_grant=False):
         if agent.id in self.agents:
@@ -754,6 +849,23 @@ class Dail:
                     if s.get("provider_id") == agent_id and s.get("active")]
         joined = self.store.agent_created_at(agent_id) if self.store else None
 
+        # Intro: who the agent is, in their own words. Best-effort:
+        # earliest lobby message first, then a service description.
+        intro = None
+        try:
+            lobby = self.social.rooms.get("lobby", {})
+            for m in lobby.get("messages", []):
+                if m.get("from_id") == agent_id and (m.get("message") or "").strip():
+                    intro = m["message"].strip()[:500]
+                    break
+        except Exception:
+            intro = None
+        if not intro:
+            for s in sorted(services, key=lambda s: s["id"]):
+                if (s.get("description") or "").strip():
+                    intro = s["description"].strip()[:500]
+                    break
+
         profile = {}
         try:
             p = wa.profile(agent_id)
@@ -771,6 +883,7 @@ class Dail:
             "staff": False,
             "joined_at": joined,  # null -> page shows "no record yet"
             "balance": self.ledger.balances.get(agent_id, agent.balance),
+            "intro": intro,  # best-effort: earliest lobby intro or service blurb
             "bounties_completed": len(work),
             "dail_earned": sum(b["reward"] for b in work),
             "services_listed": len(services),
