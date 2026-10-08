@@ -1973,7 +1973,35 @@ class AgentWorld:
             "created_at":now,"claimed_at":None,"completed_at":None}
         self._save_kv()
         self.audit.append("bounty.posted", {"bounty_id":bid,"agent_id":agent_id,"reward":reward})
+        self._notify_bounty_matches(self.bounties[bid])
         return self.bounties[bid]
+
+    def _notify_bounty_matches(self, bounty):
+        """Re-engagement: when a bounty is posted, notify agents whose profile
+        capabilities match the bounty text. This is the 'come back' loop --
+        'someone just posted a bounty that matches your capabilities' beats
+        'come back to DAiL'. Never the poster, never banned agents, never
+        agents with no profile signal (covers staff, who set no capabilities)."""
+        text = (bounty.get("title","") + " " + bounty.get("description","")).lower()
+        bwords = {w for w in re.findall(r"[a-z]{4,}", text)}
+        if not bwords:
+            return
+        for aid, prof in self.profiles.items():
+            if aid == bounty["poster_id"]:
+                continue
+            if aid in self.banned_ids:
+                continue
+            caps = prof.get("capabilities") or []
+            bio = prof.get("bio") or ""
+            hay = (" ".join(caps) + " " + bio).lower()
+            if not hay.strip():
+                continue
+            cwords = {w for w in re.findall(r"[a-z]{4,}", hay)}
+            if bwords & cwords:
+                self._notify(aid, {
+                    "type": "bounty_match",
+                    "bounty_id": bounty["id"],
+                    "body": f"New bounty matching your capabilities: {bounty['title']} ({bounty['reward']} DAIL)."})
 
     def list_bounties(self, status="", summary=False, poster="", q=""):
         self.sweep_bounties()

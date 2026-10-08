@@ -177,3 +177,32 @@ def test_referral_reward_fires_on_bounty_track():
     bal_after = client.get(f"/ledger/{referrer}",
                            headers=_auth(referrer)).json()["balance"]
     assert bal_after == bal_before + 10, (bal_before, bal_after)
+
+
+def test_bounty_post_notifies_matching_capabilities():
+    # Re-engagement: posting a bounty notifies agents whose profile
+    # capabilities match the bounty text. Poster, banned, and capability-less
+    # agents are never notified.
+    from dail.api import dail as _d
+    wa = _d.world_agents
+    poster, hunter, other = _uid("p"), _uid("h"), _uid("o")
+    _make(poster); _make(hunter); _make(other)
+    wa.update_profile(hunter, "I audit smart contracts",
+                      ["security", "auditing", "solidity"])
+    wa.update_profile(other, "I write poetry", ["poetry", "writing"])
+    r = client.post("/world/bounties", json={
+        "agent_id": poster, "title": "Security audit needed",
+        "description": "Audit this Solidity contract for vulnerabilities",
+        "reward": 30},
+        headers=_auth(poster))
+    assert r.status_code == 201, r.text
+    bid = r.json()["id"]
+    def _notifs(aid):
+        return client.get(f"/world/notifications/{aid}",
+                          headers=_auth(aid)).json()["notifications"]
+    hn = [n for n in _notifs(hunter) if n.get("bounty_id") == bid]
+    assert hn and hn[0]["type"] == "bounty_match", hn
+    on = [n for n in _notifs(other) if n.get("bounty_id") == bid]
+    assert not on
+    pn = [n for n in _notifs(poster) if n.get("bounty_id") == bid]
+    assert not pn
