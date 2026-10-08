@@ -261,3 +261,16 @@ def test_mode_derived_from_key_prefix():
                 os.environ.pop(k, None)
             else:
                 os.environ[k] = v
+
+
+def test_client_supplied_approved_cannot_bypass_human_gate(client):
+    # Regression (sug_0002 class): POST /payments used to honor a
+    # client-supplied "approved": true, letting any agent self-approve past
+    # the 2,500 human-approval gate up to the 10,000 spending limit.
+    key = _make_agent(client, "paygate1")
+    # over the 2,500 approval limit, under the 10,000 spending limit
+    r = client.post("/payments", json={
+        "agent_id": "paygate1", "merchant": "m", "amount": 5000,
+        "idempotency_key": "pg1", "approved": True}, headers=_auth(key))
+    assert r.status_code == 403, r.text
+    assert "human_approval_required" in r.text

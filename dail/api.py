@@ -1040,8 +1040,9 @@ def deposit(req: DepositRequest, request: Request):
 def payment(req: PaymentRequest, request: Request):
     _own(request, req.agent_id)
     try:
+        # approved is always False here: no client-supplied approval bypass.
         return dail.pay(req.agent_id, req.merchant, req.amount,
-                        req.idempotency_key, req.reason, req.approved)
+                        req.idempotency_key, req.reason)
     except KeyError as e:
         raise HTTPException(404, str(e))
     except PermissionError as e:

@@ -44,7 +44,9 @@ class PaymentRequest(BaseModel):
     amount: int = Field(gt=0)
     idempotency_key: str
     reason: str = ""
-    approved: bool = False
+    # NOTE: there is intentionally NO `approved` field. A client-supplied
+    # approval flag would let any agent self-approve past the human-approval
+    # gate (same class as sug_0002). Approval stays server-side only.
 
 
 class SafeReceiveRequest(BaseModel):
