@@ -213,13 +213,14 @@ def test_launch_links_bring_your_agent():
 
 
 def test_spotlight_links_to_passport():
-    # Darwin (or any spotlight agent) must link to their public career page.
+    # Darwin (or any spotlight agent) must open their public career page —
+    # now inline via the passport modal (no new window), driven by data-pp.
     r = client.get("/observatory/public")
     assert r.status_code == 200, r.text
     body = client.get("/observatory/public/data").json()
     p = body.get("spotlight")
     if p:
-        assert f'/passport/{p["agent_id"]}' in r.text
+        assert f'data-pp="{p["agent_id"]}"' in r.text
 
 
 def test_road_to_100_renders_real_count():

@@ -61,7 +61,10 @@ class WorldStore:
                 from_account VARCHAR(255) NOT NULL, to_account VARCHAR(255) NOT NULL,
                 amount INTEGER NOT NULL, idempotency_key VARCHAR(255) UNIQUE NOT NULL,
                 status VARCHAR(32) NOT NULL DEFAULT 'posted',
+                memo TEXT NOT NULL DEFAULT '',
                 created_at VARCHAR(64) NOT NULL)""",
+            # Migration for DBs created before the memo column existed.
+            """ALTER TABLE dail_ledger_tx ADD COLUMN IF NOT EXISTS memo TEXT NOT NULL DEFAULT ''""",
             """CREATE TABLE IF NOT EXISTS dail_orders (
                 order_id VARCHAR(64) PRIMARY KEY, data TEXT NOT NULL,
                 updated_at VARCHAR(64) NOT NULL)""",
@@ -106,12 +109,13 @@ class WorldStore:
             return
         with self._lock, self.engine.begin() as c:
             c.execute(text(
-                """INSERT INTO dail_ledger_tx (txid, kind, from_account, to_account, amount, idempotency_key, status, created_at)
-                   VALUES (:txid, :kind, :frm, :to, :amt, :idem, :status, :now)
+                """INSERT INTO dail_ledger_tx (txid, kind, from_account, to_account, amount, idempotency_key, status, memo, created_at)
+                   VALUES (:txid, :kind, :frm, :to, :amt, :idem, :status, :memo, :now)
                    ON CONFLICT (txid) DO NOTHING"""),
                 {"txid": tx.id, "kind": tx.kind, "frm": tx.from_account,
                  "to": tx.to_account, "amt": tx.amount,
-                 "idem": tx.idempotency_key, "status": tx.status, "now": _now()})
+                 "idem": tx.idempotency_key, "status": tx.status,
+                 "memo": tx.memo or "", "now": _now()})
 
     def recent_ledger_txs(self, limit=60):
         """Newest ledger transactions for the public activity feed.
@@ -225,7 +229,7 @@ class WorldStore:
             agents = c.execute(text(
                 "SELECT id, name, goal, spending_limit, approval_limit, status FROM dail_agents")).fetchall()
             txs = c.execute(text(
-                "SELECT txid, kind, from_account, to_account, amount, idempotency_key, status FROM dail_ledger_tx ORDER BY created_at, txid")).fetchall()
+                "SELECT txid, kind, from_account, to_account, amount, idempotency_key, status, memo FROM dail_ledger_tx ORDER BY created_at, txid")).fetchall()
             orders = c.execute(text("SELECT order_id, data FROM dail_orders")).fetchall()
             services = c.execute(text("SELECT service_id, data FROM dail_services")).fetchall()
             bulletins = c.execute(text("SELECT bulletin_id, data FROM dail_bulletins")).fetchall()

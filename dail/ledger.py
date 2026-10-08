@@ -43,7 +43,8 @@ class Ledger:
         self.audit.append("ledger.credit", tx.model_dump())
         return self._committed(tx)
 
-    def transfer(self, source, destination, amount, kind="payment", idem=None):
+    def transfer(self, source, destination, amount, kind="payment", idem=None,
+                 memo=""):
         if amount <= 0:
             raise LedgerError("amount must be positive")
         idem = self._clean_idem(idem)
@@ -54,7 +55,7 @@ class Ledger:
         txid = f"tx_{len(self.transactions)+1:06d}"
         tx = Transaction(id=txid, kind=kind, from_account=source,
                          to_account=destination, amount=amount,
-                         idempotency_key=idem or txid)
+                         idempotency_key=idem or txid, memo=memo or "")
         self.balances[source] -= amount
         self.balances[destination] += amount
         self.transactions[txid] = tx

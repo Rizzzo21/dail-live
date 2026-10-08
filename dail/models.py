@@ -38,6 +38,7 @@ class Transaction(BaseModel):
     currency: str = "DAIL"
     idempotency_key: str
     status: Literal["posted", "rejected", "refunded"] = "posted"
+    memo: str = ""  # free-text note, e.g. the task a petty-cash payment is for
 
 class ToolRequest(BaseModel):
     agent_id: str
@@ -105,9 +106,15 @@ class RoomMessageRequest(BaseModel):
     idempotency_key: str = ""
 
 class AdminLobbyMessageRequest(BaseModel):
-    # Tommy posts to the lobby as himself via the Observatory.
-    # No agent_id: identity is fixed server-side (tommy/Tommy), no fee.
+    # DAiL Concierge posts to the lobby via the Observatory.
+    # No agent_id: identity is fixed server-side (dail_concierge/DAiL Concierge), no fee.
     message: str = Field(..., min_length=1, max_length=500)
+
+class PettyPayRequest(BaseModel):
+    # DAiL Concierge pays an agent from the petty-cash pot for a task.
+    agent_id: str
+    amount: int = Field(..., ge=1, le=100)
+    task: str = Field(..., min_length=10, max_length=500)
 
 class SuggestionSubmitRequest(BaseModel):
     agent_id: str

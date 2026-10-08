@@ -33,7 +33,7 @@ from .models import (
     BountyBatchReviewRequest,
     WebhookRegisterRequest, ServiceEditRequest,
     BanRequest, TreasuryLoanDisburseRequest, TreasuryLoanRepayRequest,
-    VaultMintRequest, VaultDisburseRequest,
+    VaultMintRequest, VaultDisburseRequest, PettyPayRequest,
     X402TopupRequest,
 )
 from .service import Dail
@@ -579,13 +579,13 @@ def _po_spot(d):
         return ""
     aid = _po_esc(p["agent_id"])
     return (f'<div class="card spot"><h2>PROOF IT WORKS</h2>'
-            f'<div class="big"><a href="/passport/{aid}" style="color:inherit;text-decoration:underline">{_po_esc(p["name"])}</a> '
+            f'<div class="big"><a class="pplink" data-pp="{aid}" style="color:inherit">{_po_esc(p["name"])}</a> '
             f'<span style="color:#5b7183">({aid})</span></div>'
             f'<div>{_po_esc(p["bounties_completed"])} bounties completed · '
             f'{_po_esc(p["dail_earned"])} DAIL earned · receipts verified</div>'
             f'<div style="margin-top:8px;font-size:12px;color:#7a8fa0">'
             f'The first external agent to work in DAiL — real jobs, real payouts, on the ledger. '
-            f'<a href="/passport/{aid}" style="color:#f5b43c">View career passport &rarr;</a></div></div>')
+            f'<a class="pplink" data-pp="{aid}" style="color:#f5b43c">View career passport &rarr;</a></div></div>')
 
 
 def _po_road(d):
@@ -610,7 +610,7 @@ def _po_event(e):
     if e.get("type") == "bounty_completed" and e.get("title"):
         body = (f"<div class=\"x\">"
                 f"<div><b>BOUNTY COMPLETED</b></div>"
-                f"<div>Hunter: {_po_esc(e.get('hunter'))} "
+                f"<div>Hunter: <a class=\"pplink\" data-pp=\"{_po_esc(e.get('hunter_id'))}\">{_po_esc(e.get('hunter'))}</a> "
                 f"<span class=\"t\">({_po_esc(e.get('hunter_id'))})</span></div>"
                 f"<div>Bounty: &ldquo;{_po_esc(e.get('title'))}&rdquo; "
                 f"<span class=\"t\">({_po_esc(e.get('bounty_id'))})</span></div>"
@@ -618,8 +618,10 @@ def _po_event(e):
                 f"<div class=\"v\">&#10003; PAYMENT POSTED &mdash; escrow released to hunter</div>"
                 f"<div class=\"v\">&#10003; LEDGER RECEIPT &mdash; recorded in the persisted ledger</div>"
                 f"<div class=\"v\">&#10003; VERIFIED &mdash; tamper-evident chain intact</div>"
-                f"<div style=\"margin-top:6px\"><a href=\"/receipts/{_po_esc(e.get('bounty_id') or '')}\" style=\"color:#f5b43c;font-size:13px\">Portable signed receipt &rarr;</a>"
-                f" <span class=\"t\">verifiable anywhere, no DAiL account needed</span></div>"
+                f"<div style=\"margin-top:6px\">"
+                f"<button class=\"vbtn\" onclick=\"showReceipt(this,'{_po_esc(e.get('bounty_id') or '')}')\">PORTABLE SIGNED RECEIPT &rarr;</button> "
+                f"<span class=\"t\">verifiable anywhere, no DAiL account needed</span>"
+                f"<div class=\"vout t\"></div></div>"
                 f"<button class=\"vbtn\" onclick=\"verifyReceipt(this)\">VERIFY RECEIPT &rarr;</button>"
                 f"<div class=\"vout t\"></div></div>")
         return f"<div class=\"ev\"><details><summary>{head}</summary>{body}</details></div>"
@@ -645,13 +647,20 @@ def _po_econ(d):
 def _po_bounties(d):
     rows = d.get("bounties") or []
     if not rows:
-        return ("<tr><th>ID</th><th>TITLE</th><th>REWARD</th><th>POSTER</th></tr>"
-                "<tr><td colspan=4>No open bounties right now.</td></tr>")
-    tr = ("<tr><th>ID</th><th>TITLE</th><th>REWARD</th><th>POSTER</th></tr>" + "".join(
-        f"<tr><td>{_po_esc(b['id'])}</td><td>{_po_esc(b['title'])}</td>"
-        f"<td>{_po_esc(b['reward'])} DAIL</td><td>{_po_esc(b['poster'])}</td></tr>"
-        for b in rows))
-    return tr
+        return ('<div class="quiet">No open bounties right now.</div>')
+    out = []
+    for b in rows:
+        desc = _po_esc((b.get("description") or "")[:600])
+        out.append(
+            f'<div class="bcard"><div class="bhead" onclick="this.parentElement.classList.toggle(\'open\')">'
+            f'<div><b>{_po_esc(b["title"])}</b><br>'
+            f'<span class="t">{_po_esc(b["id"])} · by {_po_esc(b["poster"])}</span></div>'
+            f'<div><b style="color:#f5b43c">{_po_esc(b["reward"])} DAIL</b></div></div>'
+            f'<div class="bbody"><div class="pk">WHAT NEEDS DOING</div>'
+            f'<div class="bdesc">{desc or "No description."}</div>'
+            f'<div class="pk">HOW TO CLAIM</div><div>Agents: POST /world/bounties/{_po_esc(b["id"])}/claim — '
+            f'claim reserves the bounty, then submit your work.</div></div></div>')
+    return "".join(out)
 
 
 def _po_services(d):
@@ -1540,6 +1549,41 @@ def vault_disburse(req: VaultDisburseRequest, request: Request):
 def vault_status():
     """Public read-only vault status: balance, minted, cap. Real numbers."""
     return dail.vault_status()
+
+
+@app.post("/admin/petty/seed", status_code=201)
+def admin_petty_seed(request: Request):
+    """Admin-only: seed the petty-cash pot with 500 DAIL from the vault.
+    Idempotent — a no-op if the pot already holds funds. Not a mint:
+    existing vault funds move to the separate petty account."""
+    _require_admin(request)
+    try:
+        return dail.petty_seed()
+    except LedgerError as e:
+        raise HTTPException(400, str(e))
+
+
+@app.get("/admin/petty/status")
+def admin_petty_status(request: Request):
+    """Admin-only: petty-cash ledger view — balance, payouts, recent transfers."""
+    _require_admin(request)
+    return dail.petty_status()
+
+
+@app.post("/admin/petty/pay", status_code=201)
+def admin_petty_pay(req: PettyPayRequest, request: Request):
+    """Admin-only: pay an agent from the petty pot for a task.
+    The task is recorded in the transfer memo and the petty.pay audit."""
+    _require_admin(request)
+    try:
+        tx = dail.petty_pay(req.agent_id, req.amount, req.task)
+        return {"tx": tx.id, "to": tx.to_account, "amount": tx.amount,
+                "task": tx.memo,
+                "petty_balance": dail.petty_status()["balance"]}
+    except KeyError as e:
+        raise HTTPException(404, str(e))
+    except LedgerError as e:
+        raise HTTPException(400, str(e))
 
 @app.get("/admin/payments/incoming")
 def admin_payments_incoming(request: Request):

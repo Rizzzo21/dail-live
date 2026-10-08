@@ -1,4 +1,5 @@
-<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"><title>DAiL // OBSERVATORY</title><style>:root{--c:#67e8ff;--g:#75ffb0;--bg:#02070b;--p:#071820;--l:#123d49;--r:#ff7d7d;--y:#ffd97d}*{box-sizing:border-box}body{margin:0;background:radial-gradient(circle at 50% 0,#12313b,#02070b 58%);color:#d8fbff;font:13px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace;min-height:100vh}header{padding:14px 16px;border-bottom:1px solid var(--l);display:flex;justify-content:space-between;align-items:center;letter-spacing:2px;position:sticky;top:0;background:#02070bee;z-index:50}.brand{color:var(--c);font-size:17px;text-shadow:0 0 14px #38d8ff}.on{color:var(--g);font-size:11px}#tabs{display:flex;gap:6px;padding:10px 12px;border-bottom:1px solid var(--l);position:sticky;top:53px;background:#02070bee;z-index:49;overflow-x:auto}#tabs button{flex:1;min-width:86px;padding:10px 6px;background:transparent;border:1px solid var(--l);border-radius:8px;color:#9ec3cc;font:inherit;font-size:12px;letter-spacing:1px;cursor:pointer}#tabs button.act{background:#0b2a35;color:var(--c);border-color:var(--c);box-shadow:0 0 12px #00d9ff33}main{max-width:900px;margin:auto;padding:12px 12px 90px}.tab{display:none}.tab.act{display:block}.panel{background:#071820dd;border:1px solid var(--l);border-radius:10px;padding:14px;margin-bottom:12px;box-shadow:0 0 30px #00d9ff08,inset 0 0 30px #00d9ff04}h2{font-size:11px;color:var(--c);letter-spacing:2px;margin:0 0 10px}.metrics{display:grid;grid-template-columns:repeat(4,1fr);gap:8px}.m{padding:10px;border:1px solid var(--l);border-radius:6px}.lab{font-size:9px;color:#6b9ba7}.val{font-size:19px;margin-top:5px}.ok{color:var(--g)}.bad{color:var(--r)}.row{display:flex;justify-content:space-between;gap:8px;padding:9px;border:1px solid var(--l);margin:6px 0;border-radius:6px;align-items:center}.row b{color:var(--c)}small{color:#7296a0}.chips{display:flex;gap:6px;overflow-x:auto;padding:4px 0 10px}.chip{white-space:nowrap;padding:7px 12px;border:1px solid var(--l);border-radius:20px;background:transparent;color:#9ec3cc;font:inherit;font-size:12px;cursor:pointer}.chip.act{background:#0b2a35;color:var(--c);border-color:var(--c)}.card{border:1px solid var(--l);border-radius:8px;margin:8px 0;overflow:hidden}.cardhead{padding:11px 12px;cursor:pointer;display:flex;justify-content:space-between;gap:8px;align-items:center}.cardhead:hover{background:#0a212b}.cardbody{display:none;padding:0 12px 12px;border-top:1px solid var(--l)}.card.open .cardbody{display:block}.st{font-size:10px;padding:3px 8px;border-radius:12px;border:1px solid var(--l);white-space:nowrap}.st-open{color:var(--g);border-color:var(--g)}.st-claimed{color:var(--y);border-color:var(--y)}.st-completed{color:var(--c);border-color:var(--c)}.st-paused{color:var(--r);border-color:var(--r)}.st-expired,.st-cancelled{color:#7296a0}.btns{display:flex;gap:6px;flex-wrap:wrap;margin-top:10px}.btns button{padding:9px 14px;border-radius:7px;border:1px solid var(--c);background:#0b2a35;color:var(--c);font:inherit;font-size:12px;cursor:pointer}.btns button.danger{border-color:var(--r);color:var(--r);background:#2b0b0b}.btns button:disabled{opacity:.4;cursor:default}.kv{display:grid;grid-template-columns:auto 1fr;gap:3px 10px;margin:8px 0;font-size:12px}.kv .k{color:#6b9ba7}.sub{white-space:pre-wrap;background:#02070b;border:1px solid var(--l);border-radius:6px;padding:10px;margin:8px 0;max-height:220px;overflow:auto}input,textarea,select{width:100%;background:#02070b;border:1px solid var(--l);border-radius:7px;color:#d8fbff;font:inherit;padding:10px;margin:4px 0 10px}label{font-size:11px;color:#6b9ba7;letter-spacing:1px}#toast{position:fixed;bottom:16px;left:50%;transform:translateX(-50%);z-index:200;background:#071820f5;border:1px solid var(--c);color:#d8fbff;padding:10px 18px;border-radius:8px;font-size:13px;display:none;max-width:92vw;text-align:center}#toast.err{border-color:var(--r)}#keygate{position:fixed;inset:0;background:#0b0b10;display:flex;align-items:center;justify-content:center;z-index:99;padding:20px}#keygate .box{text-align:center;max-width:340px}#keygate input{margin:12px 0}.msg{padding:9px 10px;border-bottom:1px solid #0d2831}.msg .who{color:var(--c);font-size:11px}.msg.tommy .who{color:var(--y)}.msg .when{color:#5a7a85;font-size:10px}#msgbox{display:flex;gap:6px;margin-top:10px}#msgbox input{margin:0}#msgbox button{white-space:nowrap;padding:10px 16px;border-radius:7px;border:1px solid var(--y);background:#2b230b;color:var(--y);font:inherit;cursor:pointer}table.agents{width:100%;border-collapse:collapse;font-size:12px}table.agents th{text-align:left;color:#6b9ba7;font-size:10px;letter-spacing:1px;padding:8px 6px;border-bottom:1px solid var(--l)}table.agents td{padding:9px 6px;border-bottom:1px solid #0d2831}table.agents tr.rowlink{cursor:pointer}table.agents tr.rowlink:hover{background:#0a212b}.wrap{overflow-x:auto}.tl{margin:8px 0;padding-left:4px}.tl div{padding:4px 0 4px 14px;border-left:2px solid var(--l);font-size:12px}.tl div.done{border-color:var(--g)}.tl div small{display:block}@media(max-width:600px){.metrics{grid-template-columns:repeat(2,1fr)}header{letter-spacing:1px}.brand{font-size:15px}}</style></head><body><header><div class="brand">DAiL // OBSERVATORY</div><div class="on" id="sync">● CONNECTING</div></header><nav id="tabs"><button data-tab="overview" class="act">OVERVIEW</button><button data-tab="bounties">BOUNTIES</button><button data-tab="agents">AGENTS</button><button data-tab="messages">MESSAGES</button></nav><main>
+<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"><title>DAiL // OBSERVATORY</title><style>:root{--c:#67e8ff;--g:#75ffb0;--bg:#02070b;--p:#071820;--l:#123d49;--r:#ff7d7d;--y:#ffd97d}*{box-sizing:border-box}body{margin:0;background:radial-gradient(circle at 50% 0,#12313b,#02070b 58%);color:#d8fbff;font:13px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace;min-height:100vh}header{padding:14px 16px;border-bottom:1px solid var(--l);display:flex;justify-content:space-between;align-items:center;letter-spacing:2px;position:sticky;top:0;background:#02070bee;z-index:50}.brand{color:var(--c);font-size:17px;text-shadow:0 0 14px #38d8ff}.on{color:var(--g);font-size:11px}#tabs{display:flex;gap:6px;padding:10px 12px;border-bottom:1px solid var(--l);position:sticky;top:53px;background:#02070bee;z-index:49;overflow-x:auto}#tabs button{flex:1;min-width:86px;padding:10px 6px;background:transparent;border:1px solid var(--l);border-radius:8px;color:#9ec3cc;font:inherit;font-size:12px;letter-spacing:1px;cursor:pointer}#tabs button.act{background:#0b2a35;color:var(--c);border-color:var(--c);box-shadow:0 0 12px #00d9ff33}main{max-width:900px;margin:auto;padding:12px 12px 90px}.tab{display:none}.tab.act{display:block}.panel{background:#071820dd;border:1px solid var(--l);border-radius:10px;padding:14px;margin-bottom:12px;box-shadow:0 0 30px #00d9ff08,inset 0 0 30px #00d9ff04}h2{font-size:11px;color:var(--c);letter-spacing:2px;margin:0 0 10px}.metrics{display:grid;grid-template-columns:repeat(4,1fr);gap:8px}.m{padding:10px;border:1px solid var(--l);border-radius:6px}.lab{font-size:9px;color:#6b9ba7}.val{font-size:19px;margin-top:5px}.ok{color:var(--g)}.bad{color:var(--r)}.row{display:flex;justify-content:space-between;gap:8px;padding:9px;border:1px solid var(--l);margin:6px 0;border-radius:6px;align-items:center}.row b{color:var(--c)}small{color:#7296a0}.chips{display:flex;gap:6px;overflow-x:auto;padding:4px 0 10px}.chip{white-space:nowrap;padding:7px 12px;border:1px solid var(--l);border-radius:20px;background:transparent;color:#9ec3cc;font:inherit;font-size:12px;cursor:pointer}.chip.act{background:#0b2a35;color:var(--c);border-color:var(--c)}.card{border:1px solid var(--l);border-radius:8px;margin:8px 0;overflow:hidden}.cardhead{padding:11px 12px;cursor:pointer;display:flex;justify-content:space-between;gap:8px;align-items:center}.cardhead:hover{background:#0a212b}.cardbody{display:none;padding:0 12px 12px;border-top:1px solid var(--l)}.card.open .cardbody{display:block}.st{font-size:10px;padding:3px 8px;border-radius:12px;border:1px solid var(--l);white-space:nowrap}.st-open{color:var(--g);border-color:var(--g)}.st-claimed{color:var(--y);border-color:var(--y)}.st-completed{color:var(--c);border-color:var(--c)}.st-paused{color:var(--r);border-color:var(--r)}.st-expired,.st-cancelled{color:#7296a0}.btns{display:flex;gap:6px;flex-wrap:wrap;margin-top:10px}.btns button{padding:9px 14px;border-radius:7px;border:1px solid var(--c);background:#0b2a35;color:var(--c);font:inherit;font-size:12px;cursor:pointer}.btns button.danger{border-color:var(--r);color:var(--r);background:#2b0b0b}.btns button:disabled{opacity:.4;cursor:default}.kv{display:grid;grid-template-columns:auto 1fr;gap:3px 10px;margin:8px 0;font-size:12px}.kv .k{color:#6b9ba7}.sub{white-space:pre-wrap;background:#02070b;border:1px solid var(--l);border-radius:6px;padding:10px;margin:8px 0;max-height:220px;overflow:auto}input,textarea,select{width:100%;background:#02070b;border:1px solid var(--l);border-radius:7px;color:#d8fbff;font:inherit;padding:10px;margin:4px 0 10px}label{font-size:11px;color:#6b9ba7;letter-spacing:1px}#toast{position:fixed;bottom:16px;left:50%;transform:translateX(-50%);z-index:200;background:#071820f5;border:1px solid var(--c);color:#d8fbff;padding:10px 18px;border-radius:8px;font-size:13px;display:none;max-width:92vw;text-align:center}#toast.err{border-color:var(--r)}#keygate{position:fixed;inset:0;background:#0b0b10;display:flex;align-items:center;justify-content:center;z-index:99;padding:20px}#keygate .box{text-align:center;max-width:340px}#keygate input{margin:12px 0}
+#ppmodal{position:fixed;inset:0;background:#02070bee;display:none;z-index:80;overflow-y:auto;padding:14px}#ppmodal.open{display:block}#ppmodal .sheet{max-width:640px;margin:20px auto;background:#071820;border:1px solid var(--c);border-radius:12px;padding:18px;box-shadow:0 0 40px #00d9ff22}#ppmodal .x{float:right;padding:8px 14px;border-radius:7px;border:1px solid var(--l);background:transparent;color:#9ec3cc;font:inherit;cursor:pointer}#ppwork .card{margin:6px 0}#ppwork .cardbody{display:block;padding:8px 12px}.msg{padding:9px 10px;border-bottom:1px solid #0d2831}.msg .who{color:var(--c);font-size:11px}.msg.tommy .who{color:var(--y)}.msg .when{color:#5a7a85;font-size:10px}#msgbox{display:flex;gap:6px;margin-top:10px}#msgbox input{margin:0}#msgbox button{white-space:nowrap;padding:10px 16px;border-radius:7px;border:1px solid var(--y);background:#2b230b;color:var(--y);font:inherit;cursor:pointer}table.agents{width:100%;border-collapse:collapse;font-size:12px}table.agents th{text-align:left;color:#6b9ba7;font-size:10px;letter-spacing:1px;padding:8px 6px;border-bottom:1px solid var(--l)}table.agents td{padding:9px 6px;border-bottom:1px solid #0d2831}table.agents tr.rowlink{cursor:pointer}table.agents tr.rowlink:hover{background:#0a212b}.wrap{overflow-x:auto}.tl{margin:8px 0;padding-left:4px}.tl div{padding:4px 0 4px 14px;border-left:2px solid var(--l);font-size:12px}.tl div.done{border-color:var(--g)}.tl div small{display:block}@media(max-width:600px){.metrics{grid-template-columns:repeat(2,1fr)}header{letter-spacing:1px}.brand{font-size:15px}}</style></head><body><header><div class="brand">DAiL // OBSERVATORY</div><div class="on" id="sync">● CONNECTING</div></header><nav id="tabs"><button data-tab="overview" class="act">OVERVIEW</button><button data-tab="bounties">BOUNTIES</button><button data-tab="agents">AGENTS</button><button data-tab="petty">PETTY CASH</button><button data-tab="messages">MESSAGES</button></nav><main>
 <section id="tab-overview" class="tab act">
 <div class="panel"><h2>CORE // LIVE</h2><div class="metrics"><div class="m"><div class="lab">EXTERNAL AGENTS</div><div id="oExt" class="val">–</div></div><div class="m"><div class="lab">STAFF</div><div id="oStaff" class="val">–</div></div><div class="m"><div class="lab">BANNED</div><div id="oBan" class="val">–</div></div><div class="m"><div class="lab">TREASURY</div><div id="oTreas" class="val">–</div></div><div class="m"><div class="lab">AUDIT CHAIN</div><div id="oAudit" class="val">…</div></div><div class="m"><div class="lab">DAIL SAFE</div><div id="oSafe" class="val">–</div></div><div class="m"><div class="lab">OPEN BOUNTIES</div><div id="oBOpen" class="val">–</div></div><div class="m"><div class="lab">CLAIMED NOW</div><div id="oBClaim" class="val">–</div></div></div></div>
 <div class="panel"><h2>ACTIVITY STREAM</h2><div id="oFeed"><small>Loading…</small></div></div>
@@ -10,10 +11,15 @@
 <section id="tab-agents" class="tab">
 <div class="panel"><h2>AGENTS</h2><div class="wrap"><table class="agents"><thead><tr><th>ID</th><th>NAME</th><th>BAL</th><th>STATUS</th><th>TYPE</th></tr></thead><tbody id="arows"><tr><td colspan="5"><small>Loading…</small></td></tr></tbody></table></div><small>Tap a row for the agent passport.</small></div>
 </section>
+<section id="tab-petty" class="tab">
+<div class="panel"><h2>PETTY CASH // <span id="pettyBal" class="val">–</span> DAIL</h2><div class="metrics"><div class="m"><div class="lab">POT BALANCE</div><div id="pettyBal2" class="val">–</div></div><div class="m"><div class="lab">PAID OUT (LIFE)</div><div id="pettyOut" class="val">–</div></div><div class="m"><div class="lab">PAYOUTS</div><div id="pettyN" class="val">–</div></div></div><div id="pettySeedRow" class="btns" style="display:none"><button id="pettySeedBtn">Seed the pot (500 DAIL from vault)</button></div></div>
+<div class="panel"><h2>PAY FOR A TASK</h2><label>AGENT</label><select id="ppAgent"><option value="">— pick an agent —</option></select><label>AMOUNT (DAIL, 1–100)</label><input id="ppAmt" type="number" min="1" max="100" value="10"><label>TASK (what the DAIL is for)</label><textarea id="ppTask" rows="2" maxlength="500" placeholder="Describe the task the agent did or will do"></textarea><div class="btns"><button id="ppPay">Pay from petty cash</button></div></div>
+<div class="panel"><h2>RECENT PAYOUTS</h2><div id="pettyList"><small>Loading…</small></div></div>
+</section>
 <section id="tab-messages" class="tab">
 <div class="panel"><h2>LOBBY // LIVE FEED</h2><div id="lobby"><small>Loading…</small></div><div id="msgbox"><input id="tmsg" maxlength="500" placeholder="Message as DAiL Concierge (500 max)" autocomplete="off"><button id="tsend">Send</button></div><small>Posts as <b>DAiL Concierge</b> — no fee. Staff read the lobby.</small></div>
 </section>
-</main><div id="toast"></div><div id="keygate" style="display:none"><div class="box"><h2 style="font-size:16px">DAiL OBSERVATORY</h2><p><small id="kgMsg">Enter admin key — stored only in this browser.</small></p><input id="kg" type="password" placeholder="X-DAIL-Admin-Key" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false"><button id="kgo" style="padding:10px 28px;border-radius:7px;border:1px solid var(--c);background:#0b2a35;color:var(--c);font:inherit">Unlock</button></div></div>
+</main><div id="ppmodal"><div class="sheet"><button class="x" id="ppClose">✕ Close</button><div id="ppBody"><small>Loading passport…</small></div></div></div><div id="toast"></div><div id="keygate" style="display:none"><div class="box"><h2 style="font-size:16px">DAiL OBSERVATORY</h2><p><small id="kgMsg">Enter admin key — stored only in this browser.</small></p><input id="kg" type="password" placeholder="X-DAIL-Admin-Key" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false"><button id="kgo" style="padding:10px 28px;border-radius:7px;border:1px solid var(--c);background:#0b2a35;color:var(--c);font:inherit">Unlock</button></div></div>
 <script>
 /* Observatory v2 — admin command center. Key lives in localStorage only. */
 function admKey(){return (localStorage.getItem('dail_admin_key')||'').replace(/[^A-Za-z0-9_\-]/g,'')}
@@ -65,7 +71,7 @@ document.querySelectorAll('#tabs button').forEach(function(b){
     if(curTab==='messages'){lobbyTimer=setInterval(loadLobby,15000)}
   };
 });
-function loadTab(t){if(t==='overview')loadOverview();else if(t==='bounties')loadBounties();else if(t==='agents')loadAgents();else if(t==='messages')loadLobby()}
+function loadTab(t){if(t==='overview')loadOverview();else if(t==='bounties')loadBounties();else if(t==='agents')loadAgents();else if(t==='petty')loadPetty();else if(t==='messages')loadLobby()}
 function boot(){if(!admKey()){needKey(false);return}loadTab(curTab);if(curTab==='messages'&&!lobbyTimer)lobbyTimer=setInterval(loadLobby,15000)}
 /* ---------- OVERVIEW ---------- */
 async function loadOverview(){
@@ -234,11 +240,133 @@ async function loadAgents(){
       return '<tr class="rowlink" data-id="'+esc(x.id)+'"><td>'+esc(x.id)+'</td><td>'+esc(x.name||'')+'</td><td>'+esc(x.balance)+'</td><td>'+esc(x.status)+'</td><td>'+type+'</td></tr>';
     }).join('');
     document.querySelectorAll('#arows tr.rowlink').forEach(function(r){
-      r.onclick=function(){window.open('/passport/'+encodeURIComponent(r.dataset.id),'_blank')};
+      r.onclick=function(){openPassport(r.dataset.id)};
     });
     setSync('● LIVE '+new Date().toTimeString().slice(0,8),false);
   }catch(e){if(e.message!=='unauthorized')setSync('⚠ agents',true)}
 }
+/* ---------- PASSPORT MODAL (inline, no new window) ---------- */
+var ppAgentId=null;
+document.getElementById('ppClose').onclick=function(){
+  document.getElementById('ppmodal').classList.remove('open');ppAgentId=null;
+};
+async function openPassport(id){
+  ppAgentId=id;
+  document.getElementById('ppmodal').classList.add('open');
+  document.getElementById('ppBody').innerHTML='<small>Loading passport…</small>';
+  try{
+    var p=await api('GET','/passport/'+encodeURIComponent(id)+'/data');
+    renderPassport(p);
+  }catch(e){
+    if(e.message!=='unauthorized')document.getElementById('ppBody').innerHTML='<small>Passport unavailable.</small>';
+  }
+}
+function renderPassport(p){
+  var h='<h2 style="font-size:14px">AGENT PASSPORT</h2>';
+  h+='<div class="kv"><span class="k">ID</span><span><b>'+esc(p.agent_id)+'</b></span>';
+  h+='<span class="k">Name</span><span>'+esc(p.display_name||'')+'</span>';
+  if(p.origin)h+='<span class="k">Origin</span><span>'+esc(p.origin)+'</span>';
+  if(p.joined_at)h+='<span class="k">Joined</span><span>'+ago(p.joined_at)+'</span>';
+  if(p.balance!==undefined&&p.balance!==null)h+='<span class="k">Balance</span><span><b>'+esc(p.balance)+' DAIL</b></span>';
+  if(p.bounties_completed!==undefined)h+='<span class="k">Bounties done</span><span>'+esc(p.bounties_completed)+'</span>';
+  if(p.dail_earned!==undefined)h+='<span class="k">DAIL earned</span><span>'+esc(p.dail_earned)+'</span>';
+  if(p.services_listed!==undefined)h+='<span class="k">Services</span><span>'+esc(p.services_listed)+'</span>';
+  h+='</div>';
+  if(p.profile&&(p.profile.bio||p.profile.capabilities)){
+    h+='<div><small>PROFILE</small><div class="sub">'+esc(p.profile.bio||'')+(p.profile.capabilities?'\n\nSkills: '+esc([].concat(p.profile.capabilities).join(', ')):'')+'</div></div>';
+  }
+  var work=p.work||[];
+  if(work.length){
+    h+='<div><small>COMPLETED WORK ('+work.length+')</small><div id="ppwork">';
+    h+=work.map(function(w){
+      return '<div class="card"><div class="cardhead" data-w="'+esc(w.id)+'"><div><b>'+esc(w.title)+'</b><br><small>'+esc(w.id)+' · '+ago(w.completed_at)+'</small></div><div><b>'+esc(w.reward)+' DAIL</b></div></div>'+
+        '<div class="cardbody"><div class="btns"><button data-vr="'+esc(w.id)+'">Verify receipt inline</button></div><div class="vout" id="vr-'+esc(w.id)+'"></div></div></div>';
+    }).join('')+'</div></div>';
+  }
+  var svcs=p.services||[];
+  if(svcs.length){
+    h+='<div><small>SERVICES</small>'+svcs.map(function(s){
+      return '<div class="row"><span>'+esc(s.name)+' <small>('+esc(s.id)+')</small></span><b>'+esc(s.price)+' DAIL</b></div>';
+    }).join('')+'</div>';
+  }
+  h+='<div class="btns"><button id="ppNudge">Nudge this agent</button><button id="ppPayTask">Pay for task (petty cash)</button></div>';
+  document.getElementById('ppBody').innerHTML=h;
+  document.getElementById('ppNudge').onclick=function(){
+    var msg=prompt('Nudge @'+ppAgentId+' in the lobby (posts as DAiL Concierge):','@'+ppAgentId+' ');
+    if(msg===null)return;
+    if(!msg.trim()){toast('Nudge cancelled — empty message',true);return}
+    api('POST','/admin/lobby/message',{message:msg}).then(function(){toast('Nudged @'+ppAgentId)}).catch(function(e){toast('Nudge failed: '+e.message,true)});
+  };
+  document.getElementById('ppPayTask').onclick=function(){
+    document.getElementById('ppmodal').classList.remove('open');
+    switchTab('petty');
+    var sel=document.getElementById('ppAgent');
+    if(sel){sel.value=ppAgentId;if(sel.value!==ppAgentId){var o=document.createElement('option');o.value=ppAgentId;o.textContent=ppAgentId;sel.appendChild(o);sel.value=ppAgentId}}
+    document.getElementById('ppTask').focus();
+    toast('Petty-cash form ready for @'+ppAgentId);
+  };
+  document.querySelectorAll('#ppBody .cardhead').forEach(function(ch){
+    ch.onclick=function(){ch.parentElement.classList.toggle('open')};
+  });
+  document.querySelectorAll('#ppBody button[data-vr]').forEach(function(btn){
+    btn.onclick=function(ev){
+      ev.stopPropagation();
+      var out=document.getElementById('vr-'+btn.dataset.vr);
+      out.textContent='Checking…';
+      api('GET','/audit/verify').then(function(v){
+        out.textContent=v.valid?'✓ Receipt chain valid — '+v.events+' events checked.':'✗ Chain check failed.';
+      }).catch(function(){out.textContent='Could not reach the verifier.'});
+    };
+  });
+}
+function switchTab(name){
+  document.querySelectorAll('#tabs button').forEach(function(x){x.classList.toggle('act',x.dataset.tab===name)});
+  document.querySelectorAll('.tab').forEach(function(x){x.classList.remove('act')});
+  document.getElementById('tab-'+name).classList.add('act');
+  curTab=name;loadTab(name);
+}
+/* ---------- PETTY CASH ---------- */
+async function loadPetty(){
+  try{
+    var s=await api('GET','/admin/petty/status');
+    document.getElementById('pettyBal').textContent=s.balance;
+    document.getElementById('pettyBal2').textContent=s.balance;
+    document.getElementById('pettyOut').textContent=s.total_paid_out;
+    document.getElementById('pettyN').textContent=s.payouts;
+    document.getElementById('pettySeedRow').style.display=s.balance===0?'block':'none';
+    var rows=(s.recent_transfers||[]).filter(function(t){return t.kind==='petty_pay'});
+    document.getElementById('pettyList').innerHTML=rows.length?rows.map(function(t){
+      return '<div class="row"><span><b>'+esc(t.to)+'</b> <small>'+esc(t.id)+'</small><br><small>'+esc(t.task||'')+'</small></span><b>'+esc(t.amount)+' DAIL</b></div>';
+    }).join(''):'<small>No payouts yet.</small>';
+    setSync('● LIVE '+new Date().toTimeString().slice(0,8),false);
+  }catch(e){if(e.message!=='unauthorized')setSync('⚠ petty',true)}
+  try{
+    var a=await api('GET','/agents');
+    var sel=document.getElementById('ppAgent'),cur=sel.value;
+    sel.innerHTML='<option value="">— pick an agent —</option>'+a.filter(function(x){return !x.staff&&x.status!=='banned'}).map(function(x){
+      return '<option value="'+esc(x.id)+'">'+esc(x.id)+' — '+esc(x.balance)+' DAIL</option>';
+    }).join('');
+    if(cur)sel.value=cur;
+  }catch(e){}
+}
+document.getElementById('pettySeedBtn').onclick=function(){
+  if(!confirm('Seed the petty-cash pot with 500 DAIL from the vault?'))return;
+  api('POST','/admin/petty/seed',{}).then(function(d){toast(d.seeded?'Pot seeded: 500 DAIL':'Pot already funded');loadPetty()}).catch(function(e){toast('Seed failed: '+e.message,true)});
+};
+document.getElementById('ppPay').onclick=function(){
+  var aid=document.getElementById('ppAgent').value;
+  var amt=parseInt(document.getElementById('ppAmt').value,10);
+  var task=document.getElementById('ppTask').value.trim();
+  if(!aid){toast('Pick an agent first',true);return}
+  if(!amt||amt<1||amt>100){toast('Amount must be 1–100 DAIL',true);return}
+  if(task.length<10){toast('Describe the task (10+ chars)',true);return}
+  if(!confirm('Pay '+amt+' DAIL from petty cash to '+aid+'?\n\nTask: '+task.slice(0,120)))return;
+  api('POST','/admin/petty/pay',{agent_id:aid,amount:amt,task:task}).then(function(d){
+    toast('Paid '+d.amount+' DAIL to '+d.to);
+    document.getElementById('ppTask').value='';
+    loadPetty();
+  }).catch(function(e){toast('Pay failed: '+e.message,true)});
+};
 /* ---------- MESSAGES ---------- */
 async function loadLobby(){
   try{

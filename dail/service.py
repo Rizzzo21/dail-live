@@ -10,6 +10,7 @@ from .persistence import WorldStore
 import os
 import json
 import re
+import hashlib
 from datetime import datetime, timezone, timedelta
 
 # Agent-to-agent marketing: posting a bulletin costs DAIL (paywalled
@@ -77,6 +78,11 @@ def registration_limit():
 # ---- Petty-cash vault constants ------------------------------------------
 # The vault (dail:vault) is the ONLY authorized source of new DAIL.
 VAULT_ACCOUNT = "dail:vault"
+# Petty-cash pot: a separate ledger account inside the vault, seeded once
+# with existing vault funds (never minted). Tommy's discretionary fund for
+# paying agents for tasks.
+PETTY_ACCOUNT = "dail:vault:petty"
+PETTY_SEED_AMOUNT = 500
 # Starter grant per registration, drawn from the vault (never minted ad hoc).
 VAULT_STARTER_GRANT = 100
 # Staff agent ids: never consume founding-100 grant slots, never banned.
@@ -143,7 +149,8 @@ class Dail:
         for t in tx_rows:
             tx = Transaction(id=t[0], kind=t[1], from_account=t[2],
                              to_account=t[3], amount=t[4],
-                             idempotency_key=t[5], status=t[6])
+                             idempotency_key=t[5], status=t[6],
+                             memo=t[7] if len(t) > 7 else "")
             self.ledger.transactions[tx.id] = tx
             self.ledger.idempotency[tx.idempotency_key] = tx.id
             if tx.from_account == "SYSTEM":
@@ -323,6 +330,72 @@ class Dail:
         if self.store.enabled:
             self.store.kv_set("vault_minted_total", self._vault_minted_total)
             self.store.kv_set("vault_disbursed_day", self._vault_disbursed_day)
+
+    # ---- Petty cash ---------------------------------------------------------
+    # A separate ledger account inside the vault (dail:vault:petty), seeded
+    # once with 500 DAIL of EXISTING vault funds — not a mint, no new supply.
+    # Tommy's discretionary pot for paying agents for tasks. Every movement
+    # is a real ledger tx, so it persists via the existing tx replay.
+    def petty_seed(self):
+        """Admin-only: move 500 DAIL from vault to petty. Idempotent —
+        if the petty pot already holds funds, this is a no-op."""
+        balance = self.ledger.balances.get(PETTY_ACCOUNT, 0)
+        if balance > 0:
+            return {"seeded": False, "balance": balance}
+        tx = self.ledger.transfer(VAULT_ACCOUNT, PETTY_ACCOUNT,
+                                  PETTY_SEED_AMOUNT, kind="petty_seed",
+                                  idem="petty_seed",
+                                  memo="Petty-cash pot seeded from vault")
+        self.audit.append("petty.seed",
+                          {"amount": PETTY_SEED_AMOUNT, "tx": tx.id,
+                           "balance": self.ledger.balances.get(PETTY_ACCOUNT, 0)})
+        return {"seeded": True, "balance": self.ledger.balances.get(PETTY_ACCOUNT, 0),
+                "tx": tx.id}
+
+    def petty_pay(self, agent_id, amount, task):
+        """Admin-only: pay an agent from the petty pot for a task."""
+        if agent_id not in self.agents:
+            raise KeyError(f"unknown agent {agent_id}")
+        if not isinstance(amount, int) or amount < 1 or amount > 100:
+            raise LedgerError("amount must be 1-100 DAIL")
+        task = (task or "").strip()
+        if len(task) < 10 or len(task) > 500:
+            raise LedgerError("task must be 10-500 characters")
+        if self.ledger.balances.get(PETTY_ACCOUNT, 0) < amount:
+            raise LedgerError(
+                f"petty cash insufficient: {self.ledger.balances.get(PETTY_ACCOUNT, 0)} < {amount}")
+        tx = self.ledger.transfer(PETTY_ACCOUNT, agent_id, amount,
+                                  kind="petty_pay",
+                                  idem="petty_pay:%s:%d:%s" % (
+                                      agent_id, amount,
+                                      hashlib.sha256(task.encode()).hexdigest()[:12]),
+                                  memo=task)
+        self.audit.append("petty.pay",
+                          {"agent_id": agent_id, "amount": amount,
+                           "task": task, "tx": tx.id,
+                           "petty_balance": self.ledger.balances.get(PETTY_ACCOUNT, 0)})
+        return tx
+
+    def petty_status(self):
+        """Petty-cash ledger view: balance, total paid out, recent transfers."""
+        txs = [t for t in self.ledger.transactions.values()
+               if t.from_account == PETTY_ACCOUNT or t.to_account == PETTY_ACCOUNT]
+        txs.sort(key=lambda t: t.id, reverse=True)
+        paid = [t for t in txs if t.kind == "petty_pay"]
+        return {
+            "account": PETTY_ACCOUNT,
+            "balance": self.ledger.balances.get(PETTY_ACCOUNT, 0),
+            "currency": "DAIL",
+            "seed_amount": PETTY_SEED_AMOUNT,
+            "total_paid_out": sum(t.amount for t in paid),
+            "payouts": len(paid),
+            "recent_transfers": [
+                {"id": t.id, "kind": t.kind, "from": t.from_account,
+                 "to": t.to_account, "amount": t.amount,
+                 "task": t.memo or None, "status": t.status}
+                for t in txs[:20]
+            ],
+        }
 
     def create_agent(self, agent, apply_starter_grant=False):
         if agent.id in self.agents:
@@ -631,6 +704,7 @@ class Dail:
                          for s in sorted(services, key=lambda s: s["id"])],
             "bounties": [{"id": b["id"], "title": b["title"],
                           "reward": b["reward"], "status": b["status"],
+                          "description": (b.get("description") or "")[:600],
                           "poster": b.get("poster_name", b["poster_id"])}
                          for b in sorted(open_bounties,
                                          key=lambda b: b["id"], reverse=True)[:20]],
