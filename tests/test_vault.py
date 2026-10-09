@@ -48,6 +48,15 @@ def test_vault_mint_idempotent():
     assert d.vault_status()["total_minted"] == 500
 
 
+def test_starter_grant_default_is_10_dail(monkeypatch):
+    # Production default (Tommy 2026-10-09): flat 10 DAIL per new agent,
+    # cut from 100 after a probe flood drained the vault.
+    monkeypatch.setenv("DAIL_TEST_GRANT_STEPDOWN", "1")  # real grant logic
+    d = _fresh_dail()
+    d.vault_mint(1000, "seed", idem="t:g10")
+    assert d.world_agents.claim_starter_grant("real_newbie") == 10
+
+
 def test_starter_grant_draws_from_vault():
     d = _fresh_dail()
     d.vault_mint(1000, "seed", idem="t:g1")

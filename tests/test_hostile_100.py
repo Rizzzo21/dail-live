@@ -201,7 +201,10 @@ def test_hostile_100_agents():
 
 
 def test_grant_step_down_after_founding_100(monkeypatch):
-    # Opt back into the real step-down logic for this test.
+    # Opt back into the real grant logic for this test.
+    # Flat 10-DAIL grant (Tommy 2026-10-09): the founding-100 step-down is
+    # moot — both tiers are 10. Counter mechanics (no overshoot, staff
+    # exempt) still hold.
     monkeypatch.setenv("DAIL_TEST_GRANT_STEPDOWN", "1")
     wa = dail.world_agents
     saved = wa.full_grants_given
@@ -210,7 +213,7 @@ def test_grant_step_down_after_founding_100(monkeypatch):
         a = _uid("g")
         r = client.post("/agents", json={"id": a, "name": a})
         assert r.status_code == 200, r.text
-        assert r.json()["balance"] == 100, r.json()
+        assert r.json()["balance"] == 10, r.json()
         assert wa.full_grants_given == 100
         b = _uid("g")
         r = client.post("/agents", json={"id": b, "name": b})
@@ -218,7 +221,7 @@ def test_grant_step_down_after_founding_100(monkeypatch):
         assert r.json()["balance"] == 10, r.json()
         assert wa.full_grants_given == 100  # capped, no overshoot
         # staff never consume slots
-        assert wa.claim_starter_grant("dail_host") == 100
+        assert wa.claim_starter_grant("dail_host") == 10
         assert wa.full_grants_given == 100
     finally:
         wa.full_grants_given = saved

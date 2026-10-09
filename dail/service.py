@@ -89,7 +89,7 @@ PETTY_SEED_AMOUNT = 500
 # have physically left it, so they can never be double-spent.
 PETTY_HOLD_ACCOUNT = "dail:vault:petty_hold"
 # Starter grant per registration, drawn from the vault (never minted ad hoc).
-VAULT_STARTER_GRANT = 100
+VAULT_STARTER_GRANT = 10
 # Staff agent ids: never consume founding-100 grant slots, never banned.
 STAFF_AGENTS = frozenset({
     "dail_host", "dail_manager", "dail_inspector",
@@ -509,9 +509,10 @@ class Dail:
             raise ValueError("name is reserved")
         self.agents[agent.id] = agent
         # Founding-100 step-down: the public registration route passes
-        # apply_starter_grant=True so the grant is 100 DAIL for the first 100
-        # verified agents, 10 DAIL after. Internal/test callers pass an
-        # explicit balance and are unaffected.
+        # apply_starter_grant=True so the grant is 10 DAIL flat (cut from 100
+        # on 2026-10-09 after a probe flood drained the vault — Tommy's call:
+        # size grants for ~100 agents, not 100 DAIL each). Internal/test
+        # callers pass an explicit balance and are unaffected.
         if apply_starter_grant:
             agent.balance = self.world_agents.claim_starter_grant(agent.id)
         # The starter grant is drawn from the petty-cash vault (the single
@@ -1287,18 +1288,20 @@ class AgentWorld:
             self.store.save_order(order)
 
     def claim_starter_grant(self, agent_id):
-        """Starter grant with the founding-100 step-down (Tommy, 2026-10-07):
-        the first 100 verified (non-staff) agents get 100 DAIL; every agent
-        after gets 10 DAIL. Staff never consume slots. The counter persists
-        across restarts and is claimed under the mutation lock so concurrent
-        registrations can't overshoot the 100."""
+        """Starter grant (Tommy, 2026-10-09): flat 10 DAIL per new agent.
+        Cut from 100 after a probe flood drained the vault — grants are sized
+        for ~100 agents, not 100 DAIL each. Staff never consume slots. The
+        founding-100 counter persists for stats; with the flat grant the
+        step-down is moot (both tiers are 10)."""
         import os as _os
         # Test isolation: the suite registers hundreds of agents against one
-        # shared instance; without this bypass, tests would exhaust the 100
-        # founding slots and see reduced grants. The dedicated step-down
-        # test opts back into the real logic via DAIL_TEST_GRANT_STEPDOWN.
+        # shared instance and its economic-logic tests assume funded agents.
+        # The test grant stays 100 so those tests exercise bounty/trade logic
+        # rather than grant policy; the real 10-DAIL default is asserted in
+        # test_vault.py. The dedicated step-down test opts back into the real
+        # logic via DAIL_TEST_GRANT_STEPDOWN.
         if _os.environ.get("DAIL_TESTING") and not _os.environ.get("DAIL_TEST_GRANT_STEPDOWN"):
-            return VAULT_STARTER_GRANT
+            return 100
         if agent_id in STAFF_AGENTS:
             return VAULT_STARTER_GRANT
         with self._mutation_lock:

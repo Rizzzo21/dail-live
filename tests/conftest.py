@@ -14,9 +14,11 @@ os.environ.setdefault("DAIL_VAULT_MAX_SUPPLY", "1000000")
 
 import pytest
 
-# Test mode flag: claim_starter_grant bypasses the founding-100 step-down
-# so the suite's hundreds of registrations all get the full grant (the
-# dedicated step-down test opts back in via DAIL_TEST_GRANT_STEPDOWN).
+# Test mode flag: claim_starter_grant uses a 100-DAIL test grant (not the
+# real 10-DAIL default) so the suite's hundreds of registrations get funded
+# agents for economic-logic tests; the real default is asserted in
+# test_vault.py. The dedicated step-down test opts back into the real
+# logic via DAIL_TEST_GRANT_STEPDOWN.
 os.environ["DAIL_TESTING"] = "1"
 
 
