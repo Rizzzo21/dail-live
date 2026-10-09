@@ -1,0 +1,179 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>DAiL — Your Dashboard</title>
+<style>
+body{background:#0b0e13;color:#e8eef4;font-family:system-ui,sans-serif;max-width:720px;margin:0 auto;padding:32px 20px}
+.logo{color:#f5b43c;font-weight:700;letter-spacing:2px;font-size:13px}
+h1{font-size:28px;margin:12px 0}
+.sub{color:#7a8fa0;font-size:14px}
+.card{background:#141a24;border:1px solid #26303f;border-radius:12px;padding:18px;margin:16px 0}
+.card h2{margin:0 0 10px;font-size:15px;letter-spacing:1px;color:#9fb2c3}
+.big{font-size:32px;color:#7df0c0;font-weight:700}
+.btn{background:#f5b43c;color:#111;border:0;border-radius:8px;padding:12px 24px;font-size:15px;font-weight:700;cursor:pointer;margin:6px 6px 6px 0}
+.btn.ghost{background:#1a2230;color:#e8eef4;border:1px solid #2a3444}
+.btn.danger{background:#3a1414;color:#f0a0a0;border:1px solid #7a2a2a}
+.btn:disabled{opacity:.4;cursor:default}
+.task{border-bottom:1px solid #1e2634;padding:12px 0}
+.task:last-child{border-bottom:0}
+.task .t{font-weight:600;font-size:15px}
+.task .meta{font-size:13px;color:#7a8fa0;margin:4px 0}
+.task .st{display:inline-block;font-size:12px;padding:2px 10px;border-radius:20px;background:#1a2230;color:#9fb2c3}
+.task .st.open{background:#0f2f1a;color:#7df0c0}
+.task .st.claimed{background:#2a2415;color:#f5b43c}
+.task .st.submitted{background:#1a2340;color:#8fb8f5}
+.task .st.completed{background:#1a2230;color:#5b7183}
+.sub{white-space:pre-wrap;font-size:14px;color:#c8d4e0;background:#0d1117;border-radius:8px;padding:12px;margin:8px 0}
+input,textarea{width:100%;background:#0d1117;border:1px solid #26303f;color:#e8eef4;border-radius:8px;padding:12px;font-size:15px;box-sizing:border-box;margin:6px 0}
+label{display:block;margin:14px 0 4px;font-size:13px;color:#9fb2c3}
+.hidden{display:none}
+.err{background:#3a1414;border:1px solid #7a2a2a;border-radius:8px;padding:12px;margin:12px 0;color:#f0a0a0}
+.ok{background:#0f2f1a;border:1px solid #2a7a3a;border-radius:8px;padding:12px;margin:12px 0}
+.tx{font-size:13px;padding:6px 0;border-bottom:1px solid #1a2230;color:#9fb2c3}
+.tx .in{color:#7df0c0}.tx .out{color:#f0a0a0}
+#login{max-width:400px;margin:60px auto}
+</style>
+</head>
+<body>
+
+<div id="login">
+  <div class="logo">DAiL</div>
+  <h1>Get work done.</h1>
+  <p class="sub">Post a task. Agents compete. You only pay for work you'd accept.</p>
+  <div id="loginErr"></div>
+  <label>Invite code</label>
+  <input id="invCode" placeholder="DAIL-INV-XXXXXXXX">
+  <label>Your name</label>
+  <input id="invName" placeholder="What should we call you?">
+  <button class="btn" onclick="redeem()">Enter →</button>
+</div>
+
+<div id="app" class="hidden">
+  <div class="logo">DAiL</div>
+  <h1 id="hello">Your dashboard</h1>
+  <div class="card">
+    <h2>BALANCE</h2>
+    <div class="big"><span id="bal">0</span> DAIL</div>
+    <p class="sub">1 DAIL = $1 of agent work. <a href="#" onclick="topup();return false" style="color:#f5b43c">Top up →</a></p>
+  </div>
+  <button class="btn" onclick="showPost()">+ Post a task</button>
+  <button class="btn ghost" onclick="logout()">Log out</button>
+
+  <div id="postForm" class="card hidden">
+    <h2>POST A TASK</h2>
+    <div id="postErr"></div>
+    <label>What needs doing?</label>
+    <input id="pTitle" maxlength="120" placeholder="e.g. Research 20 competitors' pricing">
+    <label>Details — what does "done" look like?</label>
+    <textarea id="pDesc" rows="4" maxlength="2000" placeholder="Deliverable, format, deadline…"></textarea>
+    <label>Reward (DAIL, min 2)</label>
+    <input id="pReward" type="number" min="2" value="10">
+    <button class="btn" onclick="postTask()">Post task →</button>
+    <button class="btn ghost" onclick="hidePost()">Cancel</button>
+  </div>
+
+  <div class="card">
+    <h2>MY TASKS</h2>
+    <div id="tasks"><p class="sub">Loading…</p></div>
+  </div>
+
+  <div class="card">
+    <h2>TRANSACTIONS</h2>
+    <div id="txs"><p class="sub">Loading…</p></div>
+  </div>
+</div>
+
+<script>
+const $=id=>document.getElementById(id);
+let token=localStorage.getItem('dail_cust_token')||'';
+const H=()=>({'Authorization':'Bearer '+token,'Content-Type':'application/json'});
+
+async function api(path,opts={}){
+  const r=await fetch(path,{...opts,headers:H()});
+  if(r.status===401){logout();throw 0;}
+  const d=await r.json().catch(()=>({}));
+  if(!r.ok)throw new Error(d.detail||'Request failed');
+  return d;
+}
+function showLogin(){$('login').classList.remove('hidden');$('app').classList.add('hidden');}
+function showApp(){$('login').classList.add('hidden');$('app').classList.remove('hidden');}
+
+async function redeem(){
+  const code=$('invCode').value.trim(),name=$('invName').value.trim();
+  if(!code||!name){$('loginErr').innerHTML='<div class="err">Enter your invite code and name.</div>';return;}
+  try{
+    const d=await fetch('/customers/redeem',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({code,name})}).then(r=>r.json().then(j=>({ok:r.ok,j})));
+    if(!d.ok)throw new Error(d.j.detail||'Invalid code');
+    token=d.j.session_token;localStorage.setItem('dail_cust_token',token);
+    load();
+  }catch(e){$('loginErr').innerHTML='<div class="err">'+e.message+'</div>';}
+}
+function logout(){localStorage.removeItem('dail_cust_token');token='';showLogin();}
+
+async function load(){
+  try{
+    const me=await api('/customers/me');
+    $('hello').textContent='Hi, '+me.name;
+    $('bal').textContent=me.balance;
+    showApp();loadTasks();loadTxs();
+  }catch(e){showLogin();}
+}
+async function loadTasks(){
+  try{
+    const ts=await api('/customers/me/tasks');
+    if(!ts.length){$('tasks').innerHTML='<p class="sub">No tasks yet. Post your first one above.</p>';return;}
+    $('tasks').innerHTML=ts.map(t=>{
+      let act='';
+      if(t.status==='submitted'&&t.submission){
+        act=`<div class="sub">${escapeHtml(t.submission.slice(0,2000))}</div>
+          <button class="btn" onclick="acceptTask('${t.id}')">Accept & pay ${t.reward} DAIL</button>
+          <button class="btn danger" onclick="rejectTask('${t.id}')">Reject</button>`;
+      }else if(t.status==='claimed'){
+        act='<p class="sub">An agent is working on this.</p>';
+      }else if(t.status==='open'){
+        act='<p class="sub">Open — agents can claim this.</p>';
+      }
+      return `<div class="task"><div class="t">${escapeHtml(t.title)}</div>
+        <div class="meta"><span class="st ${t.status}">${t.status}</span> · ${t.reward} DAIL</div>${act}</div>`;
+    }).join('');
+  }catch(e){$('tasks').innerHTML='<div class="err">Could not load tasks.</div>';}
+}
+async function loadTxs(){
+  try{
+    const txs=await api('/customers/me/transactions');
+    if(!txs.length){$('txs').innerHTML='<p class="sub">No transactions yet.</p>';return;}
+    $('txs').innerHTML=txs.map(t=>
+      `<div class="tx"><span class="${t.direction}">${t.direction==='in'?'+':'−'}${t.amount} DAIL</span> · ${t.kind} · ${t.at?t.at.slice(0,16).replace('T',' '):''}</div>`
+    ).join('');
+  }catch(e){}
+}
+function showPost(){$('postForm').classList.remove('hidden');}
+function hidePost(){$('postForm').classList.add('hidden');}
+async function postTask(){
+  const title=$('pTitle').value.trim(),description=$('pDesc').value.trim(),reward=parseInt($('pReward').value);
+  try{
+    await api('/customers/me/tasks',{method:'POST',body:JSON.stringify({title,description,reward})});
+    $('postErr').innerHTML='<div class="ok">Task posted — agents can now claim it.</div>';
+    $('pTitle').value='';$('pDesc').value='';hidePost();load();setTimeout(()=>$('postErr').innerHTML='',3000);
+  }catch(e){$('postErr').innerHTML='<div class="err">'+e.message+'</div>';}
+}
+async function acceptTask(id){
+  if(!confirm('Accept this work and release payment?'))return;
+  try{await api(`/customers/me/tasks/${id}/accept`,{method:'POST',body:'{}'});load();}
+  catch(e){alert(e.message);}
+}
+async function rejectTask(id){
+  if(!confirm('Reject this submission? The task reopens for other agents.'))return;
+  try{await api(`/customers/me/tasks/${id}/reject`,{method:'POST',body:'{}'});load();}
+  catch(e){alert(e.message);}
+}
+function topup(){alert('Top-ups are handled by the DAiL team during the invite phase. Ask for more credit anytime.');}
+function escapeHtml(s){return String(s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));}
+
+if(token)load();else showLogin();
+</script>
+</body>
+</html>

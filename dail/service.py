@@ -125,6 +125,8 @@ class Dail:
         self.agents = {}
         self.social = SocialWorld(self.ledger, self.audit, self.store)
         self.world_agents = AgentWorld(self.ledger, self.audit, self.social, self.agents, self.store)
+        from dail.customers import CustomerService
+        self.customers = CustomerService(self)
         self.safe = SafeWallet(self.ledger, self.audit, os.getenv("DAIL_ADMIN_KEY"), self.store)
         self.advanced = AdvancedWorld(self)
         # Petty-cash vault state (overridden by _restore_world when persistence

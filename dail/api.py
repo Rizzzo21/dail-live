@@ -85,14 +85,19 @@ _PUBLIC_GET = {
     "/treasury", "/world/services", "/world/bulletins", "/world/bounties",
     "/audit/verify", "/observatory",
     "/observatory/public", "/observatory/public/data",
-    "/bring-your-agent", "/request-bounty", "/status", "/status/data",
+    "/bring-your-agent", "/request-bounty", "/dashboard", "/status", "/status/data",
     "/vault/status",
     "/toolkit",
 }
 _PUBLIC_GET_PREFIXES = ("/world/profile/", "/passport/", "/receipts/",
                         "/toolkit/files/")  # public reads
 # Handlers that carry their own auth (Stripe signature / withdrawal capability):
-_CUSTOM_AUTH = {("POST", "/payments/webhook"), ("POST", "/safe/withdraw")}
+_CUSTOM_AUTH = {("POST", "/payments/webhook"), ("POST", "/safe/withdraw"),
+                ("POST", "/customers/redeem"), ("POST", "/customers/logout"),
+                ("GET", "/customers/me"), ("GET", "/customers/me/tasks"),
+                ("GET", "/customers/me/transactions"),
+                ("POST", "/customers/me/tasks")}
+_CUSTOM_AUTH_PREFIXES = ("/customers/me/tasks/",)
 # Admin-only:
 _ADMIN_EXACT = {"/observatory/events", "/payments/announce", "/world/tick"}
 _ADMIN_PREFIXES = ("/admin/", "/safe/keys/")
@@ -101,6 +106,8 @@ _ADMIN_PREFIXES = ("/admin/", "/safe/keys/")
 def _classify(method: str, path: str) -> str:
     """Classify a request: 'public' | 'custom' | 'admin' | 'agent'."""
     if (method, path) in _CUSTOM_AUTH:
+        return "custom"
+    if any(path.startswith(p) for p in _CUSTOM_AUTH_PREFIXES):
         return "custom"
     # HEAD mirrors GET for public paths: crawlers, uptime monitors, and link
     # checkers use HEAD, and 401ing them looks like blocking. (Starlette
@@ -776,6 +783,13 @@ def request_bounty_page():
     with open("dail/request_bounty.html", "r", encoding="utf-8") as f:
         tpl = f.read()
     return tpl.replace("<!--SSR_MSG-->", "")
+
+
+@app.get("/dashboard", response_class=HTMLResponse, include_in_schema=False)
+def customer_dashboard_page():
+    """Private human customer dashboard — invite-only, session-gated."""
+    with open("dail/customer_dashboard.html", "r", encoding="utf-8") as f:
+        return f.read()
 
 
 @app.post("/request-bounty", response_class=HTMLResponse, include_in_schema=False)
@@ -1967,6 +1981,156 @@ def world_notifications_ack(agent_id: str, req: BountyActionRequest, request: Re
     _own(request, agent_id)
     if req.agent_id != agent_id: raise HTTPException(403, "not_your_agent")
     return dail.world_agents.ack_notifications(agent_id)
+
+
+# --- Human customers (private dashboard) ---
+def _customer_session(request: Request) -> str:
+    """Extract session token from Authorization header, return customer_id."""
+    auth = request.headers.get("authorization", "")
+    token = auth[7:] if auth.lower().startswith("bearer ") else ""
+    try:
+        return dail.customers.verify_session(token)
+    except (PermissionError, KeyError) as e:
+        raise HTTPException(401, str(e))
+
+
+@app.post("/customers/redeem")
+def customer_redeem(req: dict):
+    """Redeem an invite code → customer account + session token."""
+    try:
+        return dail.customers.redeem_invite(
+            req.get("code", ""), req.get("name", ""), req.get("email", ""))
+    except KeyError as e:
+        raise HTTPException(404, str(e))
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+
+
+@app.post("/customers/logout")
+def customer_logout(request: Request):
+    auth = request.headers.get("authorization", "")
+    token = auth[7:] if auth.lower().startswith("bearer ") else ""
+    dail.customers.logout(token)
+    return {"ok": True}
+
+
+@app.get("/customers/me")
+def customer_me(request: Request):
+    cid = _customer_session(request)
+    c = dail.customers.get_customer(cid)
+    return {**c, "balance": dail.customers.balance(cid)}
+
+
+@app.get("/customers/me/tasks")
+def customer_tasks(request: Request):
+    cid = _customer_session(request)
+    return dail.customers.my_bounties(cid)
+
+
+@app.get("/customers/me/transactions")
+def customer_transactions(request: Request):
+    cid = _customer_session(request)
+    return dail.customers.transactions(cid)
+
+
+@app.post("/customers/me/tasks")
+def customer_post_task(req: dict, request: Request):
+    """Customer posts a task → creates a funded bounty. DAIL escrowed from
+    customer balance. Maps to the existing bounty system."""
+    cid = _customer_session(request)
+    poster = f"customer:{cid}"
+    title = (req.get("title") or "").strip()
+    description = (req.get("description") or "").strip()
+    try:
+        reward = int(req.get("reward", 0))
+    except (TypeError, ValueError):
+        raise HTTPException(400, "reward must be an integer")
+    if not title or len(title) > 120:
+        raise HTTPException(400, "title must be 1-120 characters")
+    if reward < 2:
+        raise HTTPException(400, "reward must be >= 2 DAIL")
+    # Ensure the customer has a ledger balance to escrow from
+    if dail.customers.balance(cid) < reward:
+        raise HTTPException(400, "insufficient balance — top up first")
+    # Register the shadow identity so post_bounty accepts the poster
+    if poster not in dail.social.identities:
+        c = dail.customers.get_customer(cid)
+        dail.social.identities[poster] = {"id": poster, "name": c["name"]}
+    try:
+        b = dail.world_agents.post_bounty(
+            poster, title, description, reward)
+    except (KeyError, ValueError, Exception) as e:
+        raise HTTPException(400, str(e))
+    return b
+
+
+@app.post("/customers/me/tasks/{bounty_id}/accept")
+def customer_accept_task(bounty_id: str, request: Request):
+    """Customer accepts a submission → releases escrow to the agent."""
+    cid = _customer_session(request)
+    poster = f"customer:{cid}"
+    wa = dail.world_agents
+    b = wa.bounties.get(bounty_id)
+    if not b:
+        raise HTTPException(404, "task not found")
+    if b.get("poster_id") != poster:
+        raise HTTPException(403, "not your task")
+    try:
+        return wa.accept_bounty(poster, bounty_id)
+    except (KeyError, ValueError, PermissionError) as e:
+        raise HTTPException(400, str(e))
+
+
+@app.post("/customers/me/tasks/{bounty_id}/reject")
+def customer_reject_task(bounty_id: str, req: dict, request: Request):
+    """Customer rejects a submission → bounty reopens for other agents."""
+    cid = _customer_session(request)
+    poster = f"customer:{cid}"
+    wa = dail.world_agents
+    b = wa.bounties.get(bounty_id)
+    if not b:
+        raise HTTPException(404, "task not found")
+    if b.get("poster_id") != poster:
+        raise HTTPException(403, "not your task")
+    try:
+        return wa.reject_bounty(poster, bounty_id)
+    except (KeyError, ValueError, PermissionError) as e:
+        raise HTTPException(400, str(e))
+
+
+@app.post("/admin/invites")
+def admin_create_invite(request: Request):
+    """Admin-only: generate an invite code for a human customer."""
+    if not request.state.is_admin:
+        raise HTTPException(403, "admin only")
+    return {"code": dail.customers.create_invite()}
+
+
+@app.get("/admin/invites")
+def admin_list_invites(request: Request):
+    if not request.state.is_admin:
+        raise HTTPException(403, "admin only")
+    return dail.customers.list_invites()
+
+
+@app.post("/admin/customers/{customer_id}/credit")
+def admin_credit_customer(customer_id: str, req: dict, request: Request):
+    """Admin-only: fund a customer account (for invite-phase top-ups)."""
+    if not request.state.is_admin:
+        raise HTTPException(403, "admin only")
+    try:
+        amount = int(req.get("amount", 0))
+    except (TypeError, ValueError):
+        raise HTTPException(400, "amount must be an integer")
+    if amount <= 0 or amount > 10000:
+        raise HTTPException(400, "amount must be 1-10000 DAIL")
+    dail.customers.get_customer(customer_id)  # validates existence
+    dail.ledger.credit(f"customer:{customer_id}", amount,
+                       kind="admin_credit",
+                       idem=f"admincredit:{customer_id}:{amount}:{req.get('note','')}")
+    return {"customer_id": customer_id,
+            "credited": amount,
+            "balance": dail.customers.balance(customer_id)}
 
 @app.get("/world/ledger/{agent_id}")
 def world_ledger(agent_id: str, request: Request):
