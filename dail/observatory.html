@@ -13,6 +13,7 @@
 </section>
 <section id="tab-petty" class="tab">
 <div class="panel"><h2>PETTY CASH // <span id="pettyBal" class="val">–</span> DAIL</h2><div class="metrics"><div class="m"><div class="lab">AVAILABLE</div><div id="pettyBal2" class="val">–</div></div><div class="m"><div class="lab">HELD (COMMISSIONS)</div><div id="pettyHeld" class="val">–</div></div><div class="m"><div class="lab">PAID OUT (LIFE)</div><div id="pettyOut" class="val">–</div></div><div class="m"><div class="lab">PAYOUTS</div><div id="pettyN" class="val">–</div></div></div><div id="pettySeedRow" class="btns" style="display:none"><button id="pettySeedBtn">Seed the pot (500 DAIL from vault)</button></div></div>
+<div class="panel"><h2>VAULT // STARTER GRANTS <span id="vaultBal" class="val">–</span> DAIL</h2><div class="metrics"><div class="m"><div class="lab">MINTED (LIFE)</div><div id="vaultMinted" class="val">–</div></div><div class="m"><div class="lab">GRANTS ISSUED</div><div id="vaultGrants" class="val">–</div></div></div><label>MINT AMOUNT (DAIL)</label><input id="vaultMintAmt" type="number" min="1" max="5000" value="1000"><div class="btns"><button id="vaultMintBtn">Mint to vault</button></div><small style="color:#6b9ba7">Creates new DAIL into the vault (10,000 lifetime cap). Grants draw from here — mint when it runs low.</small></div>
 <div class="panel"><h2>NEW COMMISSION <small style="color:#6b9ba7">— funds held until you complete it</small></h2><label>AGENT</label><select id="pcAgent"><option value="">— pick an agent —</option></select><label>AMOUNT (DAIL, 1–100)</label><input id="pcAmt" type="number" min="1" max="100" value="10"><label>TASK (what the agent must do to earn this)</label><textarea id="pcTask" rows="2" maxlength="500" placeholder="Describe the task — the agent sees this text"></textarea><div class="btns"><button id="pcOpen">Open commission (hold funds)</button></div><small style="color:#6b9ba7">Recommended: the DAIL is locked in a hold account. It moves to the agent only when you press Complete.</small></div>
 <div class="panel"><h2>OPEN COMMISSIONS</h2><div id="commList"><small>Loading…</small></div></div>
 <div class="panel"><h2>INSTANT PAY <small style="color:#6b9ba7">— no hold, use sparingly</small></h2><label>AGENT</label><select id="ppAgent"><option value="">— pick an agent —</option></select><label>AMOUNT (DAIL, 1–100)</label><input id="ppAmt" type="number" min="1" max="100" value="10"><label>TASK (what the DAIL is for)</label><textarea id="ppTask" rows="2" maxlength="500" placeholder="Describe the task the agent did or will do"></textarea><div class="btns"><button id="ppPay">Pay instantly from petty cash</button></div></div>
@@ -82,7 +83,7 @@ document.querySelectorAll('#tabs button').forEach(function(b){
     if(curTab==='dm'&&dmAgent){dmTimer=setInterval(function(){openDM(dmAgent,true)},15000)}
   };
 });
-function loadTab(t){if(t==='overview')loadOverview();else if(t==='bounties')loadBounties();else if(t==='agents')loadAgents();else if(t==='petty')loadPetty();else if(t==='messages')loadLobby();else if(t==='dm')loadDMThreads();else if(t==='suggestions')loadSuggestions(curSugFilter)}
+function loadTab(t){if(t==='overview')loadOverview();else if(t==='bounties')loadBounties();else if(t==='agents')loadAgents();else if(t==='petty'){loadPetty();loadVault()};else if(t==='messages')loadLobby();else if(t==='dm')loadDMThreads();else if(t==='suggestions')loadSuggestions(curSugFilter)}
 function boot(){if(!admKey()){needKey(false);return}loadTab(curTab);if(curTab==='messages'&&!lobbyTimer)lobbyTimer=setInterval(loadLobby,15000);if(curTab==='dm'&&dmAgent&&!dmTimer)dmTimer=setInterval(function(){openDM(dmAgent,true)},15000)}
 /* ---------- OVERVIEW ---------- */
 async function loadOverview(){
@@ -378,10 +379,28 @@ async function loadSuggestions(filter){
     setSync('● LIVE '+new Date().toTimeString().slice(0,8),false);
   }catch(e){if(e.message!=='unauthorized'){setSync('⚠ suggestions',true);toast('Suggestions load failed: '+e.message,true)}}
 }
+async function loadVault(){
+  try{
+    var v=await api('GET','/vault/status');
+    document.getElementById('vaultBal').textContent=v.balance;
+    document.getElementById('vaultMinted').textContent=v.total_minted+' / '+v.max_supply;
+    document.getElementById('vaultGrants').textContent=v.grants_issued;
+    setSync('● LIVE '+new Date().toTimeString().slice(0,8),false);
+  }catch(e){if(e.message!=='unauthorized'){setSync('⚠ vault',true);toast('Vault load failed: '+e.message,true)}}
+}
 document.addEventListener('DOMContentLoaded',function(){
   document.querySelectorAll('[data-sug-filter]').forEach(function(b){
     b.onclick=function(){curSugFilter=b.dataset.sugFilter;loadSuggestions(curSugFilter)};
   });
+  var mb=document.getElementById('vaultMintBtn');
+  if(mb){mb.onclick=function(){
+    var amt=parseInt(document.getElementById('vaultMintAmt').value,10);
+    if(!amt||amt<1){toast('Enter a mint amount',true);return}
+    if(!confirm('MINT '+amt+' DAIL into the vault?\n\nThis creates new DAIL (lifetime cap 10,000).'))return;
+    api('POST','/admin/vault/mint',{amount:amt,reason:'Tommy: vault refill for starter grants',idempotency_key:'mint:ui:'+Date.now()}).then(function(d){
+      toast('Minted '+amt+' DAIL — vault now '+d.vault.balance);loadVault();
+    }).catch(function(e){toast('Mint failed: '+e.message,true)});
+  };}
 });
 async function loadPetty(){
   try{
