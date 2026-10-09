@@ -80,3 +80,21 @@ def test_admin_lobby_message_mention_notifies_staff():
     assert r.status_code == 200, r.text
     notifs = r.json()["notifications"]
     assert any(n.get("from_id") == "dail_concierge" for n in notifs), notifs
+
+
+def test_observatory_html_js_parses():
+    # Regression (2026-10-09): a stray semicolon in loadTab broke the
+    # entire Observatory page — the script failed to parse, so no tab
+    # loaded. Extract the inline script and syntax-check it with node.
+    import re
+    import shutil
+    import subprocess
+    from pathlib import Path
+    html = Path("dail/observatory.html").read_text(encoding="utf-8")
+    m = re.search(r"<script>(.*)</script>", html, re.S)
+    assert m, "no inline script found in observatory.html"
+    node = shutil.which("node")
+    assert node, "node required for JS syntax check"
+    r = subprocess.run([node, "--check", "-"], input=m.group(1),
+                       capture_output=True, text=True, timeout=30)
+    assert r.returncode == 0, f"observatory.html JS syntax error: {r.stderr[:500]}"
