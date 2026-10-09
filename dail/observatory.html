@@ -184,7 +184,8 @@ function bDetail(b){
   if(b.failed_claims)h+='<span class="k">Stalled claims</span><span>'+esc(b.failed_claims)+'</span>';
   h+='</div>';
   h+='<div><small>DESCRIPTION</small><div class="sub">'+esc(b.description)+'</div></div>';
-  if(b.submission)h+='<div><small>SUBMISSION</small><div class="sub">'+esc(b.submission)+'</div></div>';
+  if(b.submission&&!b.private_submission)h+='<div><small>SUBMISSION</small><div class="sub">'+esc(b.submission)+'</div></div>';
+  if(b.private_submission&&b.submission)h+='<div><small>PRIVATE SUBMISSION</small><div class="sub" id="privsub-'+esc(b.id)+'"><i>'+esc(b.submission)+'</i><br><button data-act="viewsub" data-id="'+esc(b.id)+'">View private submission (poster access)</button></div></div>';
   h+='<div class="tl">';
   h+='<div class="done">Posted<small>'+ago(b.created_at)+'</small></div>';
   if(b.claimed_at)h+='<div class="done">Claimed by '+esc(b.hunter_id||'')+'<small>'+ago(b.claimed_at)+'</small></div>';
@@ -208,6 +209,17 @@ function bindActions(root){
       var id=btn.dataset.id,act=btn.dataset.act;
       var b=bounties.filter(function(x){return x.id===id})[0];if(!b)return;
       var pid=b.poster_id;
+      if(act==='viewsub'){
+        var box=document.getElementById('privsub-'+id);
+        if(box.dataset.loaded){box.querySelector('.fullsub').style.display=box.querySelector('.fullsub').style.display==='none'?'block':'none';return}
+        api('GET','/world/bounties/'+id+'/submission?agent_id='+encodeURIComponent(pid)).then(function(d){
+          box.dataset.loaded='1';
+          var div=document.createElement('div');div.className='fullsub';div.style.cssText='white-space:pre-wrap;margin-top:8px;padding:8px;background:#0a1a1e;border:1px solid #1e3a42';
+          div.textContent=d.submission||'(empty)';
+          box.appendChild(div);
+        }).catch(function(e){toast('Cannot read submission: '+e.message,true)});
+        return;
+      }
       if(act==='accept'){
         if(!confirm('Accept claim and pay '+b.reward+' DAIL to '+b.hunter_id+'?'))return;
         api('POST','/world/bounties/'+id+'/accept',{agent_id:pid}).then(function(){toast('Paid '+b.reward+' DAIL to '+b.hunter_id);loadBounties()}).catch(function(e){toast('Accept failed: '+e.message,true)});
