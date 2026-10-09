@@ -170,7 +170,24 @@ async function rejectTask(id){
   try{await api(`/customers/me/tasks/${id}/reject`,{method:'POST',body:'{}'});load();}
   catch(e){alert(e.message);}
 }
-function topup(){alert('Top-ups are handled by the DAiL team during the invite phase. Ask for more credit anytime.');}
+async function topup(){
+  const amt=prompt('How much to add? (USD, min $1)','20');
+  if(!amt)return;
+  const cents=Math.round(parseFloat(amt)*100);
+  if(!cents||cents<100){alert('Minimum $1.');return;}
+  try{
+    const d=await api('/customers/me/checkout',{method:'POST',
+      body:JSON.stringify({usd_cents:cents,
+        idempotency_key:'cust-topup-'+Date.now()})});
+    window.location.href=d.checkout_url;
+  }catch(e){alert('Top-up failed: '+e.message);}
+}
+// Show a confirmation if returning from Stripe
+if(new URLSearchParams(location.search).get('topup')==='success'){
+  alert('Payment received — your DAIL will appear shortly.');
+  history.replaceState({},'',location.pathname);
+  load();
+}
 function escapeHtml(s){return String(s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));}
 
 if(token)load();else showLogin();

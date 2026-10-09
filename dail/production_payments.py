@@ -134,9 +134,25 @@ class ProductionPayments:
                 "dail_amount": row[4], "status": row[5], "transaction_id": row[8]}
 
     def create_checkout(self, agent_id, usd_cents, success_url, cancel_url, idempotency_key=None):
+        return self._create_checkout_for(agent_id, usd_cents, success_url,
+                                         cancel_url, idempotency_key)
+
+    def create_customer_checkout(self, customer_id, usd_cents, success_url,
+                                 cancel_url, idempotency_key=None):
+        """Stripe checkout for a human customer. Stored with a customer:
+        prefix so the webhook credits the right ledger account."""
+        # Validate the customer exists
+        self.dail.customers.get_customer(customer_id)
+        return self._create_checkout_for(f"customer:{customer_id}", usd_cents,
+                                         success_url, cancel_url,
+                                         idempotency_key)
+
+    def _create_checkout_for(self, account_id, usd_cents, success_url,
+                             cancel_url, idempotency_key=None):
         self._require_ready()
         self._init_db()  # self-healing: ensure the payments table exists
-        if agent_id not in self.dail.agents:
+        is_customer = account_id.startswith("customer:")
+        if not is_customer and account_id not in self.dail.agents:
             raise KeyError("agent not found")
         if usd_cents < 100 or usd_cents > 1000000:
             raise ValueError("amount must be between $1 and $10,000")
@@ -151,10 +167,10 @@ class ProductionPayments:
         with self.engine.begin() as c:
             pending = c.execute(
                 text("SELECT COUNT(*) FROM dail_payments WHERE agent_id=:a AND status='pending'"),
-                {"a": agent_id}).scalar()
+                {"a": account_id}).scalar()
         if pending >= MAX_PENDING_PER_AGENT:
             raise PaymentRateLimited(
-                f"too many pending checkouts for agent {agent_id} (max {MAX_PENDING_PER_AGENT})")
+                f"too many pending checkouts for {account_id} (max {MAX_PENDING_PER_AGENT})")
         create_kwargs = dict(
             mode="payment", payment_method_types=["card"],
             line_items=[{"price_data": {"currency": "usd",
@@ -162,7 +178,7 @@ class ProductionPayments:
                                        "unit_amount": usd_cents},
                         "quantity": 1}],
             success_url=success_url, cancel_url=cancel_url,
-            metadata={"agent_id": agent_id, "dail_amount": str(dail_amount)})
+            metadata={"agent_id": account_id, "dail_amount": str(dail_amount)})
         if idempotency_key:
             session = stripe.checkout.Session.create(idempotency_key=idempotency_key, **create_kwargs)
         else:
@@ -172,7 +188,7 @@ class ProductionPayments:
                 c.execute(text(
                     "INSERT INTO dail_payments (id, agent_id, session_id, usd_cents, dail_amount, status, created_at)"
                     " VALUES (:id,:agent,:sid,:usd,:dail,'pending',:created)"),
-                    {"id": session.id, "agent": agent_id, "sid": session.id,
+                    {"id": session.id, "agent": account_id, "sid": session.id,
                      "usd": usd_cents, "dail": dail_amount, "created": _now()})
         except IntegrityError:
             # Client retried with the same Stripe idempotency key: Stripe
@@ -207,7 +223,18 @@ class ProductionPayments:
                         "session_id": sid, "transaction_id": record["transaction_id"]}
             agent_id = record["agent_id"]
             dail_amount = int(record["dail_amount"])
-            if agent_id not in self.dail.agents:
+            is_customer = agent_id.startswith("customer:")
+            if is_customer:
+                # Human customer: validate + credit their shadow ledger account
+                try:
+                    self.dail.customers.get_customer(agent_id[len("customer:"):])
+                except KeyError:
+                    with self.engine.begin() as c:
+                        c.execute(text("UPDATE dail_payments SET status='orphaned' WHERE session_id=:sid"),
+                                  {"sid": sid})
+                    raise ValueError(
+                        f"customer {agent_id} not found for paid session {sid}: manual reconciliation required")
+            elif agent_id not in self.dail.agents:
                 with self.engine.begin() as c:
                     c.execute(text("UPDATE dail_payments SET status='orphaned' WHERE session_id=:sid"),
                               {"sid": sid})
@@ -219,7 +246,8 @@ class ProductionPayments:
             # the two is recovered by the next webhook retry instead of
             # silently losing the customer's credit.
             tx = self.dail.ledger.credit(agent_id, dail_amount, kind="stripe_deposit", idem=f"stripe:{sid}")
-            self.dail.agents[agent_id].balance = self.dail.ledger.balances[agent_id]
+            if not is_customer:
+                self.dail.agents[agent_id].balance = self.dail.ledger.balances[agent_id]
             with self.engine.begin() as c:
                 updated = c.execute(
                     text("UPDATE dail_payments SET status='paid', paid_at=:paid, transaction_id=:tx"
@@ -238,11 +266,13 @@ class ProductionPayments:
             # the standard _notify() path (fires webhooks when configured).
             # Repeated Stripe callbacks for the same session can never
             # duplicate the event or the notification.
-            self.dail.world_agents.notify_payment_event(
-                f"stripe:{sid}", agent_id, "stripe_topup", dail_amount,
-                {"type": "topup_credited", "rail": "stripe",
-                 "session_id": sid, "amount_dail": dail_amount,
-                 "transaction_id": tx.id})
+            # Customers don't get agent notifications — they see it on refresh.
+            if not is_customer:
+                self.dail.world_agents.notify_payment_event(
+                    f"stripe:{sid}", agent_id, "stripe_topup", dail_amount,
+                    {"type": "topup_credited", "rail": "stripe",
+                     "session_id": sid, "amount_dail": dail_amount,
+                     "transaction_id": tx.id})
             return {"received": True, "handled": True, "duplicate": False,
                     "session_id": sid, "transaction_id": tx.id}
 

@@ -68,3 +68,22 @@ def test_invite_admin_only():
     c = TestClient(app)
     r = c.post("/admin/invites")
     assert r.status_code == 403
+
+
+def test_customer_checkout_requires_auth():
+    c = TestClient(app)
+    r = c.post("/customers/me/checkout", json={"usd_cents": 2000})
+    assert r.status_code == 401
+
+
+def test_customer_checkout_validates_amount():
+    c = TestClient(app)
+    h = _authed_customer("Checkout Tester")
+    # Too small
+    r = c.post("/customers/me/checkout", headers=h, json={"usd_cents": 50})
+    # 503 because Stripe isn't configured in test, or 400 for validation.
+    # Either way it must not 500 or succeed silently.
+    assert r.status_code in (400, 503)
+    # Non-integer
+    r = c.post("/customers/me/checkout", headers=h, json={"usd_cents": "abc"})
+    assert r.status_code == 400

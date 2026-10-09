@@ -96,7 +96,8 @@ _CUSTOM_AUTH = {("POST", "/payments/webhook"), ("POST", "/safe/withdraw"),
                 ("POST", "/customers/redeem"), ("POST", "/customers/logout"),
                 ("GET", "/customers/me"), ("GET", "/customers/me/tasks"),
                 ("GET", "/customers/me/transactions"),
-                ("POST", "/customers/me/tasks")}
+                ("POST", "/customers/me/tasks"),
+                ("POST", "/customers/me/checkout")}
 _CUSTOM_AUTH_PREFIXES = ("/customers/me/tasks/",)
 # Admin-only:
 _ADMIN_EXACT = {"/observatory/events", "/payments/announce", "/world/tick"}
@@ -2111,6 +2112,31 @@ def admin_list_invites(request: Request):
     if not request.state.is_admin:
         raise HTTPException(403, "admin only")
     return dail.customers.list_invites()
+
+
+@app.post("/customers/me/checkout")
+def customer_checkout(req: dict, request: Request):
+    """Customer self-serve top-up: creates a Stripe Checkout session.
+    Returns {checkout_url} — the dashboard redirects the human there."""
+    cid = _customer_session(request)
+    try:
+        usd_cents = int(req.get("usd_cents", 0))
+    except (TypeError, ValueError):
+        raise HTTPException(400, "usd_cents must be an integer")
+    base = str(request.base_url).rstrip("/")
+    try:
+        result = production_payments.create_customer_checkout(
+            cid, usd_cents,
+            success_url=f"{base}/dashboard?topup=success",
+            cancel_url=f"{base}/dashboard?topup=cancelled",
+            idempotency_key=(req.get("idempotency_key") or None))
+    except KeyError as e:
+        raise HTTPException(404, str(e))
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    except Exception as e:
+        raise HTTPException(503, f"{type(e).__name__}: {e}")
+    return {"checkout_url": result["checkout_url"]}
 
 
 @app.post("/admin/customers/{customer_id}/credit")
