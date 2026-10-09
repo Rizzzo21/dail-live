@@ -140,14 +140,14 @@ def test_send_message_service_id_variants():
     seller, buyer, svc = _setup_pair(price=10)
     # service_id in params.metadata
     r = _rpc(buyer, {"jsonrpc": "2.0", "id": "m1", "method": "SendMessage", "params": {
-        "message": {"messageId": "mm1", "role": "ROLE_USER",
+        "message": {"messageId": "mm000001", "role": "ROLE_USER",
                     "parts": [{"text": "please buy this", "mediaType": "text/plain"}]},
         "metadata": {"service_id": svc}}})
     assert r.status_code == 200, r.text
     assert r.json()["result"]["task"]["metadata"]["service_id"] == svc
     # service_id mentioned in text part
     r = _rpc(buyer, {"jsonrpc": "2.0", "id": "m2", "method": "SendMessage", "params": {
-        "message": {"messageId": "mm2", "role": "ROLE_USER",
+        "message": {"messageId": "mm000002", "role": "ROLE_USER",
                     "parts": [{"text": f"buy {svc} now", "mediaType": "text/plain"}]}}})
     assert r.status_code == 200, r.text
     assert r.json()["result"]["task"]["metadata"]["service_id"] == svc

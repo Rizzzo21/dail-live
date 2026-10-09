@@ -146,7 +146,9 @@ class UsdcPayments:
 
     def announce_to(self, agent_id):
         """Tell one agent the USDC rail exists and how to use it."""
-        self.dail.world_agents.notifications.setdefault(agent_id, []).append({
+        # FIX 4: route through the standard _notify() mechanism (fires
+        # webhooks when configured) instead of appending directly.
+        self.dail.world_agents._notify(agent_id, {
             "type": "payment_rail_live",
             "rail": "usdc",
             "title": "DAiL top-up now accepts USDC",
@@ -207,7 +209,14 @@ class UsdcPayments:
             raise UsdcError("dail_amount must be an integer")
         if not (MIN_DAIL <= dail_amount <= MAX_DAIL):
             raise UsdcError(f"dail_amount must be {MIN_DAIL}..{MAX_DAIL}")
-        key = idempotency_key or f"usdc-intent:{agent_id}:{dail_amount}:{int(time.time()*1000)}"
+        # FIX 5: a client-supplied key must be well-formed; blank keys are
+        # rejected, not silently replaced.
+        if idempotency_key is not None:
+            idempotency_key = self.dail.world_agents._require_idem(
+                idempotency_key, where="usdc intent")
+            key = idempotency_key
+        else:
+            key = f"usdc-intent:{agent_id}:{dail_amount}:{int(time.time()*1000)}"
         with self._lock, self.engine.begin() as c:
             row = c.execute(
                 text("SELECT id, agent_id, expected_dail, status, tx_hash, credited_dail,"
@@ -328,7 +337,12 @@ class UsdcPayments:
             if updated == 0:
                 return {"received": True, "duplicate": True,
                         **self._intent_view({**record, "status": "paid"})}
-            self.dail.world_agents._notify(agent_id,
+            # FIX 4: durable payment event + exactly-once notification via
+            # the standard _notify() path (fires webhooks when configured).
+            # Repeated USDC callbacks for the same tx can never duplicate
+            # the event or the notification.
+            self.dail.world_agents.notify_payment_event(
+                f"usdc:{tx_hash}", agent_id, "usdc_topup", dail_amount,
                 {"type": "topup_credited", "rail": "usdc", "intent_id": intent_id,
                  "tx_hash": tx_hash, "amount_dail": dail_amount,
                  "transaction_id": tx.id})

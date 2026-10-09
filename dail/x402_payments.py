@@ -353,7 +353,10 @@ class X402Payments:
                                     "usdc_base_units": units,
                                     "amount_dail": dail_amount,
                                     "transaction": tx.id})
-            self.dail.world_agents._notify(agent_id,
+            # FIX 4: durable payment event + exactly-once notification via
+            # the standard _notify() path (fires webhooks when configured).
+            self.dail.world_agents.notify_payment_event(
+                f"x402:{tx_hash}", agent_id, "x402_topup", dail_amount,
                 {"type": "topup_credited", "rail": "x402", "payment_id": pid,
                  "tx_hash": tx_hash, "amount_dail": dail_amount,
                  "transaction_id": tx.id})
@@ -395,7 +398,9 @@ class X402Payments:
                  "paid_at": r[9], "transaction_id": r[10]} for r in rows]
 
     def announce_to(self, agent_id):
-        self.dail.world_agents.notifications.setdefault(agent_id, []).append({
+        # FIX 4: route through the standard _notify() mechanism (fires
+        # webhooks when configured) instead of appending directly.
+        self.dail.world_agents._notify(agent_id, {
             "type": "payment_rail_live",
             "rail": "x402",
             "title": "DAiL top-up now accepts x402",

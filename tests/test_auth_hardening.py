@@ -155,18 +155,18 @@ def test_purchase_idempotency():
         headers=_auth(ks)).json()
     bal0 = client.get(f"/ledger/{b}", headers=_auth(kb)).json()["balance"]
     p1 = client.post("/world/services/purchase", json={
-        "buyer_id": b, "service_id": svc["id"], "idempotency_key": "idem-1"},
+        "buyer_id": b, "service_id": svc["id"], "idempotency_key": "idem-0001"},
         headers=_auth(kb)).json()
     # retry with the same key: same order, no second escrow hold
     p2 = client.post("/world/services/purchase", json={
-        "buyer_id": b, "service_id": svc["id"], "idempotency_key": "idem-1"},
+        "buyer_id": b, "service_id": svc["id"], "idempotency_key": "idem-0001"},
         headers=_auth(kb)).json()
     assert p1["order_id"] == p2["order_id"]
     bal1 = client.get(f"/ledger/{b}", headers=_auth(kb)).json()["balance"]
     assert bal1 == bal0 - 30
     # a new key is a new purchase
     p3 = client.post("/world/services/purchase", json={
-        "buyer_id": b, "service_id": svc["id"], "idempotency_key": "idem-2"},
+        "buyer_id": b, "service_id": svc["id"], "idempotency_key": "idem-0002"},
         headers=_auth(kb)).json()
     assert p3["order_id"] != p1["order_id"]
     bal2 = client.get(f"/ledger/{b}", headers=_auth(kb)).json()["balance"]
@@ -182,10 +182,10 @@ def test_idempotency_key_scoped_per_buyer():
         "provider_id": s, "name": "S", "description": "d", "price": 10},
         headers=_auth(ks)).json()
     o1 = client.post("/world/services/purchase", json={
-        "buyer_id": b1, "service_id": svc["id"], "idempotency_key": "shared"},
+        "buyer_id": b1, "service_id": svc["id"], "idempotency_key": "shared-key-0001"},
         headers=_auth(k1)).json()
     o2 = client.post("/world/services/purchase", json={
-        "buyer_id": b2, "service_id": svc["id"], "idempotency_key": "shared"},
+        "buyer_id": b2, "service_id": svc["id"], "idempotency_key": "shared-key-0001"},
         headers=_auth(k2)).json()
     assert o1["order_id"] != o2["order_id"]
 

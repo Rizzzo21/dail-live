@@ -1,8 +1,25 @@
 import hashlib
 import hmac
+import re
 import secrets
 
 SAFE_ACCOUNT = "DAIL_SAFE"
+
+# FIX 5 (2026-10-08): idempotency-key format shared with
+# AgentWorld._require_idem (duplicated here to avoid a service->wallet
+# import cycle). Keys must be 8..128 chars, alphanumeric plus : _ - .
+_IDEM_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9:_\-\.]{6,126}[A-Za-z0-9]$")
+
+
+def _require_withdraw_idem(key):
+    cleaned = (key or "").strip() if isinstance(key, str) else ""
+    if not cleaned:
+        raise ValueError("idempotency_key is required for safe_withdraw")
+    if not _IDEM_RE.match(cleaned):
+        raise ValueError(
+            "idempotency_key for safe_withdraw must be 8..128 chars, "
+            "alphanumeric plus : _ - .")
+    return cleaned
 
 
 class SafeWallet:
@@ -110,6 +127,9 @@ class SafeWallet:
             raise PermissionError("withdrawal_key_invalid")
         if not destination or len(destination) > 200:
             raise ValueError("invalid_destination")
+        # FIX 5 (2026-10-08): withdrawals are money movement; the
+        # idempotency key is mandatory and validated (blank keys rejected).
+        idem = _require_withdraw_idem(idem)
         tx = self.ledger.transfer(
             SAFE_ACCOUNT,
             f"withdrawal:{destination}",

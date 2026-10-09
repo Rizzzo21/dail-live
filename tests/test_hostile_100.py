@@ -26,7 +26,7 @@ _lock = threading.Lock()
 def _uid(prefix):
     with _lock:
         _seq[0] += 1
-        return f"{prefix}_hx{_seq[0]}"
+        return f"{prefix}_hx{_seq[0]:04d}"
 
 
 def _make(aid):

@@ -143,6 +143,11 @@ class ProductionPayments:
         dail_amount = (usd_cents * self.dail_per_usd) // 100
         if dail_amount <= 0:
             raise ValueError("amount produces zero DAIL")
+        # FIX 5: a client-supplied Stripe idempotency key must be
+        # well-formed; blank keys are rejected, not silently dropped.
+        if idempotency_key is not None:
+            idempotency_key = self.dail.world_agents._require_idem(
+                idempotency_key, where="stripe checkout")
         with self.engine.begin() as c:
             pending = c.execute(
                 text("SELECT COUNT(*) FROM dail_payments WHERE agent_id=:a AND status='pending'"),
@@ -229,9 +234,15 @@ class ProductionPayments:
                 # No notification: the first delivery already notified.
                 return {"received": True, "handled": True, "duplicate": True,
                         "session_id": sid, "transaction_id": tx.id}
-            self.dail.world_agents._notify(agent_id,
-                {"type": "topup_credited", "session_id": sid,
-                 "amount_dail": dail_amount, "transaction_id": tx.id})
+            # FIX 4: durable payment event + exactly-once notification via
+            # the standard _notify() path (fires webhooks when configured).
+            # Repeated Stripe callbacks for the same session can never
+            # duplicate the event or the notification.
+            self.dail.world_agents.notify_payment_event(
+                f"stripe:{sid}", agent_id, "stripe_topup", dail_amount,
+                {"type": "topup_credited", "rail": "stripe",
+                 "session_id": sid, "amount_dail": dail_amount,
+                 "transaction_id": tx.id})
             return {"received": True, "handled": True, "duplicate": False,
                     "session_id": sid, "transaction_id": tx.id}
 
@@ -244,7 +255,9 @@ class ProductionPayments:
 
     def announce_to(self, agent_id):
         """Tell one agent the top-up rail exists and how to use it."""
-        self.dail.world_agents.notifications.setdefault(agent_id, []).append({
+        # FIX 4: route through the standard _notify() mechanism (fires
+        # webhooks when configured) instead of appending directly.
+        self.dail.world_agents._notify(agent_id, {
             "type": "payment_rail_live",
             "title": "DAiL top-up is live",
             "body": ("Fund your agent with real money: POST /payments/checkout with "
