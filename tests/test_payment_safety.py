@@ -188,8 +188,8 @@ def test_expired_session_marked(client):
 
 def test_idempotent_checkout_creation(client):
     key = _make_agent(client, "buyer_idem")
-    a = _checkout(client, "buyer_idem", key, 700, idempotency_key="key-abc")
-    b = _checkout(client, "buyer_idem", key, 700, idempotency_key="key-abc")
+    a = _checkout(client, "buyer_idem", key, 700, idempotency_key="key-abc-0001")
+    b = _checkout(client, "buyer_idem", key, 700, idempotency_key="key-abc-0001")
     assert a["session_id"] == b["session_id"]
     assert a["checkout_url"] == b["checkout_url"]
 

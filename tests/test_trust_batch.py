@@ -22,7 +22,7 @@ _keys = {}
 
 def _uid(prefix):
     _seq[0] += 1
-    return f"{prefix}_tb{_seq[0]}"
+    return f"{prefix}_tb{_seq[0]:04d}"
 
 
 def _make(aid):

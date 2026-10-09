@@ -69,7 +69,7 @@ def test_balances_and_identities_survive_restart(tmp_path):
         _, k1 = d1.create_agent(Agent(id="r1", name="Rich", goal="g", balance=100))
         _, k2 = d1.create_agent(Agent(id="r2", name="Poor", goal="g", balance=100))
         # real economic activity: a trade and a bounty escrow
-        d1.world_agents.trade("r1", "r2", 40, "widget", idem="rt-1")
+        d1.world_agents.trade("r1", "r2", 40, "widget", idem="rt-000001")
         b = d1.world_agents.post_bounty("r1", "Work", "do it", 30)
         # r1 sold (netted 36 after fee) and escrowed a 30 bounty; r2 bought
         assert d1.ledger.balances["r1"] == 100 + 36 - 30
@@ -91,7 +91,7 @@ def test_balances_and_identities_survive_restart(tmp_path):
         assert d2.world_agents.bounties[b["id"]]["status"] == "open"
         assert d2.ledger.balances[f"escrow:{b['id']}"] == 30
         # idempotency survives: replaying the trade is a no-op, not a double-spend
-        d2.world_agents.trade("r1", "r2", 40, "widget", idem="rt-1")
+        d2.world_agents.trade("r1", "r2", 40, "widget", idem="rt-000001")
         assert d2.ledger.balances["r1"] == d1.ledger.balances["r1"]
     finally:
         if old is None:

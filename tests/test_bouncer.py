@@ -143,6 +143,9 @@ def test_banned_agent_restores_without_crashing():
             [("badguy", "Bad Guy", "g", 10000, 2500, "weird_status")],
             [], [], {}, [], [],
         )),
+        "load_profiles": staticmethod(lambda: {}),
+        "load_trades": staticmethod(lambda: {}),
+        "save_profile": staticmethod(lambda p: None),
     })()
     inst.ledger = Ledger(inst.audit)
     inst.social = SocialWorld(inst.ledger, inst.audit)

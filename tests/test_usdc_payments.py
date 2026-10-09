@@ -68,7 +68,7 @@ def api(tmp_path):
     return client, api_mod, {"Authorization": f"Bearer {key}"}
 
 
-def _intent(client, auth, amount=25, key="k1"):
+def _intent(client, auth, amount=25, key="usdc-k1-0001"):
     r = client.post("/payments/usdc/intent", headers=auth,
                     json={"agent_id": "usdc_buyer", "dail_amount": amount,
                           "idempotency_key": key})
@@ -76,7 +76,7 @@ def _intent(client, auth, amount=25, key="k1"):
     return r.json()
 
 
-def _confirm(client, auth, intent_id, tx_hash, key="c1"):
+def _confirm(client, auth, intent_id, tx_hash, key="usdc-c1-0001"):
     return client.post("/payments/usdc/confirm", headers=auth,
                        json={"agent_id": "usdc_buyer", "intent_id": intent_id,
                              "tx_hash": tx_hash, "idempotency_key": key})
@@ -116,11 +116,11 @@ def test_replay_same_tx_no_double_credit(api):
     client, mod, auth = api
     intent = _intent(client, auth)
     with patch.object(mod.usdc_payments.chain, "_rpc", _rpc_factory(_receipt())):
-        r1 = _confirm(client, auth, intent["intent_id"], TX, key="c1")
+        r1 = _confirm(client, auth, intent["intent_id"], TX, key="usdc-c1-0001")
         assert r1.json()["duplicate"] is False
         # Same tx submitted again (new intent): duplicate, no second credit.
-        intent2 = _intent(client, auth, key="k2")
-        r2 = _confirm(client, auth, intent2["intent_id"], TX, key="c2")
+        intent2 = _intent(client, auth, key="usdc-k2-0001")
+        r2 = _confirm(client, auth, intent2["intent_id"], TX, key="usdc-c2-0001")
     assert r2.status_code == 200
     assert r2.json()["duplicate"] is True
     # 100 starter + 25 credited exactly once
@@ -129,10 +129,10 @@ def test_replay_same_tx_no_double_credit(api):
 
 def test_concurrent_confirm_same_tx_single_credit(api):
     client, mod, auth = api
-    i1, i2 = _intent(client, auth, key="k1"), _intent(client, auth, key="k2")
+    i1, i2 = _intent(client, auth, key="usdc-k1-0001"), _intent(client, auth, key="usdc-k2-0001")
     with patch.object(mod.usdc_payments.chain, "_rpc", _rpc_factory(_receipt())):
-        r1 = _confirm(client, auth, i1["intent_id"], TX, key="c1")
-        r2 = _confirm(client, auth, i2["intent_id"], TX, key="c2")
+        r1 = _confirm(client, auth, i1["intent_id"], TX, key="usdc-c1-0001")
+        r2 = _confirm(client, auth, i2["intent_id"], TX, key="usdc-c2-0001")
     assert r1.json()["duplicate"] is False
     assert r2.json()["duplicate"] is True
     assert _bal(client, auth) == 125
@@ -200,8 +200,8 @@ def test_bad_tx_hash_rejected(api):
 
 def test_intent_idempotent(api):
     client, _, auth = api
-    a = _intent(client, auth, key="same")
-    b = _intent(client, auth, key="same")
+    a = _intent(client, auth, key="usdc-same-0001")
+    b = _intent(client, auth, key="usdc-same-0001")
     assert a["intent_id"] == b["intent_id"]
 
 
@@ -264,10 +264,10 @@ def test_rpc_fallback_when_primary_flakes(api, tmp_path):
         return _Resp({"jsonrpc": "2.0", "id": 1, "result": "0x110"})
 
     client, mod, auth = api
-    intent = _intent(client, auth, key="fb1")
+    intent = _intent(client, auth, key="usdc-fb1-0001")
     before = _bal(client, auth)
     with patch.object(urllib.request, "urlopen", flaky):
-        r = _confirm(client, auth, intent["intent_id"], TX, key="fbc1")
+        r = _confirm(client, auth, intent["intent_id"], TX, key="usdc-fbc1-0001")
     assert r.status_code == 200, r.text
     assert r.json()["credited_dail"] == 25
     assert _bal(client, auth) == before + 25

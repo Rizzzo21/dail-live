@@ -141,6 +141,16 @@ class Dail:
         if not self.store.enabled:
             return
         agent_rows, tx_rows, order_rows, kv, service_rows, bulletin_rows = self.store.load_all()
+        # FIX 2/3: load profiles and trades from their dedicated tables
+        # FIRST, before the agent loop below calls ensure_agent() (which
+        # would otherwise overwrite the DB rows with blank defaults).
+        # The legacy kv blobs are kept as migration fallbacks.
+        _db_profiles = self.store.load_profiles()
+        _kv_profiles = kv.get("profiles", {}) or {}
+        self.world_agents.profiles = _db_profiles if _db_profiles else _kv_profiles
+        _db_trades = self.store.load_trades()
+        _kv_trades = kv.get("trades", {}) or {}
+        self.world_agents.trades = _db_trades if _db_trades else _kv_trades
         for r in agent_rows:
             # Never let one bad row crash the whole service on restart:
             # coerce unknown statuses to "disabled" and audit it.
@@ -178,8 +188,6 @@ class Dail:
         self.world_agents.agent_created = kv.get("agent_created", {})
         self.world_agents.purchase_idem = kv.get("purchase_idem", {})
         self.world_agents.trade_idem = kv.get("trade_idem", {})
-        self.world_agents.profiles = kv.get("profiles", {}) or {}
-        self.world_agents.trades = kv.get("trades", {}) or {}
         self.world_agents.trade_seq = int(kv.get("trade_seq", 0) or 0)
         self.world_agents.social.msg_seq = int(kv.get("msg_seq", 0) or 0)
         if self.world_agents.trade_seq == 0 and self.world_agents.trades:
@@ -638,6 +646,9 @@ class Dail:
 
     def deposit(self, agent_id, amount, provider, idem):
         self._agent(agent_id)
+        # FIX 5: deposits are money movement; the idempotency key is
+        # mandatory and validated (blank keys rejected, not ignored).
+        idem = self.world_agents._require_idem(idem, where="deposit")
         tx = self.payment.deposit(agent_id, amount, idem)
         self.agents[agent_id].balance = self.ledger.balances[agent_id]
         return tx
@@ -1300,11 +1311,31 @@ class AgentWorld:
         return grant
 
     def ensure_agent(self, agent):
-        self.profiles.setdefault(agent.id, {
-            "agent_id":agent.id, "bio":"", "capabilities":[],
-            "reputation":100, "online":True
-        })
+        # FIX 2 (2026-10-08): profiles live in the dedicated dail_profiles
+        # table, written immediately -- never in-memory-only. created_at is
+        # stamped on first creation and never overwritten by later calls.
+        now = datetime.now(timezone.utc).isoformat()
+        existing = self.profiles.get(agent.id)
+        if existing is None:
+            name = ""
+            try:
+                name = self.social.identities.get(agent.id, {}).get("name", "") or ""
+            except Exception:
+                name = ""
+            self.profiles[agent.id] = {
+                "agent_id": agent.id, "display_name": name,
+                "bio": "", "capabilities": [],
+                "reputation": 100, "online": True,
+                "created_at": now, "updated_at": now,
+            }
+        else:
+            # Backfill fields added after the profile was first created.
+            existing.setdefault("display_name", "")
+            existing.setdefault("created_at", now)
+            existing["updated_at"] = now
         self.notifications.setdefault(agent.id, [])
+        if self.store:
+            self.store.save_profile(self.profiles[agent.id])
 
     def profile(self, agent_id):
         if agent_id not in self.social.identities: raise KeyError("agent not found")
@@ -1316,8 +1347,13 @@ class AgentWorld:
     def update_profile(self, agent_id, bio, capabilities):
         if agent_id not in self.social.identities: raise KeyError("agent not found")
         self.ensure_agent(type("A",(),{"id":agent_id})())
+        # FIX 2: write-through to the DB immediately; a restart right after
+        # this call must see the identical profile.
         self.profiles[agent_id]["bio"]=bio
         self.profiles[agent_id]["capabilities"]=capabilities
+        self.profiles[agent_id]["updated_at"]=datetime.now(timezone.utc).isoformat()
+        if self.store:
+            self.store.save_profile(self.profiles[agent_id])
         self._save_kv()
         self.audit.append("profile.updated", {"agent_id":agent_id,"capabilities":capabilities})
         return self.profile(agent_id)
@@ -1425,13 +1461,25 @@ class AgentWorld:
 
         idem is a client-supplied idempotency key: repeating a purchase with
         the same (buyer, key) returns the original order instead of creating
-        a second escrow hold."""
+        a second escrow hold. FIX 5: a provided key must be well-formed
+        (blank keys are rejected, not silently ignored); the DB-level
+        dail_idempotency registry backstops the in-memory map."""
         if buyer_id not in self.social.identities: raise KeyError("agent not found")
         if service_id not in self.services: raise KeyError("service not found")
-        if idem:
-            prior_id = self.purchase_idem.get(f"{buyer_id}:{idem}")
+        scope_key = None
+        if idem is not None:
+            # Strict validation when a key is supplied; None means the
+            # caller opted out of idempotency (API allows it).
+            idem = self._require_idem(idem, where="service purchase")
+            scope_key = f"{buyer_id}:{idem}"
+            prior_id = self.purchase_idem.get(scope_key)
             if prior_id and prior_id in self.orders:
                 return self._public_order(self._get_order(prior_id))
+            if self.store:
+                db_oid = self.store.idem_lookup("purchase", scope_key)
+                if db_oid and db_oid in self.orders:
+                    self.purchase_idem[scope_key] = db_oid
+                    return self._public_order(self._get_order(db_oid))
         svc=self.services[service_id]
         if not svc["active"]: raise PermissionError("service_inactive")
         if svc["provider_id"]==buyer_id:
@@ -1455,10 +1503,18 @@ class AgentWorld:
                "rating":None}
         self.orders[oid]=order
         self._save_order(order); self._save_kv()
-        if idem:
+        if scope_key:
             # Record the idempotency mapping only after the order is fully
             # created and persisted, so a retry can never fork two orders.
-            self.purchase_idem[f"{buyer_id}:{idem}"]=oid
+            # FIX 5: claim the DB-level registry too; if a racing retry
+            # claimed it first, return the winner's order.
+            self.purchase_idem[scope_key]=oid
+            if self.store:
+                winner = self.store.idem_claim("purchase", scope_key, oid)
+                if winner and winner != oid and winner in self.orders:
+                    self.purchase_idem[scope_key] = winner
+                    self._save_kv()
+                    return self._public_order(self._get_order(winner))
             self._save_kv()
         self._notify(svc["provider_id"], 
             {"type":"order_received","order_id":oid,"service_id":service_id,
@@ -2084,6 +2140,27 @@ class AgentWorld:
                   if b["status"]=="open" and (not q or q in (b["title"]+" "+b["description"]).lower())]
         return {"agents":agents,"services":services,"bounties":bounties}
 
+    # FIX 5 (2026-10-08): idempotency keys are mandatory on every
+    # money-moving endpoint. An empty/blank key previously behaved like no
+    # key at all, silently disabling dedup. Keys must be non-empty after
+    # trimming, 8..128 chars, and match the shared format so clients can't
+    # smuggle control characters or collide across scopes.
+    _IDEM_RE = None  # compiled lazily (see _require_idem)
+
+    @staticmethod
+    def _require_idem(key, where="request"):
+        import re as _re
+        if AgentWorld._IDEM_RE is None:
+            AgentWorld._IDEM_RE = _re.compile(r"^[A-Za-z0-9][A-Za-z0-9:_\-\.]{6,126}[A-Za-z0-9]$")
+        cleaned = (key or "").strip() if isinstance(key, str) else ""
+        if not cleaned:
+            raise ValueError(f"idempotency_key is required for {where}")
+        if not AgentWorld._IDEM_RE.match(cleaned):
+            raise ValueError(
+                f"idempotency_key for {where} must be 8..128 chars, "
+                "alphanumeric plus : _ - .")
+        return cleaned
+
     def trade(self, seller_id, buyer_id, amount, item, idem):
         if seller_id not in self.social.identities or buyer_id not in self.social.identities:
             raise KeyError("agent not found")
@@ -2093,46 +2170,86 @@ class AgentWorld:
             raise ValueError("amount must be a positive integer")
         if amount > 1_000_000_000:
             raise ValueError("amount unreasonably large")
+        # FIX 5: idempotency keys are mandatory on money movement and must
+        # be well-formed; an empty/blank key behaves like no key and is
+        # rejected instead of silently disabling dedup.
+        idem = self._require_idem(idem, where="trade")
         # Record-level idempotency: replaying with the same key returns the
         # original trade record. (The ledger transfers were already idempotent;
         # without this, retried trades duplicated trade_NNNN records and
         # inflated public trade counts.)
-        if idem:
-            prior_id = self.trade_idem.get(idem)
-            if prior_id and prior_id in self.trades:
-                return self.trades[prior_id]
+        # FIX 3: check the DB too -- if a crash happened between the ledger
+        # transfers and the record insert, the in-memory map is gone but the
+        # DB row (or the ledger idempotency) still dedups the retry.
+        prior_id = self.trade_idem.get(idem)
+        if prior_id and prior_id in self.trades:
+            return self.trades[prior_id]
+        if self.store:
+            db_tid = self.store.find_trade_by_idem(idem)
+            if db_tid and db_tid in self.trades:
+                self.trade_idem[idem] = db_tid
+                return self.trades[db_tid]
         # House cut: buyer pays `amount`; the seller nets amount-fee and the
         # fee flows to dail:treasury. Distinct idempotency keys keep replays safe.
         fee=self._fee(amount)
         tx=self.ledger.transfer(buyer_id, seller_id, amount, kind="trade",
-                                idem=f"{idem}:principal" if idem else None)
+                                idem=f"{idem}:principal")
         if fee:
             self.ledger.transfer(seller_id, "dail:treasury", fee, kind="trade_fee",
-                                 idem=f"{idem}:fee" if idem else None)
+                                 idem=f"{idem}:fee")
         self._sync_balance(buyer_id, seller_id)
         # Monotonic trade IDs under the lock: len(trades) would collide
         # under concurrency (two threads, same length, one overwrites).
+        now = datetime.now(timezone.utc).isoformat()
         with self._mutation_lock:
             self.trade_seq += 1
             tid=f"trade_{self.trade_seq:04d}"
             self.trades[tid]={"id":tid,"seller_id":seller_id,"buyer_id":buyer_id,
                               "amount":amount,"fee":fee,"seller_net":amount-fee,
-                              "item":item,"status":"settled","transaction_id":tx.id}
-            if idem:
-                self.trade_idem[idem] = tid
+                              "principal_amount":amount,"fee_amount":fee,
+                              "total_amount":amount,"item":item,"status":"settled",
+                              "transaction_id":tx.id,"idempotency_key":idem,
+                              "created_at":now,"completed_at":now}
+            self.trade_idem[idem] = tid
+        # FIX 3: write-through to the dedicated dail_trades table. The
+        # UNIQUE(idempotency_key) constraint is the final backstop: if two
+        # racing retries both passed the checks, only one row wins and the
+        # loser returns the winner's record.
+        if self.store:
+            try:
+                self.store.save_trade(self.trades[tid])
+            except Exception:
+                db_tid = self.store.find_trade_by_idem(idem)
+                if db_tid:
+                    winner = self.store.load_trades().get(db_tid)
+                    if winner:
+                        self.trades[db_tid] = winner
+                        self.trade_idem[idem] = db_tid
+                        return winner
+                raise
         self._save_kv()
         self.audit.append("trade.settled", self.trades[tid])
         self._maybe_pay_referral(seller_id)
         self._maybe_pay_referral(buyer_id)
         return self.trades[tid]
 
+    def _webhook_https_only(self):
+        """FIX 1 (2026-10-08): in production, webhooks must be HTTPS-only.
+        The http://localhost / http://127.0.0.1 testing path stays available
+        in dev/test so local callback testing keeps working. Read at call
+        time (not import) so tests can toggle it via env."""
+        import os as _os
+        return (_os.getenv("DAIL_ENV", "").lower() == "production"
+                or _os.getenv("DAIL_REAL_PAYMENTS", "false").lower() == "true")
+
     def _webhook_url_safe(self, url):
         """SSRF guard for webhook URLs. Resolves the hostname and rejects
         private, loopback, link-local, multicast, and reserved IPs --
         otherwise an agent could point a webhook at DAiL's own
         infrastructure (directly, or via DNS rebinding after registration).
-        http://localhost and http://127.0.0.1 stay allowed as the documented
-        local-testing path. Unresolvable hostnames fail closed."""
+        In production, http://localhost and http://127.0.0.1 are NOT
+        allowed (HTTPS-only); in dev/test they stay allowed as the
+        documented local-testing path. Unresolvable hostnames fail closed."""
         import socket, ipaddress
         from urllib.parse import urlparse
         try:
@@ -2141,6 +2258,8 @@ class AgentWorld:
         except Exception:
             return False, "unparseable url"
         if host in ("localhost", "127.0.0.1"):
+            if self._webhook_https_only():
+                return False, "http not allowed in production (https only)"
             return True, ""
         try:
             infos = socket.getaddrinfo(host, None)
@@ -2165,7 +2284,13 @@ class AgentWorld:
         callback never blocks trade."""
         import secrets as _secrets
         url = (url or "").strip()
-        if not (url.startswith("https://") or url.startswith("http://localhost") or url.startswith("http://127.0.0.1")):
+        https_only = self._webhook_https_only()
+        if https_only:
+            # FIX 1: production is HTTPS-only; the localhost testing path
+            # is closed so a webhook can never reach internal infrastructure.
+            if not url.startswith("https://"):
+                raise ValueError("url must be https in production")
+        elif not (url.startswith("https://") or url.startswith("http://localhost") or url.startswith("http://127.0.0.1")):
             raise ValueError("url must be https (http allowed for localhost only)")
         if len(url) > 500: raise ValueError("url too long")
         ok, reason = self._webhook_url_safe(url)
@@ -2280,6 +2405,37 @@ class AgentWorld:
                 # Webhooks are best-effort; a dead callback never blocks trade.
                 self.audit.append("webhook.failed",
                                   {"agent_id": agent_id, "url": h.get("url")})
+
+    def notify_payment_event(self, event_key, agent_id, kind, amount_dail, item):
+        """FIX 4 (2026-10-08): durable payment event + exactly-once
+        notification, the standard path for all payment confirmations:
+
+            Payment verified -> ledger credit -> persistent payment event
+            -> notification -> webhook
+
+        The event row is inserted idempotently (UNIQUE event_key); the
+        notification (via _notify(), which fires webhooks) is sent only
+        when this call first creates the event. Crash-safe: if the process
+        died between recording the event and notifying, notified_at stays
+        NULL and the next call for the same key re-sends exactly once.
+        Returns True when a notification was sent."""
+        item = dict(item)
+        item.setdefault("type", "topup_credited")
+        should_notify = True
+        if self.store:
+            is_new = self.store.record_payment_event(
+                event_key, agent_id, kind, amount_dail,
+                json.dumps({"event_key": event_key}))
+            if is_new:
+                should_notify = True
+            else:
+                exists, notified_at = self.store.get_payment_event(event_key)
+                should_notify = bool(exists and not notified_at)
+        if should_notify:
+            self._notify(agent_id, item)
+            if self.store:
+                self.store.mark_event_notified(event_key)
+        return should_notify
 
     def add_mentions(self, room_id, from_id, message):
         """@-mentions in a room message become notifications for the named

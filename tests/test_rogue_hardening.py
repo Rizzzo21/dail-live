@@ -279,7 +279,7 @@ def test_safe_is_dail_denominated_no_cash_out():
     assert wdkey.startswith("dail_wd_")
     r = client.post("/safe/withdraw",
                     json={"amount": 50, "destination": "somewhere",
-                          "idempotency_key": "rh-wd-1"},
+                          "idempotency_key": "rh-wd-0001"},
                     headers={"X-DAIL-Withdrawal-Key": wdkey, **_auth(key)})
     assert r.status_code == 200, r.text
     # The "withdrawal" is still DAIL inside the ledger: closed loop holds.
