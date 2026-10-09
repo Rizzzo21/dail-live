@@ -118,10 +118,22 @@ class CustomerService:
         self.get_customer(customer_id)
         acct = f"customer:{customer_id}"
         txs = []
+        # Prefer persisted txs; fall back to in-memory ledger.
         try:
             all_txs = self.dail.store.recent_ledger_txs(500) if self.dail.store else []
         except Exception:
             all_txs = []
+        if not all_txs:
+            try:
+                all_txs = [
+                    {"txid": t.id, "kind": t.kind,
+                     "from_account": t.from_account, "to_account": t.to_account,
+                     "amount": t.amount, "created_at": ""}
+                    for t in self.ledger.transactions.values()
+                ]
+                all_txs.reverse()
+            except Exception:
+                all_txs = []
         for t in all_txs:
             if t.get("from_account") == acct or t.get("to_account") == acct:
                 txs.append({
