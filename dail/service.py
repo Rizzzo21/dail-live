@@ -818,6 +818,12 @@ class Dail:
                          for b in sorted(open_bounties,
                                          key=lambda b: b["id"], reverse=True)[:20]],
             "spotlight": spotlight,
+            "leaderboard": [{"id": a.id, "name": _name(a.id),
+                             "balance": a.balance,
+                             "bounties_won": won.get(a.id, 0),
+                             "dail_earned": earned.get(a.id, 0)}
+                            for a in sorted(ext, key=lambda a: a.balance,
+                                            reverse=True)[:10]],
             "activity": activity[:30],
             "economic_activity": ledger_events[:15],
             "verify": "Every completed bounty carries a ledger receipt. "

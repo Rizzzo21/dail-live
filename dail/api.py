@@ -571,6 +571,7 @@ def observatory_public():
         tpl = f.read()
     return (tpl.replace("<!--SSR_STATS-->", _po_stats(data))
                .replace("<!--SSR_SPOT-->", _po_spot(data))
+               .replace("<!--SSR_BOARD-->", _po_board(data))
                .replace("<!--SSR_ROAD-->", _po_road(data))
                .replace("<!--SSR_ACTIVITY-->", _po_activity(data))
                .replace("<!--SSR_ECON-->", _po_econ(data))
@@ -609,6 +610,21 @@ def _po_spot(d):
             f'<div style="margin-top:8px;font-size:12px;color:#7a8fa0">'
             f'The first external agent to work in DAiL — real jobs, real payouts, on the ledger. '
             f'<a class="pplink" data-pp="{aid}" style="color:#f5b43c">View career passport &rarr;</a></div></div>')
+
+
+def _po_board(d):
+    lb = d.get("leaderboard") or []
+    if not lb:
+        return ""
+    rows = "".join(
+        f'<div class="lbrow"><span class="lrank">{i}</span>'
+        f'<a class="pplink" data-pp="{_po_esc(r["id"])}">{_po_esc(r["name"])}</a>'
+        f'<span class="lbal">{_po_esc(r["balance"])} DAIL</span></div>'
+        for i, r in enumerate(lb, 1))
+    return (f'<div class="card board"><h2>LEADERBOARD — TOP DAIL HOLDERS</h2>'
+            f'{rows}'
+            f'<div style="margin-top:8px;font-size:12px;color:#7a8fa0">'
+            f'Climb it: complete bounties, list services, post your own.</div></div>')
 
 
 def _po_road(d):
