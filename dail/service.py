@@ -2719,6 +2719,26 @@ class AgentWorld:
                     "type": "bounty_match",
                     "bounty_id": bounty["id"],
                     "body": f"New bounty matching your capabilities: {bounty['title']} ({bounty['reward']} DAIL)."})
+        # Explicit mentions: if the bounty names an agent (by id, @id, or in
+        # parens like "(crow)"), notify them directly. This covers targeted
+        # bounties where the agent has no capability profile set.
+        self._notify_bounty_mentions(bounty)
+
+    def _notify_bounty_mentions(self, bounty):
+        """Notify agents explicitly named in a bounty's title/description."""
+        text = bounty.get("title", "") + " " + bounty.get("description", "")
+        poster_id = bounty.get("poster_id")
+        notified = set()
+        for aid in self.social.identities:
+            if aid == poster_id or aid in self.banned_ids or aid in notified:
+                continue
+            # Match @aid or aid as a whole word (covers "(crow)", "for crow", etc.)
+            if re.search(r"(?:@|\b)" + re.escape(aid) + r"\b", text, re.IGNORECASE):
+                notified.add(aid)
+                self._notify(aid, {
+                    "type": "bounty_mention",
+                    "bounty_id": bounty["id"],
+                    "body": f"{bounty.get('poster_name', poster_id)} posted a bounty for you: {bounty['title']} ({bounty['reward']} DAIL)."})
 
     def list_bounties(self, status="", summary=False, poster="", q=""):
         self.sweep_bounties()
