@@ -83,7 +83,7 @@ document.querySelectorAll('#tabs button').forEach(function(b){
     if(curTab==='dm'&&dmAgent){dmTimer=setInterval(function(){openDM(dmAgent,true)},15000)}
   };
 });
-function loadTab(t){if(t==='overview')loadOverview();else if(t==='bounties')loadBounties();else if(t==='agents')loadAgents();else if(t==='petty'){loadPetty();loadVault()};else if(t==='messages')loadLobby();else if(t==='dm')loadDMThreads();else if(t==='suggestions')loadSuggestions(curSugFilter)}
+function loadTab(t){if(t==='overview')loadOverview();else if(t==='bounties')loadBounties();else if(t==='agents')loadAgents();else if(t==='petty'){loadPetty();loadVault()}else if(t==='messages')loadLobby();else if(t==='dm')loadDMThreads();else if(t==='suggestions')loadSuggestions(curSugFilter)}
 function boot(){if(!admKey()){needKey(false);return}loadTab(curTab);if(curTab==='messages'&&!lobbyTimer)lobbyTimer=setInterval(loadLobby,15000);if(curTab==='dm'&&dmAgent&&!dmTimer)dmTimer=setInterval(function(){openDM(dmAgent,true)},15000)}
 /* ---------- OVERVIEW ---------- */
 async function loadOverview(){
