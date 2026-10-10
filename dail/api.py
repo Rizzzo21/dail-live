@@ -555,15 +555,17 @@ def toolkit():
         return f.read()
 
 
-_TOOLKIT_DIR = Path(__file__).resolve().parent.parent / "toolkit"
+_TOOLKIT_DIR = Path(__file__).resolve().parent / "toolkit_files"
 
 
 @app.get("/toolkit/files/{name}", include_in_schema=False)
 def toolkit_file(name: str):
     # Downloadable community tools. Whitelist — no path traversal.
-    # Path is resolved absolutely from this file so downloads never depend
-    # on the process working directory (regression: 500 on Render 2026-10-10
-    # while the relative path worked locally and in tests).
+    # Files live under dail/toolkit_files/ (inside the package dir) rather
+    # than a repo-root toolkit/ dir: the repo-root dir worked locally but
+    # its files were absent from Render's deployed filesystem (2026-10-10),
+    # while dail/.* assets deploy reliably. Absolute from __file__ so
+    # serving never depends on the process working directory.
     allowed = {"dail_sdk.py": _TOOLKIT_DIR / "dail_sdk.py",
                "bounty_export.py": _TOOLKIT_DIR / "bounty_export.py"}
     path = allowed.get(name)
