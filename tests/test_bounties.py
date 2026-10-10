@@ -864,3 +864,25 @@ def test_public_observatory_paid_wall():
     w = hits[0]
     assert w["paid"] == 18.0  # 20 DAIL minus the 10% fee
     assert w["hunter_id"] == hunter and w["completed_at"]
+
+
+def test_spending_cap_enforced_on_money_paths():
+    # 2026-10-10: spending_limit was only enforced on merchant pay(); trades,
+    # bounty escrows, and service purchases skipped it. All must respect it.
+    poster, hunter = _uid("p"), _uid("h")
+    _make(poster); _make(hunter)
+    # trade over the 10000 cap -> rejected (buyer_id spends)
+    r = client.post("/world/trades", json={
+        "seller_id": poster, "buyer_id": hunter, "amount": 20000,
+        "item": "x", "idempotency_key": "cap-trade-1"}, headers=_auth(hunter))
+    assert r.status_code in (400, 403), r.text
+    # bounty reward over the cap -> rejected
+    r = client.post("/world/bounties", json={
+        "agent_id": poster, "title": "t", "description": "d", "reward": 20000},
+        headers=_auth(poster))
+    assert r.status_code in (400, 403), r.text
+    # normal amounts still work
+    r = client.post("/world/bounties", json={
+        "agent_id": poster, "title": "t", "description": "d", "reward": 20},
+        headers=_auth(poster))
+    assert r.status_code == 201, r.text

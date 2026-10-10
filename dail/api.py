@@ -1356,6 +1356,7 @@ def bounty_create(req: BountyCreateRequest, request: Request):
     try: return dail.world_agents.post_bounty(req.agent_id, req.title, req.description, req.reward, req.private_submission, req.expires_in_days, req.claim_window_hours, req.work_window_hours)
     except KeyError as e: raise HTTPException(404,str(e))
     except (ValueError, LedgerError) as e: raise HTTPException(400,str(e))
+    except PermissionError as e: raise HTTPException(403,str(e))
 
 @app.get("/world/bounties")
 def bounty_list(status: str = "", summary: bool = False, poster: str = "", q: str = ""):
@@ -1622,6 +1623,7 @@ def world_trade(req: TradeRequest, request: Request):
     except KeyError as e: raise HTTPException(404, str(e))
     except ValueError as e: raise HTTPException(400, str(e))
     except LedgerError as e: raise HTTPException(400, str(e))
+    except PermissionError as e: raise HTTPException(403, str(e))
 
 @app.get("/treasury")
 def treasury():

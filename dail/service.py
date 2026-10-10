@@ -1189,6 +1189,19 @@ class SocialWorld:
 
 class AgentWorld:
     """DAiL autonomous-agent world primitives: profiles, services, discovery and trades."""
+    def _enforce_spending_cap(self, agent_id, amount):
+        """SECURITY (2026-10-10): the spending_limit hard cap (default 10000)
+        was only enforced on the merchant pay() path — trades, bounty
+        escrows, and service purchases skipped it entirely. Every path that
+        moves an agent's DAIL must respect the cap. (The approval_limit
+        soft gate needs a human-approval UX that doesn't exist yet for
+        these paths — that's a product decision, not enforced here.)"""
+        agent = self.agents.get(agent_id)
+        if agent is None:
+            raise KeyError("agent not found")
+        if amount > agent.spending_limit:
+            raise PermissionError("spending_limit_exceeded")
+
     def __init__(self, ledger, audit, social, agents=None, store=None):
         self.ledger=ledger; self.audit=audit; self.social=social
         self.agents=agents if agents is not None else {}
@@ -1453,6 +1466,8 @@ class AgentWorld:
         if svc.get("provider_id") == buyer_id: raise ValueError("cannot trial your own service")
         trial_price = svc.get("trial_price")
         if trial_price is None: raise KeyError("this service offers no trial")
+        if trial_price > 0:
+            self._enforce_spending_cap(buyer_id, trial_price)
         key = f"{buyer_id}:{service_id}"
         # Race-safe: check, charge, and record under the mutation lock so 100
         # simultaneous requests produce exactly one trial. The ledger
@@ -1511,6 +1526,7 @@ class AgentWorld:
             # orders_completed and 5-star ratings for the 1-DAIL fee.
             raise ValueError("cannot buy your own service")
         price=svc["price"]
+        self._enforce_spending_cap(buyer_id, price)
         self.order_seq+=1
         oid=f"ord_{self.order_seq:04d}"
         now=datetime.now(timezone.utc).isoformat()
@@ -2194,6 +2210,7 @@ class AgentWorld:
             raise ValueError("amount must be a positive integer")
         if amount > 1_000_000_000:
             raise ValueError("amount unreasonably large")
+        self._enforce_spending_cap(buyer_id, amount)
         # FIX 5: idempotency keys are mandatory on money movement and must
         # be well-formed; an empty/blank key behaves like no key and is
         # rejected instead of silently disabling dedup.
@@ -2642,6 +2659,7 @@ class AgentWorld:
         try: reward=int(reward)
         except (TypeError, ValueError): raise ValueError("reward must be an integer")
         if reward < self.BOUNTY_MIN_REWARD: raise ValueError(f"reward must be >= {self.BOUNTY_MIN_REWARD} DAIL")
+        self._enforce_spending_cap(agent_id, reward)
         # Bounty IDs must be unique even under concurrent posts: the increment
         # and the read happen atomically under the mutation lock, otherwise
         # two threads can mint the same bnty_NNNN -- one record overwrites
