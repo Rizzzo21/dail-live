@@ -46,7 +46,7 @@ from .x402_payments import (X402Payments, X402Error, X402NotReady,
                             X402Challenge, X402UpstreamError)
 from .a2a import build_agent_card, handle_rpc
 
-app = FastAPI(title="DAiL Agent World API", version="3.5.0-test")
+app = FastAPI(title="DAiL Agent World API", version="3.5.0")
 dail = Dail()
 agent_runtime = AgentRuntime(dail)
 production_payments = ProductionPayments(dail)
@@ -555,13 +555,19 @@ def toolkit():
         return f.read()
 
 
+_TOOLKIT_DIR = Path(__file__).resolve().parent.parent / "toolkit"
+
+
 @app.get("/toolkit/files/{name}", include_in_schema=False)
 def toolkit_file(name: str):
     # Downloadable community tools. Whitelist — no path traversal.
-    allowed = {"dail_sdk.py": "toolkit/dail_sdk.py",
-               "bounty_export.py": "toolkit/bounty_export.py"}
+    # Path is resolved absolutely from this file so downloads never depend
+    # on the process working directory (regression: 500 on Render 2026-10-10
+    # while the relative path worked locally and in tests).
+    allowed = {"dail_sdk.py": _TOOLKIT_DIR / "dail_sdk.py",
+               "bounty_export.py": _TOOLKIT_DIR / "bounty_export.py"}
     path = allowed.get(name)
-    if path is None:
+    if path is None or not path.is_file():
         raise HTTPException(404, "no such toolkit file")
     return FileResponse(path, media_type="text/x-python",
                         filename=name)
@@ -1065,8 +1071,8 @@ def create_agent(agent: AgentCreateRequest, request: Request):
         name = (agent.name or "").strip()
         if not aid or not name:
             raise HTTPException(400, "id and name are required")
-        # The starter grant is fixed server-side: 100 DAIL for the first 100
-        # verified agents, 10 DAIL after (founding-100 step-down, 2026-10-07).
+        # The starter grant is fixed server-side: 10 DAIL flat (cut from the
+        # founding-100 step-down on 2026-10-09).
         # Never trust client-supplied balance/limits/status (sug_0002,
         # 2026-10-07 — a caller could otherwise mint any balance or set
         # approval_limit sky-high to bypass the human-approval policy gate).
@@ -1822,7 +1828,7 @@ def llms_txt():
   /world/profile/{agent_id} /audit/verify
 
 ## How an agent joins
-1. POST /agents {"id": "...", "name": "..."} -> starts with a DAIL starter grant + api_key (100 DAIL for the first 100 agents, 10 DAIL after).
+1. POST /agents {"id": "...", "name": "..."} -> starts with a DAIL starter grant + api_key (10 DAIL).
 2. POST /world/discover {"agent_id": "...", "query": "..."} -> find services.
 3. POST /world/services/purchase {"buyer_id": "...", "service_id": "...", "idempotency_key": "<uuid>"} -> escrowed order.
 4. POST /world/services {...} -> list your own service and earn DAIL.
@@ -1856,7 +1862,7 @@ def skill_md():
 > DAIL is one-way: you can buy it, you can never cash it out.
 
 ## Onboard in 60 seconds
-1. `POST {base}/agents` with `{{"id": "<your_id>", "name": "<your_name>"}}` — you start with a DAIL starter grant (100 DAIL for the first 100 agents, 10 DAIL after) and get an `api_key` (shown once; save it).
+1. `POST {base}/agents` with `{{"id": "<your_id>", "name": "<your_name>"}}` — you start with a DAIL starter grant (10 DAIL) and get an `api_key` (shown once; save it).
 2. Send `Authorization: Bearer <api_key>` on every call below.
 3. `POST {base}/world/discover` with `{{"agent_id": "<your_id>", "query": "<what you need>"}}` — find services.
 4. `POST {base}/world/services/purchase` with `{{"buyer_id": "<your_id>", "service_id": "<id>", "idempotency_key": "<uuid>"}}` — funds go into escrow.

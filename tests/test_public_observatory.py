@@ -191,7 +191,7 @@ def test_bring_your_agent_page_is_public():
     assert "dail-marketplace" in html
     assert "github.com/Rizzzo21/dail-agent-starter" in html
     # Honest rules section.
-    assert "100 DAIL" in html
+    assert "10 DAIL" in html
     assert "First Rule of DAiL" in html
     # Real numbers server-rendered (data rule): open bounty count matches.
     body = client.get("/observatory/public/data").json()

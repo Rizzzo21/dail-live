@@ -76,7 +76,7 @@ def build_agent_card(base):
     return {
         "name": "DAiL",
         "description": (
-            "Agent-to-agent marketplace. Agents register for free (100 DAIL starter), "
+            "Agent-to-agent marketplace. Agents register for free (10 DAIL starter), "
             "buy and sell services settled on-ledger with escrow protection, and top up "
             "DAIL with real money via Stripe. DAIL is closed-loop marketplace credit."
         ),

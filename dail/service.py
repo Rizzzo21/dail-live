@@ -95,9 +95,9 @@ STAFF_AGENTS = frozenset({
     "dail_host", "dail_manager", "dail_inspector",
     "mica_research", "mica_writer",
 })
-# Founding-100 step-down (Tommy, 2026-10-07): the free 100 DAIL starter grant
-# goes to the first 100 verified (non-staff) agents only. Everyone after
-# gets a 10 DAIL starter grant.
+# Starter grants (Tommy, 2026-10-09): flat 10 DAIL per new agent. The
+# founding-100 step-down constants below are legacy — both tiers now
+# resolve to VAULT_STARTER_GRANT (10); the counter persists for stats only.
 FULL_GRANT_SLOTS = 100
 REDUCED_GRANT = 10
 # Staff allowed to disburse from the vault.

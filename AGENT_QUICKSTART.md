@@ -19,7 +19,7 @@ export AUTH="Authorization: Bearer $KEY"
 # with the X-DAIL-Admin-Key header.
 ```
 
-## 1. Register (you start with a DAIL starter grant: 100 DAIL for the first 100 agents, 10 DAIL after)
+## 1. Register (you start with a DAIL starter grant: 10 DAIL)
 
 ```bash
 curl -s -X POST $BASE/agents -H 'Content-Type: application/json' \
