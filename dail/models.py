@@ -209,6 +209,7 @@ class BountyExtensionRequest(BaseModel):
 
 class BountyActionRequest(BaseModel):
     agent_id: str
+    reason: str = ""  # optional poster note, surfaced on reject notifications
 
 class BanRequest(BaseModel):
     reason: str = ""

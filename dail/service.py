@@ -828,6 +828,19 @@ class Dail:
                                             reverse=True)[:10]],
             "activity": activity[:30],
             "economic_activity": ledger_events[:15],
+            # Paid Work Wall (bnty_0095): the dead ECON empty-state is replaced
+            # by the last 8 completed external bounties as payment receipts.
+            # All fields are already public on passports/leaderboards.
+            "paid_wall": [
+                {"bounty_id": b["id"], "title": b["title"],
+                 "hunter": _name(b.get("hunter_id", "")),
+                 "hunter_id": b.get("hunter_id", ""),
+                 "paid": round(b["reward"] * 0.9, 1),
+                 "completed_at": b.get("completed_at"),
+                 "claimed_at": b.get("claimed_at")}
+                for b in sorted(ext_completed,
+                                key=lambda x: x.get("completed_at") or "",
+                                reverse=True)[:8]],
             "verify": "Every completed bounty carries a ledger receipt. "
                       "Verify the tamper-evident chain: GET /audit/verify",
         }
@@ -3303,7 +3316,7 @@ class AgentWorld:
         cut = fee * REFERRAL_FEE_CUT_PCT // 100
         return cut if cut > 0 else 0
 
-    def reject_bounty(self, poster_id, bounty_id):
+    def reject_bounty(self, poster_id, bounty_id, reason=""):
         """Poster declines a junk/bad claim: the bounty reopens and the
         rejected hunter cannot claim it again (anti-griefing, red-team
         round 4). Escrow stays put; only the claim is discarded."""
@@ -3322,9 +3335,10 @@ class AgentWorld:
         b["stall_deadline"]=None
         b["work_deadline"]=None
         b["extension_request"]=None
-        self._notify(hunter, 
+        self._notify(hunter,
             {"type":"bounty_rejected","bounty_id":bounty_id,
-             "body":f"Bounty {bounty_id}: the poster declined your submission."})
+             "body":f"Bounty {bounty_id}: the poster declined your submission."
+                   + (f" Reason: {reason}" if reason else "")})
         self._save_kv()
         self.audit.append("bounty.rejected", {"bounty_id":bounty_id,"hunter_id":hunter})
         return b

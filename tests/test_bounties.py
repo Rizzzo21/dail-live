@@ -806,3 +806,61 @@ def test_accept_audit_logs_poster_and_hunter_ips():
     payload = completed[-1]["payload"]
     assert payload["poster_ip"] == "203.0.113.7"
     assert payload["hunter_ip"] == "203.0.113.7"
+
+
+def test_bounty_reject_carries_reason():
+    # Poster can attach a reason; the hunter sees it in notifications.
+    poster, hunter = _uid("p"), _uid("h")
+    _make(poster); _make(hunter)
+    bid = client.post("/world/bounties", json={
+        "agent_id": poster, "title": "t", "description": "d", "reward": 20},
+        headers=_auth(poster)).json()["id"]
+    r = client.post(f"/world/bounties/{bid}/claim", json={
+        "agent_id": hunter,
+        "submission": "Completed the requested deliverable and verified it against the bounty requirements; full summary of changes and test evidence in the attached notes."},
+        headers=_auth(hunter))
+    assert r.status_code == 200, r.text
+    r = client.post(f"/world/bounties/{bid}/reject", json={
+        "agent_id": poster, "reason": "Fabricated numbers. Do better!"},
+        headers=_auth(poster))
+    assert r.status_code == 200, r.text
+    assert r.json()["status"] == "open"
+    r = client.get(f"/world/notifications/{hunter}", headers=_auth(hunter))
+    bodies = [n.get("body", "") for n in r.json()["notifications"]]
+    assert any("Fabricated numbers" in b and "Do better" in b for b in bodies), bodies
+    # no reason: legacy body unchanged (fresh bounty, same hunter)
+    bid2 = client.post("/world/bounties", json={
+        "agent_id": poster, "title": "t2", "description": "d", "reward": 20},
+        headers=_auth(poster)).json()["id"]
+    r = client.post(f"/world/bounties/{bid2}/claim", json={
+        "agent_id": hunter,
+        "submission": "Completed the requested deliverable and verified it against the bounty requirements; full summary of changes and test evidence in the attached notes."},
+        headers=_auth(hunter))
+    assert r.status_code == 200, r.text
+    client.post(f"/world/bounties/{bid2}/reject", json={"agent_id": poster},
+                headers=_auth(poster))
+    r = client.get(f"/world/notifications/{hunter}", headers=_auth(hunter))
+    bodies = [n.get("body", "") for n in r.json()["notifications"]]
+    assert any(b == f"Bounty {bid2}: the poster declined your submission." for b in bodies)
+
+
+def test_public_observatory_paid_wall():
+    # Completed external bounties appear on the wall with post-fee payout.
+    poster, hunter = _uid("p"), _uid("h")
+    _make(poster); _make(hunter)
+    bid = client.post("/world/bounties", json={
+        "agent_id": poster, "title": "wall job", "description": "d", "reward": 20},
+        headers=_auth(poster)).json()["id"]
+    client.post(f"/world/bounties/{bid}/claim", json={
+        "agent_id": hunter,
+        "submission": "Completed the requested deliverable and verified it against the bounty requirements; full summary of changes and test evidence in the attached notes."},
+        headers=_auth(hunter))
+    r = client.post(f"/world/bounties/{bid}/accept", json={"agent_id": poster},
+                    headers=_auth(poster))
+    assert r.status_code == 200, r.text
+    wall = client.get("/observatory/public/data").json().get("paid_wall", [])
+    hits = [w for w in wall if w["bounty_id"] == bid]
+    assert hits, "completed bounty should appear on the Paid Work Wall"
+    w = hits[0]
+    assert w["paid"] == 18.0  # 20 DAIL minus the 10% fee
+    assert w["hunter_id"] == hunter and w["completed_at"]

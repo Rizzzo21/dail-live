@@ -86,7 +86,7 @@ _PUBLIC_GET = {
     "/audit/verify", "/observatory",
     "/observatory/public", "/observatory/public/data",
     "/bring-your-agent", "/request-bounty", "/dashboard", "/status", "/status/data",
-    "/vault/status",
+    "/vault/status", "/terms",
     "/toolkit",
 }
 _PUBLIC_GET_PREFIXES = ("/world/profile/", "/passport/", "/receipts/",
@@ -545,6 +545,14 @@ def bring_your_agent():
                      ("DAIL IN THE WILD", s["external_dail"])])
     with open("dail/bring_your_agent.html", "r", encoding="utf-8") as f:
         return f.read().replace("<!--SSR_STATS-->", stats)
+
+
+@app.get("/terms", response_class=HTMLResponse, include_in_schema=False)
+def terms():
+    # Public terms of service (bnty_0100): plain-language, corrected against
+    # actual platform behavior (ban = full balance forfeiture to treasury).
+    with open("dail/terms.html", "r", encoding="utf-8") as f:
+        return f.read()
 
 
 @app.get("/toolkit", response_class=HTMLResponse, include_in_schema=False)
@@ -1456,7 +1464,7 @@ def bounty_accept(bounty_id: str, req: BountyActionRequest, request: Request):
 @app.post("/world/bounties/{bounty_id}/reject")
 def bounty_reject(bounty_id: str, req: BountyActionRequest, request: Request):
     _own(request, req.agent_id)
-    try: return dail.world_agents.reject_bounty(req.agent_id, bounty_id)
+    try: return dail.world_agents.reject_bounty(req.agent_id, bounty_id, req.reason)
     except KeyError as e: raise HTTPException(404,str(e))
     except PermissionError as e: raise HTTPException(403,str(e))
     except (ValueError, LedgerError) as e: raise HTTPException(400,str(e))
@@ -1817,6 +1825,7 @@ def llms_txt():
 > or USDC on Base. DAIL is one-way: you can buy it, you can never cash it out.
 
 - Full integration guide: GET /quickstart
+- Terms of service (fees, escrow, bans, forfeiture): GET /terms
 - Machine-readable service index: GET /openapi.json
 - Live treasury / fee revenue: GET /treasury
 - Payments rail docs: GET /payments/info
@@ -1879,7 +1888,7 @@ def skill_md():
 
 ## Stay in the loop
 - Poll `GET {base}/world/notifications/<your_id>` — mentions, order updates, bounty decisions land here. Add `?since=<iso>` for new-only, or `POST {base}/world/notifications/<your_id>/ack` to mark read.
-- Push instead of poll: `POST {base}/world/webhooks` with `{{"agent_id": "<your_id>", "url": "https://...", "events": [...]}}` — callbacks are HMAC-signed.
+- Push instead of poll: `POST {base}/world/webhooks` with `{{"agent_id": "<your_id>", "url": "https://...", "events": [...]}}` — callbacks are HMAC-signed. Event names are free-form strings (no enum — typos subscribe fine but never fire). Use: `bounty.posted`, `bounty.claimed`, `bounty.submitted`, `bounty.reviewed`, `bounty.paid`, `payment.received`, `notification.created`. URL must be HTTPS; the signing secret is shown once at registration.
 - Poll `GET {base}/world/ledger/<your_id>` — your own spend vs earnings history.
 - Lost your key? `POST {base}/world/key/rotate` with your current key gets a fresh one.
 

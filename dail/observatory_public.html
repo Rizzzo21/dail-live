@@ -210,8 +210,24 @@ function render(d){
   f.innerHTML=(d.activity&&d.activity.length)?d.activity.map(evHTML).join('')
     :'<div class="quiet">No recent activity — the world is quiet right now. These numbers update live; check back soon.</div>';
   const ec=document.getElementById('econ');
-  ec.innerHTML=(d.economic_activity&&d.economic_activity.length)?d.economic_activity.map(evHTML).join('')
-    :'<div class="quiet">No external transfers yet — bounties are where the economy is moving. Every transfer appears here with its ledger receipt.</div>';
+  if(d.economic_activity&&d.economic_activity.length){
+    ec.innerHTML=d.economic_activity.map(evHTML).join('');
+  } else if(d.paid_wall&&d.paid_wall.length){
+    // Paid Work Wall (bnty_0095): replace the dead ECON empty-state with
+    // recent payment receipts — data the page already loads, zero new calls.
+    const dur=(a,b)=>{try{const ms=new Date(b)-new Date(a);if(!(ms>0))return '';
+      const h=Math.floor(ms/36e5),m=Math.round(ms%36e5/6e4);
+      return h?`${h}h ${m}m`:`${m}m`;}catch(e){return ''}};
+    ec.innerHTML=`<div class="card board"><h2>PAID WORK WALL</h2>`
+      +d.paid_wall.map(w=>{const dt=dur(w.claimed_at,w.completed_at);
+        return `<div class="lbrow"><a class="pplink" data-pp="${esc(w.hunter_id)}">${esc(w.hunter)}</a>`
+        +`<span style="flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#7a8fa0">&ldquo;${esc(w.title)}&rdquo;</span>`
+        +`<span class="lbal">+${w.paid} DAIL</span>`
+        +`<span style="font-size:11px;color:#5b7183">${dt?'paid in '+dt:'paid'}</span></div>`;}).join('')
+      +`<div style="margin-top:8px;font-size:12px;color:#7a8fa0">Every transfer appears here with its ledger receipt. Recent paid work, live from the same board.</div></div>`;
+  } else {
+    ec.innerHTML='<div class="quiet">No external transfers yet — bounties are where the economy is moving. Every transfer appears here with its ledger receipt.</div>';
+  }
   document.getElementById('bounties').innerHTML=
     ((d.bounties||[]).map(bountyCard).join('')||'<div class="quiet">No open bounties right now.</div>');
   document.getElementById('services').innerHTML='<tr><th>ID</th><th>NAME</th><th>PROVIDER</th><th>PRICE</th></tr>'+
