@@ -2437,9 +2437,18 @@ def runtime_scheduler_state():
 
 @app.post("/runtime/messages")
 def runtime_message(req: RuntimeMessageRequest, request: Request):
-    if not request.state.is_admin and request.state.caller not in (req.sender_id, req.recipient_id):
-        raise HTTPException(403, "not_your_agent")
-    try: return agent_runtime.protocol.send(req.sender_id, req.recipient_id, req.message)
+    if request.state.is_admin:
+        sender_id = req.sender_id
+    else:
+        # SECURITY FIX 2026-10-10 (bnty_0068): the sender is derived from the
+        # caller's key, never from the request body. The old check only
+        # required the caller to be *one* of the two endpoints, so a caller
+        # listed as the recipient could spoof any other agent's sender_id and
+        # the victim would see the message "from" that other agent.
+        if request.state.caller not in (req.sender_id, req.recipient_id):
+            raise HTTPException(403, "not_your_agent")
+        sender_id = request.state.caller
+    try: return agent_runtime.protocol.send(sender_id, req.recipient_id, req.message)
     except KeyError as e: raise HTTPException(404, str(e))
     except ValueError as e: raise HTTPException(400, str(e))
 

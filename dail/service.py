@@ -1636,15 +1636,22 @@ class AgentWorld:
     def confirm_order(self, buyer_id, order_id, rating=None):
         order=self._get_order(order_id)
         if order["buyer_id"]!=buyer_id: raise PermissionError("not your order")
-        if order["status"]!="delivered": raise ValueError("order not delivered yet")
         if rating is not None:
             try: rating=int(rating)
             except (TypeError, ValueError): raise ValueError("rating must be an integer 1..5")
             if not 1 <= rating <= 5: raise ValueError("rating must be 1..5")
-        self._release_escrow(order, "provider")
-        order["status"]="completed"
-        order["completed_at"]=datetime.now(timezone.utc).isoformat()
-        order["rating"]=rating
+        # RACE FIX 2026-10-10 (bnty_0083): claim the delivered->completed
+        # transition under the mutation lock before touching escrow, so a
+        # concurrent dispute cannot interleave between the status check and
+        # the escrow release. The loser of the race gets a clean ValueError,
+        # never a phantom dispute fee or a 500.
+        with self._mutation_lock:
+            if order["status"]!="delivered": raise ValueError("order not delivered yet")
+            order["status"]="completed"
+            order["completed_at"]=datetime.now(timezone.utc).isoformat()
+            order["rating"]=rating
+            self._release_escrow(order, "provider")
+            self._save_order(order)
         if rating is not None:
             # Rolling average per service and per provider (shown on the
             # service and the provider's passport).
@@ -1670,24 +1677,32 @@ class AgentWorld:
         order=self._get_order(order_id)
         if agent_id not in (order["buyer_id"], order["provider_id"]):
             raise PermissionError("not your order")
-        if order["status"] not in ("awaiting_delivery","delivered"):
-            raise ValueError("order not disputable")
-        if order["status"]=="awaiting_delivery" and agent_id==order["provider_id"]:
-            # No grievance exists yet: the buyer has only paid. A provider
-            # disputing pre-delivery is pure grief -- it freezes the buyer's
-            # escrow and kills their instant-cancel path for 48h. If the
-            # provider can't deliver, they simply don't deliver (the buyer
-            # cancels or the order goes overdue).
-            raise ValueError("provider cannot dispute before delivery")
-        # Filing costs DISPUTE_FEE to the treasury (red-team round 4):
-        # free disputes let one griefer freeze unlimited escrows and
-        # bottleneck admin resolution.
-        if DISPUTE_FEE > 0:
-            self.ledger.transfer(agent_id, "dail:treasury", DISPUTE_FEE,
-                                 kind="dispute_fee", idem=f"dispute-fee:{order_id}")
-            self._sync_balance(agent_id)
-        order["status"]="disputed"
-        order["dispute_reason"]=(reason or "")[:500]
+        # RACE FIX 2026-10-10 (bnty_0083): the status check, the dispute-fee
+        # charge, and the status flip are one atomic step under the mutation
+        # lock. Two threads could otherwise interleave confirm/dispute so the
+        # 1-DAIL fee was charged for a dispute that never took effect (phantom
+        # fee, tx_000616/000617), or the escrow was released on an order that
+        # was simultaneously disputed (HTTP 500). The loser of the race gets
+        # a clean ValueError and is charged nothing.
+        with self._mutation_lock:
+            if order["status"] not in ("awaiting_delivery","delivered"):
+                raise ValueError("order not disputable")
+            if order["status"]=="awaiting_delivery" and agent_id==order["provider_id"]:
+                # No grievance exists yet: the buyer has only paid. A provider
+                # disputing pre-delivery is pure grief -- it freezes the buyer's
+                # escrow and kills their instant-cancel path for 48h. If the
+                # provider can't deliver, they simply don't deliver (the buyer
+                # cancels or the order goes overdue).
+                raise ValueError("provider cannot dispute before delivery")
+            # Filing costs DISPUTE_FEE to the treasury (red-team round 4):
+            # free disputes let one griefer freeze unlimited escrows and
+            # bottleneck admin resolution.
+            if DISPUTE_FEE > 0:
+                self.ledger.transfer(agent_id, "dail:treasury", DISPUTE_FEE,
+                                     kind="dispute_fee", idem=f"dispute-fee:{order_id}")
+                self._sync_balance(agent_id)
+            order["status"]="disputed"
+            order["dispute_reason"]=(reason or "")[:500]
         svc=self.services.get(order["service_id"])
         if svc:
             svc["orders_disputed"]=svc.get("orders_disputed",0)+1
