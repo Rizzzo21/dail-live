@@ -141,12 +141,26 @@ def _admin_ok(provided: str | None) -> bool:
 def _client_ip(request: Request) -> str:
     """Real client IP behind Render's proxy chain.
 
-    X-Forwarded-For grows as client -> edge -> internal router -> app, so the
-    LAST entry is our own infrastructure (a 10.x address) -- useless for
-    identifying the registrant and wrong for the faucet guard. Strip trailing
-    non-global entries; the last remaining entry is the client IP as Render's
-    edge saw it (a client-supplied spoof prefix, if any, sits left of it).
+    SECURITY (2026-10-10): the old logic took the LAST global X-Forwarded-For
+    entry, which behind Cloudflare is Cloudflare's own rotating egress IP —
+    not the client. Result: the 5/IP/24h registration faucet saw every
+    registrant as a different IP (9 scripted probe accounts registered in
+    15s, each on a distinct 172.68/162.158/104.23 egress IP), and legitimate
+    agents sharing an egress IP could block each other.
+
+    Fix: prefer Cloudflare's CF-Connecting-IP (the TCP source Cloudflare saw;
+    a client cannot spoof it when the request genuinely came through
+    Cloudflare, which we check via the CF-Ray header). Fall back to the
+    previous XFF parsing when those headers are absent.
     """
+    cf_ip = request.headers.get("cf-connecting-ip", "").strip()
+    cf_ray = request.headers.get("cf-ray", "").strip()
+    if cf_ip and cf_ray:
+        try:
+            if ipaddress.ip_address(cf_ip).is_global:
+                return cf_ip
+        except ValueError:
+            pass
     xff = request.headers.get("x-forwarded-for", "")
     entries = [e.strip() for e in xff.split(",") if e.strip()]
     while entries:
@@ -1045,11 +1059,18 @@ def safe_withdraw(req: SafeWithdrawRequest, x_dail_withdrawal_key: str | None = 
 def agents():
     # Ledger is the source of truth; overlay live balances so the cached
     # Agent.balance can never show a stale number.
+    # SECURITY (2026-10-10): this endpoint is agent-authenticated, but EVERY
+    # registered agent can call it — so it must not leak authorization
+    # internals. spending_limit / approval_limit are policy-enforcement
+    # fields, and `staff` identifies the protected staff roster (First Rule:
+    # internal). All three are stripped here; they were previously exposed
+    # to every agent (found via probe-account field enumeration).
     out=[]
     for a in dail.agents.values():
         d=a.model_dump()
         d["balance"]=dail.ledger.balances.get(a.id, a.balance)
-        d["staff"]=a.id in dail.PROTECTED_AGENTS
+        for _drop in ("spending_limit", "approval_limit"):
+            d.pop(_drop, None)
         # Registration timestamp (Postgres; None when the store is disabled).
         # The manager cron needs this to detect idle sellers (>24h, no sales).
         d["created_at"]=(dail.store.agent_created_at(a.id)
@@ -2430,7 +2451,14 @@ def runtime_work_state():
     return {"executions": agent_runtime.work.execution_log}
 
 @app.get("/runtime/receipts")
-def runtime_receipts(agent_id: str | None = None, limit: int = 20):
+def runtime_receipts(request: Request, agent_id: str | None = None, limit: int = 20):
+    # SECURITY (2026-10-10): receipts embed each agent's goal text in
+    # plaintext. Per-agent view requires ownership (matches the sibling
+    # /runtime/messages/{agent_id} route); the unfiltered view is admin-only.
+    if agent_id:
+        _own(request, agent_id)
+    elif not request.state.is_admin:
+        raise HTTPException(403, "admin_only")
     return {"receipts": agent_runtime.blackbox.latest(agent_id, max(1, min(limit, 100)))}
 
 @app.get("/runtime/receipts/verify")

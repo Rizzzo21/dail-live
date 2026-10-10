@@ -281,3 +281,76 @@ def test_registration_ignores_client_supplied_economics():
     assert body["status"] == "active"
     assert body["spending_limit"] == 10000
     assert body["approval_limit"] == 2500
+
+
+def test_agents_endpoint_strips_authz_internals():
+    # 2026-10-10: probe accounts enumerated GET /agents and confirmed it
+    # leaked spending_limit, approval_limit, and the staff roster flag to
+    # every registered agent. Those fields must never appear here.
+    from fastapi.testclient import TestClient
+    from dail.api import app
+    client = TestClient(app)
+    r = client.post("/agents", json={"id": "leakprobe1", "name": "LeakProbe"})
+    assert r.status_code == 200, r.text
+    key = r.json()["api_key"]
+    r = client.get("/agents", headers={"Authorization": f"Bearer {key}"})
+    assert r.status_code == 200, r.text
+    for a in r.json():
+        assert "spending_limit" not in a, a["id"]
+        assert "approval_limit" not in a, a["id"]
+        assert "staff" not in a, a["id"]
+        # public fields still present
+        for k in ("id", "name", "balance", "status"):
+            assert k in a, (a.get("id"), k)
+
+
+def test_client_ip_prefers_cf_connecting_ip():
+    # 2026-10-10: the faucet guard was bypassed because _client_ip returned
+    # Cloudflare's rotating egress IP instead of the real client. With
+    # CF-Connecting-IP + CF-Ray present, the real client IP must win.
+    from dail.api import _client_ip
+
+    class Req:
+        def __init__(self, headers):
+            self.headers = headers
+            self.client = None
+
+    # Genuine Cloudflare request: real client IP wins over egress IP.
+    r = _client_ip(Req({
+        "cf-connecting-ip": "8.8.8.8",
+        "cf-ray": "abc123",
+        "x-forwarded-for": "8.8.8.8, 172.68.174.166, 10.0.0.5",
+    }))
+    assert r == "8.8.8.8", r
+    # No Cloudflare headers: falls back to previous XFF behavior.
+    r = _client_ip(Req({"x-forwarded-for": "8.8.8.8, 10.0.0.5"}))
+    assert r == "8.8.8.8", r
+    # Spoofed CF-Connecting-IP without CF-Ray: ignored, falls back.
+    r = _client_ip(Req({
+        "cf-connecting-ip": "9.9.9.9",
+        "x-forwarded-for": "8.8.8.8, 10.0.0.5",
+    }))
+    assert r == "8.8.8.8", r
+
+
+def test_runtime_receipts_require_ownership():
+    # 2026-10-10: GET /runtime/receipts?agent_id=X returned any agent's
+    # receipts (including plaintext goal) with no ownership check.
+    from fastapi.testclient import TestClient
+    from dail.api import app
+    client = TestClient(app)
+    a = client.post("/agents", json={"id": "rcpt_a", "name": "A"}).json()
+    b = client.post("/agents", json={"id": "rcpt_b", "name": "B"}).json()
+    ka, kb = a["api_key"], b["api_key"]
+    # B cannot read A's receipts
+    r = client.get("/runtime/receipts", params={"agent_id": "rcpt_a"},
+                   headers={"Authorization": f"Bearer {kb}"})
+    assert r.status_code == 403, r.text
+    # A can read its own
+    r = client.get("/runtime/receipts", params={"agent_id": "rcpt_a"},
+                   headers={"Authorization": f"Bearer {ka}"})
+    assert r.status_code == 200, r.text
+    # Unfiltered view is admin-only
+    r = client.get("/runtime/receipts",
+                   headers={"Authorization": f"Bearer {ka}"})
+    assert r.status_code == 403, r.text
