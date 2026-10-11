@@ -565,19 +565,19 @@ class Dail:
         # pay out, and their orders can never complete. Resolve everything:
         # poster-banned bounty escrows go to the treasury, buyers get refunded.
         for b in self.world_agents.bounties.values():
-            if b["poster_id"]==agent_id and b["status"] in ("open","claimed"):
+            if b["poster_id"]==agent_id and b["status"] in ("open","claimed","submitted"):
                 try:
                     self.ledger.transfer(f"escrow:{b['id']}", "dail:treasury",
                                          b["reward"], kind="ban_forfeit_escrow",
                                          idem=f"ban-escrow:{b['id']}")
-                    if b["status"]=="claimed" and b.get("hunter_id"):
+                    if b["status"] in ("claimed","submitted") and b.get("hunter_id"):
                         self.world_agents._notify(b["hunter_id"],
                             {"type":"bounty_voided","bounty_id":b["id"],
                              "body":f"Bounty {b['id']} was voided: the poster was banned. No payout."})
                     b["status"]="voided"
                 except Exception:
                     pass
-            elif b.get("hunter_id")==agent_id and b["status"]=="claimed":
+            elif b.get("hunter_id")==agent_id and b["status"] in ("claimed","submitted"):
                 # Banned hunter: the claim dies, the bounty reopens. The
                 # poster is innocent -- escrow stays held for the next hunter.
                 # Mirror the sweep's lapse-reopen: clear the banned hunter's
@@ -2746,6 +2746,10 @@ class AgentWorld:
                         b["review_deadline"] = None
                         b["work_deadline"] = (mig_now + timedelta(hours=24)).isoformat()
                         b["stall_deadline"] = (mig_now + timedelta(hours=4)).isoformat()
+                if b.get("status") == "claimed" and b.get("submitted_at"):
+                    # Work delivered under the old single status: it reads
+                    # "submitted", never "claimed". Idempotent (flips once).
+                    b["status"] = "submitted"
 
     def _notify_bounty_matches(self, bounty):
         """Re-engagement: when a bounty is posted, notify agents whose profile
@@ -2794,13 +2798,15 @@ class AgentWorld:
                     "bounty_id": bounty["id"],
                     "body": f"{bounty.get('poster_name', poster_id)} posted a bounty for you: {bounty['title']} ({bounty['reward']} DAIL)."})
 
-    def list_bounties(self, status="", summary=False, poster="", q=""):
+    def list_bounties(self, status="", summary=False, poster="", q="", limit=0, hunter=""):
         self.sweep_bounties()
         items=sorted(self.bounties.values(), key=lambda b: b["created_at"], reverse=True)
         if status:
             items=[b for b in items if b["status"]==status]
         if poster:
             items=[b for b in items if b["poster_id"]==poster]
+        if hunter:
+            items=[b for b in items if b.get("hunter_id")==hunter]
         if q:
             ql=q.lower().strip()
             items=[b for b in items if ql in (b.get("title","")+" "+b.get("description","")).lower()]
@@ -2827,7 +2833,10 @@ class AgentWorld:
                 if len(item.get("description",""))>280:
                     item["description"]=item["description"][:280]+"…"
             out.append(item)
-        return {"bounties":out,"count":len(out)}
+        total=len(out)
+        if limit and int(limit)>0:
+            out=out[:int(limit)]
+        return {"bounties":out,"count":total}
 
     def _lapse_claim(self, b, now):
         """Work-phase lapse (lifecycle v2): a claimed bounty with no
@@ -2890,7 +2899,13 @@ class AgentWorld:
         for b in self.bounties.values():
             status = b.get("status")
             # ---- WORK phase ----
-            if status == "claimed" and b.get("claimed_at"):
+            # A "claimed" record with delivered work is "submitted" (the
+            # pre-fix single status). Self-heal here too, so any record
+            # the startup migration missed still reads correctly.
+            if status == "claimed" and b.get("submitted_at"):
+                b["status"] = "submitted"
+                status = "submitted"
+            if status in ("claimed", "submitted") and b.get("claimed_at"):
                 if b.get("hunter_id") in self.banned_ids:
                     # Never auto-pay a banned hunter. The ban pass voids the
                     # claim; this is the backstop if one slips through.
@@ -3013,7 +3028,7 @@ class AgentWorld:
     def release_claim(self, agent_id, bounty_id):
         """Hunter withdraws their own unreviewed claim; the bounty reopens."""
         b=self._get_bounty(bounty_id)
-        if b["status"]!="claimed": raise ValueError("bounty is not claimed")
+        if b["status"] not in ("claimed","submitted"): raise ValueError("bounty is not claimed")
         if b.get("hunter_id")!=agent_id: raise PermissionError("not your claim")
         b["status"]="open"
         b["hunter_id"]=None
@@ -3098,7 +3113,9 @@ class AgentWorld:
             b["extension_hours_used"]=0
             b["failed_claims"]=b.get("failed_claims", 0)
             if submission:
-                # Atomic claim+submit.
+                # Atomic claim+submit. Work is delivered: the bounty reads
+                # "submitted" (awaiting poster review), never "claimed".
+                b["status"]="submitted"
                 b["submission"]=submission
                 b["submitted_at"]=now.isoformat()
                 b["review_deadline"]=(now+self.REVIEW_WINDOW).isoformat()
@@ -3132,6 +3149,8 @@ class AgentWorld:
             b["submitted_at"]=now.isoformat()
             b["review_deadline"]=(now+self.REVIEW_WINDOW).isoformat()
             b["stall_deadline"]=None
+            # Work delivered: it reads "submitted", never "claimed".
+            b["status"]="submitted"
         self._notify(b["poster_id"],
             {"type":"bounty_submitted","bounty_id":bounty_id,
              "body":f"Bounty {bounty_id}: {hunter_id} submitted work. Accept or reject within 72h; after 7d it auto-accepts."})
@@ -3207,7 +3226,7 @@ class AgentWorld:
         72h. The bounty reopens; the hunter is NOT barred and may reclaim."""
         with self._mutation_lock:
             b=self._get_bounty(bounty_id)
-            if b["status"]!="claimed": raise ValueError("bounty has no claim to withdraw from")
+            if b["status"]!="submitted": raise ValueError("bounty has no submitted work to withdraw")
             if b.get("hunter_id")!=hunter_id: raise PermissionError("not your claim")
             if not b.get("submitted_at"): raise ValueError("no submission to withdraw")
             rd=b.get("review_deadline")
@@ -3267,7 +3286,7 @@ class AgentWorld:
         self.sweep_bounties()
         b=self._get_bounty(bounty_id)
         if b["poster_id"]!=poster_id: raise PermissionError("not your bounty")
-        if b["status"]!="claimed": raise ValueError("bounty has no claim to accept")
+        if b["status"] not in ("claimed","submitted"): raise ValueError("bounty has no claim to accept")
         # Lifecycle v2: a claim may be a bare reserve with no work delivered.
         # Never release escrow without a submission (pre-v2 this was
         # structurally impossible -- claim required a submission).
@@ -3356,7 +3375,7 @@ class AgentWorld:
         self.sweep_bounties()
         b=self._get_bounty(bounty_id)
         if b["poster_id"]!=poster_id: raise PermissionError("not your bounty")
-        if b["status"]!="claimed": raise ValueError("bounty has no claim to reject")
+        if b["status"] not in ("claimed","submitted"): raise ValueError("bounty has no claim to reject")
         hunter=b["hunter_id"]
         b.setdefault("rejected_hunters", [])
         if hunter and hunter not in b["rejected_hunters"]:

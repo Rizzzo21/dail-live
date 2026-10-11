@@ -61,7 +61,7 @@ def test_bounty_full_lifecycle():
     r = client.post(f"/world/bounties/{b['id']}/claim", json={
         "agent_id": hunter, "submission": "Completed the requested deliverable and verified it against the bounty requirements; summary of changes and test evidence included in the attached notes."}, headers=_auth(hunter))
     assert r.status_code == 200, r.text
-    assert r.json()["status"] == "claimed"
+    assert r.json()["status"] == "submitted"  # work delivered at claim time
     # accept: hunter nets 45, treasury takes 5 (10%)
     r = client.post(f"/world/bounties/{b['id']}/accept",
                     json={"agent_id": poster}, headers=_auth(poster))
@@ -260,6 +260,7 @@ def test_reserve_claim_then_submit():
         "agent_id": hunter, "submission": "Completed the requested deliverable and verified it against the bounty requirements; summary of changes and test evidence included in the attached notes."}, headers=_auth(hunter))
     assert r.status_code == 200, r.text
     b = r.json()
+    assert b["status"] == "submitted"  # delivered work reads "submitted"
     assert b["submitted_at"] is not None and b["review_deadline"] is not None
     assert b["stall_deadline"] is None
     r = client.post(f"/world/bounties/{bid}/submit", json={
@@ -278,6 +279,7 @@ def test_atomic_claim_with_submission():
         "agent_id": hunter, "submission": "Completed the requested deliverable and verified it against the bounty requirements; summary of changes and test evidence included in the attached notes."}, headers=_auth(hunter))
     assert r.status_code == 200, r.text
     b = r.json()
+    assert b["status"] == "submitted"
     assert b["submitted_at"] == b["claimed_at"]
     assert b["review_deadline"] is not None
     r = client.post(f"/world/bounties/{bid}/accept",
@@ -598,6 +600,7 @@ def test_lifecycle_v2_migration_grandfathers():
     assert b1["lapsed_hunters"] == [] and b1["extension_request"] is None
     # claimed record: review clock backfilled into the future
     assert b2["submitted_at"] is not None
+    assert b2["status"] == "submitted"  # delivered work reads "submitted"
     assert datetime.fromisoformat(b2["review_deadline"]) > datetime.now(timezone.utc)
     assert datetime.fromisoformat(b2["work_deadline"]) > datetime.now(timezone.utc)
     # idempotent: second run changes nothing
@@ -720,7 +723,8 @@ def test_auto_accept_measured_from_submission():
     b["review_deadline"] = (datetime.now(timezone.utc) + timedelta(hours=71)).isoformat()
     wa.sweep_bounties()
     # Submitted 1h ago: must still be awaiting review, not auto-accepted.
-    assert wa.bounties[bid]["status"] == "claimed"
+    # The old single "claimed" status self-heals to "submitted" on the sweep.
+    assert wa.bounties[bid]["status"] == "submitted"
     # And it DOES auto-accept 7 days after submission.
     b["submitted_at"] = (datetime.now(timezone.utc) - timedelta(days=8)).isoformat()
     wa.sweep_bounties()
@@ -886,3 +890,95 @@ def test_spending_cap_enforced_on_money_paths():
         "agent_id": poster, "title": "t", "description": "d", "reward": 20},
         headers=_auth(poster))
     assert r.status_code == 201, r.text
+
+
+def test_bounty_list_filters_hunter_and_limit_honored():
+    # Regression (2026-10-10, roblox-dev-agent UX audit bnty_0114):
+    # ?limit= and ?hunter= were silently ignored. Both must filter now.
+    poster, h1, h2 = _uid("p"), _uid("h1"), _uid("h2")
+    _make(poster); _make(h1); _make(h2)
+    bids = []
+    for i in range(4):
+        bids.append(client.post("/world/bounties", json={
+            "agent_id": poster, "title": f"job {i}", "description": "d",
+            "reward": 10}, headers=_auth(poster)).json()["id"])
+    # h1 claims bid 0 (bare reserve -> "claimed"), h2 claims+submits bid 1
+    client.post(f"/world/bounties/{bids[0]}/claim", json={"agent_id": h1},
+                headers=_auth(h1))
+    client.post(f"/world/bounties/{bids[1]}/claim", json={
+        "agent_id": h2,
+        "submission": "Completed the requested deliverable and verified it against the bounty requirements; full summary of changes and test evidence in the attached notes."},
+        headers=_auth(h2))
+    # ?hunter= filters to that hunter's bounties only
+    r = client.get(f"/world/bounties?hunter={h1}")
+    assert r.status_code == 200, r.text
+    got = r.json()["bounties"]
+    assert [b["id"] for b in got] == [bids[0]], got
+    r = client.get(f"/world/bounties?hunter={h2}")
+    got = r.json()["bounties"]
+    assert [b["id"] for b in got] == [bids[1]], got
+    # ?limit= caps the list but count stays total matched
+    r = client.get("/world/bounties?status=open")
+    assert r.status_code == 200, r.text
+    total_open = r.json()["count"]
+    assert total_open >= 2
+    r = client.get("/world/bounties?status=open&limit=1")
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert len(body["bounties"]) == 1
+    assert body["count"] == total_open  # capped list, full count
+    # no filters: everything back, count == len(bounties)
+    r = client.get("/world/bounties")
+    body = r.json()
+    assert len(body["bounties"]) == body["count"] >= 4
+
+
+def test_submitted_status_flows_end_to_end():
+    # Reserve -> submit -> status "submitted"; poster accepts; hunter can
+    # withdraw a stale submission; a banned hunter's submitted claim reopens.
+    from datetime import datetime, timedelta, timezone
+    from dail.api import dail as _d
+    poster, hunter = _uid("p"), _uid("h")
+    _make(poster); _make(hunter)
+    bid = client.post("/world/bounties", json={
+        "agent_id": poster, "title": "t", "description": "d", "reward": 20},
+        headers=_auth(poster)).json()["id"]
+    # status filter finds it by its real state
+    r = client.get("/world/bounties?status=submitted")
+    assert all(b["status"] == "submitted" for b in r.json()["bounties"])
+    assert not any(b["id"] == bid for b in r.json()["bounties"])
+    # reserve stays "claimed"; submit flips it
+    client.post(f"/world/bounties/{bid}/claim", json={"agent_id": hunter},
+                headers=_auth(hunter))
+    r = client.get(f"/world/bounties?status=claimed")
+    assert any(b["id"] == bid for b in r.json()["bounties"])
+    client.post(f"/world/bounties/{bid}/submit", json={
+        "agent_id": hunter,
+        "submission": "Completed the requested deliverable and verified it against the bounty requirements; full summary of changes and test evidence in the attached notes."},
+        headers=_auth(hunter))
+    r = client.get(f"/world/bounties?status=submitted")
+    assert any(b["id"] == bid for b in r.json()["bounties"]), r.json()
+    r = client.get(f"/world/bounties?status=claimed")
+    assert not any(b["id"] == bid for b in r.json()["bounties"])
+    # extensions are a pre-submit instrument: rejected after submit
+    r = client.post(f"/world/bounties/{bid}/request-extension", json={
+        "agent_id": hunter, "reason": "too late", "extra_hours": 5},
+        headers=_auth(hunter))
+    assert r.status_code == 400, r.text
+    # poster accepts a submitted bounty just like before
+    r = client.post(f"/world/bounties/{bid}/accept",
+                    json={"agent_id": poster}, headers=_auth(poster))
+    assert r.status_code == 200 and r.json()["status"] == "completed"
+    # banned hunter with a SUBMITTED claim: claim dies, bounty reopens
+    bid2 = client.post("/world/bounties", json={
+        "agent_id": poster, "title": "t2", "description": "d", "reward": 20},
+        headers=_auth(poster)).json()["id"]
+    client.post(f"/world/bounties/{bid2}/claim", json={
+        "agent_id": hunter,
+        "submission": "Completed the requested deliverable and verified it against the bounty requirements; full summary of changes and test evidence in the attached notes."},
+        headers=_auth(hunter))
+    assert _d.world_agents.bounties[bid2]["status"] == "submitted"
+    _d.ban_agent(hunter, "test")
+    b = _d.world_agents.bounties[bid2]
+    assert b["status"] == "open" and b.get("hunter_id") is None
+    _d.unban_agent(hunter)
