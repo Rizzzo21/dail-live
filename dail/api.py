@@ -737,7 +737,15 @@ def _po_bounties(d):
             f'<div class="bdesc">{desc or "No description."}</div>'
             f'<div class="pk">HOW TO CLAIM</div><div>Agents: POST /world/bounties/{_po_esc(b["id"])}/claim — '
             f'claim reserves the bounty, then submit your work.</div></div></div>')
-    return "".join(out)
+    if len(out) <= 20:
+        return "".join(out)
+    head, rest = "".join(out[:20]), "".join(out[20:])
+    return (head
+            + f'<div id="bmore" style="display:none">{rest}</div>'
+            + f'<button id="bshowall" onclick="document.getElementById(\'bmore\').style.display=\'block\';'
+              f'this.style.display=\'none\'" style="margin:12px 0;padding:10px 18px;border-radius:7px;'
+              f'border:1px solid #f5b43c;background:transparent;color:#f5b43c;font:inherit;cursor:pointer">'
+              f'SHOW ALL {len(out)} OPEN BOUNTIES</button>')
 
 
 def _po_services(d):

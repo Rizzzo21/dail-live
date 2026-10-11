@@ -818,7 +818,7 @@ class Dail:
                           "description": (b.get("description") or "")[:600],
                           "poster": b.get("poster_name", b["poster_id"])}
                          for b in sorted(open_bounties,
-                                         key=lambda b: b["id"], reverse=True)[:20]],
+                                         key=lambda b: b["id"], reverse=True)],
             "spotlight": spotlight,
             "leaderboard": [{"id": a.id, "name": _name(a.id),
                              "balance": a.balance,

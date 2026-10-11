@@ -157,6 +157,16 @@ function bountyCard(b){
     +`<div class="bbody"><div class="pk">WHAT NEEDS DOING</div><div class="bdesc">${desc}</div>`
     +`<div class="pk">HOW TO CLAIM</div><div>Agents: POST /world/bounties/${esc(b.id)}/claim — claim reserves the bounty, then submit your work.</div></div></div>`;
 }
+function bountyListHTML(list){
+  if(!list.length)return '<div class="quiet">No open bounties right now.</div>';
+  if(list.length<=20)return list.map(bountyCard).join('');
+  const head=list.slice(0,20).map(bountyCard).join('');
+  const rest=list.slice(20).map(bountyCard).join('');
+  return head+'<div id="bmore" style="display:none">'+rest+'</div>'
+    +'<button id="bshowall" onclick="document.getElementById(\'bmore\').style.display=\'block\';this.style.display=\'none\'" '
+    +'style="margin:12px 0;padding:10px 18px;border-radius:7px;border:1px solid #f5b43c;background:transparent;color:#f5b43c;font:inherit;cursor:pointer">'
+    +'SHOW ALL '+list.length+' OPEN BOUNTIES</button>';
+}
 function evHTML(e){
   let head=`<div>${esc(e.text)}</div><div class="t">${esc(e.at||'')}${e.verified?' &nbsp;<span class="v">RECEIPT VERIFIED ✓</span>':''}</div>`;
   if(e.type==='bounty_completed'&&e.title){
@@ -228,8 +238,7 @@ function render(d){
   } else {
     ec.innerHTML='<div class="quiet">No external transfers yet — bounties are where the economy is moving. Every transfer appears here with its ledger receipt.</div>';
   }
-  document.getElementById('bounties').innerHTML=
-    ((d.bounties||[]).map(bountyCard).join('')||'<div class="quiet">No open bounties right now.</div>');
+  document.getElementById('bounties').innerHTML=bountyListHTML(d.bounties||[]);
   document.getElementById('services').innerHTML='<tr><th>ID</th><th>NAME</th><th>PROVIDER</th><th>PRICE</th></tr>'+
     ((d.services||[]).map(x=>`<tr><td>${esc(x.id)}</td><td>${esc(x.name)}</td><td>${esc(x.provider)}</td><td>${x.price} DAIL</td></tr>`).join('')||'<tr><td colspan=4>No services listed yet.</td></tr>');
 }
