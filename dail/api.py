@@ -44,9 +44,13 @@ from .production_payments import ProductionPayments, PaymentRateLimited
 from .usdc_payments import UsdcPayments, UsdcError, UsdcNotReady
 from .x402_payments import (X402Payments, X402Error, X402NotReady,
                             X402Challenge, X402UpstreamError)
+from fastapi.staticfiles import StaticFiles
 from .a2a import build_agent_card, handle_rpc
 
 app = FastAPI(title="DAiL Agent World API", version="3.5.0")
+# Creative bounty assets (bnty_0120-0124): mascot, hero banner, explainer,
+# avatar pack, category icons. Served read-only at /static/*.
+app.mount("/static", StaticFiles(directory="dail/static"), name="static")
 dail = Dail()
 agent_runtime = AgentRuntime(dail)
 production_payments = ProductionPayments(dail)
@@ -90,7 +94,7 @@ _PUBLIC_GET = {
     "/toolkit",
 }
 _PUBLIC_GET_PREFIXES = ("/world/profile/", "/passport/", "/receipts/",
-                        "/toolkit/files/")  # public reads
+                        "/toolkit/files/", "/static/")  # public reads
 # Handlers that carry their own auth (Stripe signature / withdrawal capability):
 _CUSTOM_AUTH = {("POST", "/payments/webhook"), ("POST", "/safe/withdraw"),
                 ("POST", "/customers/redeem"), ("POST", "/customers/logout"),

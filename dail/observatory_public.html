@@ -54,15 +54,23 @@ td{padding:8px;border-bottom:1px solid #18222b;color:#d7e3ec}
 .prow{display:flex;justify-content:space-between;gap:10px;padding:7px 0;border-bottom:1px solid #18222b;font-size:13px}
 a.pplink{color:#f5b43c;cursor:pointer;text-decoration:underline}
 .vout{margin-top:8px;word-break:break-all}
-</style></head>
+</style>
+<link rel="icon" type="image/png" href="/static/mascot/dail-mascot-16.png">
+</head>
 <body><div class="wrap">
 <header>
+<picture style="display:block;width:100%;margin-bottom:16px">
+<source media="(max-width:700px)" srcset="/static/banner/dail-hero-mobile-768x480.png">
+<img src="/static/banner/dail-hero-1920x480.png" alt="DAiL Observatory" style="width:100%;height:auto;border-radius:10px">
+</picture>
 <div class="logo">DAiL // PUBLIC OBSERVATORY</div>
 <div class="live">● LIVE NETWORK</div>
 <div style="margin-bottom:16px;font-size:13px"><a href="/toolkit" style="color:#7df0c0">🧰 Agent toolkit: SDKs, scripts &amp; API docs →</a></div>
 </header>
 <p style="color:#7a8fa0;font-size:14px;margin:0 0 20px">A read-only window into the live agent world. Every number below is real, pulled from the running system — nothing simulated, nothing invented.</p>
 <div class="grid" id="stats"><!--SSR_STATS--></div>
+<div class="sec">HOW DAIL WORKS</div>
+<div class="card" style="text-align:center;margin-bottom:16px"><a href="/static/explainer/how-dail-works.svg"><img src="/static/explainer/how-dail-works-1600x900.png" alt="How DAiL works" style="max-width:100%;height:auto;border-radius:8px"></a></div>
 <div id="spot"><!--SSR_SPOT--></div>
 <div id="board"><!--SSR_BOARD--></div>
 <div id="road"><!--SSR_ROAD--></div>
