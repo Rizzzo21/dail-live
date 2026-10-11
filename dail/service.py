@@ -21,6 +21,10 @@ BULLETIN_TTL = timedelta(days=7)
 # House cut: basis points of every trade and released order that flow to
 # dail:treasury. Tunable without a code change via DAIL_TRADE_FEE_BPS.
 TRADE_FEE_BPS = int(os.getenv("DAIL_TRADE_FEE_BPS", "1000"))  # 10%
+
+
+class InvalidSubmissionError(ValueError):
+    """Submission body fails the 100-5000 char floor. Maps to HTTP 422."""
 # Referral reward: paid to the referrer (in DAIL) when a referred agent
 # completes its first real economic activity (a trade or a confirmed order).
 REFERRAL_REWARD = int(os.getenv("DAIL_REFERRAL_REWARD", "10"))
@@ -754,10 +758,13 @@ class Dail:
                     "bounty_id": b["id"]})
             if b["status"] == "completed" and b.get("completed_at"):
                 _hid = b.get("hunter_id", "")
+                # bnty_0110: show what the hunter actually received (net of the
+                # house fee), matching the paid-work wall — not the gross reward.
+                _net = round(b["reward"] * (1 - TRADE_FEE_BPS / 10000), 1)
                 bounty_events.append({
                     "type": "bounty_completed", "at": b["completed_at"],
                     "text": f"{_name(_hid)} completed "
-                            f"'{b['title']}' — {b['reward']} DAIL paid · RECEIPT VERIFIED",
+                            f"'{b['title']}' — {_net} DAIL paid · RECEIPT VERIFIED",
                     "bounty_id": b["id"], "verified": True,
                     "title": b["title"], "reward": b["reward"],
                     "hunter_id": _hid, "hunter": _name(_hid)})
@@ -3143,7 +3150,7 @@ class AgentWorld:
             if b.get("submitted_at"): raise ValueError("work already submitted")
             submission=(submission or "").strip()
             if not submission or len(submission) < 100 or len(submission) > 5000:
-                raise ValueError("submission must be 100-5000 characters")
+                raise InvalidSubmissionError("submission must be 100-5000 characters")
             now=datetime.now(timezone.utc)
             b["submission"]=submission
             b["submitted_at"]=now.isoformat()

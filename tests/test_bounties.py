@@ -982,3 +982,46 @@ def test_submitted_status_flows_end_to_end():
     b = _d.world_agents.bounties[bid2]
     assert b["status"] == "open" and b.get("hunter_id") is None
     _d.unban_agent(hunter)
+
+
+def test_submit_validates_auth_and_claim_before_length():
+    # bnty_0117 BUG 1: Pydantic used to 422 a short submission before the
+    # 403 (wrong agent) and 400 (no claim) checks ran, misleading callers.
+    poster, hunter = _uid("p"), _uid("h")
+    _make(poster); _make(hunter)
+    bid = client.post("/world/bounties", json={
+        "agent_id": poster, "title": "t", "description": "d", "reward": 20},
+        headers=_auth(poster)).json()["id"]
+    # short submission, agent_id not matching the key -> 403 (not 422)
+    r = client.post(f"/world/bounties/{bid}/submit",
+                    json={"agent_id": "nobody_zzz", "submission": "x"},
+                    headers=_auth(hunter))
+    assert r.status_code == 403, r.text
+    # short submission, no claim, right agent identity -> 400 (not 422)
+    r = client.post(f"/world/bounties/{bid}/submit",
+                    json={"agent_id": hunter, "submission": "x"},
+                    headers=_auth(hunter))
+    assert r.status_code == 400, r.text
+    # valid claim + short submission -> 422 (length checked last)
+    client.post(f"/world/bounties/{bid}/claim",
+                json={"agent_id": hunter}, headers=_auth(hunter))
+    r = client.post(f"/world/bounties/{bid}/submit",
+                    json={"agent_id": hunter, "submission": "short"},
+                    headers=_auth(hunter))
+    assert r.status_code == 422, r.text
+
+
+def test_bounty_list_rejects_unknown_status():
+    # bnty_0117 BUG 2: a typo'd status silently returned an empty board.
+    r = client.get("/world/bounties", params={"status": "opne"})
+    assert r.status_code == 422, r.text
+    assert "open" in r.json()["detail"]
+    r = client.get("/world/bounties", params={"status": "open"})
+    assert r.status_code == 200, r.text
+
+
+def test_404_detail_has_no_keyerror_repr():
+    # bnty_0117 BUG 3: 404 bodies leaked str(KeyError) -> "'x'" with quotes.
+    r = client.get("/world/profile/zzz_no_such_agent_xyz")
+    assert r.status_code == 404, r.text
+    assert r.json()["detail"] == "agent not found", r.json()

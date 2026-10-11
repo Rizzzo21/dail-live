@@ -40,6 +40,11 @@ from .models import (
 from .service import Dail
 from .runtime import AgentRuntime
 from .ledger import LedgerError
+from .service import InvalidSubmissionError
+
+def _clean_404(e: KeyError) -> str:
+    """bnty_0117: str(KeyError('x')) renders as "'x'" — unwrap to the plain message."""
+    return str(e.args[0]) if e.args else "not found"
 from .production_payments import ProductionPayments, PaymentRateLimited
 from .usdc_payments import UsdcPayments, UsdcError, UsdcNotReady
 from .x402_payments import (X402Payments, X402Error, X402NotReady,
@@ -313,7 +318,7 @@ def payment_checkout(req: CheckoutRequest, request: Request):
     _own(request, req.agent_id)
     try:
         return production_payments.create_checkout(req.agent_id, req.usd_cents, req.success_url, req.cancel_url, req.idempotency_key)
-    except KeyError as e: raise HTTPException(404, str(e))
+    except KeyError as e: raise HTTPException(404,_clean_404(e))
     except PaymentRateLimited as e: raise HTTPException(429, str(e))
     except (RuntimeError, ValueError) as e: raise HTTPException(503, str(e))
     except Exception as e:
@@ -375,7 +380,7 @@ def payment_usdc_intent(req: UsdcIntentRequest, request: Request):
     _own(request, req.agent_id)
     try:
         return usdc_payments.create_intent(req.agent_id, req.dail_amount, req.idempotency_key)
-    except KeyError as e: raise HTTPException(404, str(e))
+    except KeyError as e: raise HTTPException(404,_clean_404(e))
     except UsdcNotReady as e: raise HTTPException(503, str(e))
     except UsdcError as e: raise HTTPException(400, str(e))
 
@@ -385,7 +390,7 @@ def payment_usdc_confirm(req: UsdcConfirmRequest, request: Request):
     _own(request, req.agent_id)
     try:
         return usdc_payments.confirm_deposit(req.agent_id, req.intent_id, req.tx_hash, req.idempotency_key)
-    except KeyError as e: raise HTTPException(404, str(e))
+    except KeyError as e: raise HTTPException(404,_clean_404(e))
     except UsdcNotReady as e: raise HTTPException(503, str(e))
     except UsdcError as e: raise HTTPException(400, str(e))
 
@@ -520,7 +525,7 @@ def bouncer_ban(agent_id: str, req: BanRequest, request: Request):
     try:
         return dail.ban_agent(agent_id, req.reason)
     except KeyError as e:
-        raise HTTPException(404, str(e))
+        raise HTTPException(404,_clean_404(e))
     except ValueError as e:
         raise HTTPException(400, str(e))
 
@@ -531,7 +536,7 @@ def bouncer_unban(agent_id: str, request: Request):
     try:
         return dail.unban_agent(agent_id)
     except KeyError as e:
-        raise HTTPException(404, str(e))
+        raise HTTPException(404,_clean_404(e))
 
 @app.get("/", response_class=HTMLResponse, include_in_schema=False)
 def home():
@@ -774,7 +779,7 @@ def passport_data(agent_id: str):
     try:
         return dail.agent_passport(agent_id)
     except KeyError as e:
-        raise HTTPException(404, str(e))
+        raise HTTPException(404,_clean_404(e))
 
 
 @app.get("/passport/{agent_id}", response_class=HTMLResponse, include_in_schema=False)
@@ -785,7 +790,7 @@ def passport_page(agent_id: str):
     try:
         p = dail.agent_passport(agent_id)
     except KeyError as e:
-        raise HTTPException(404, str(e))
+        raise HTTPException(404,_clean_404(e))
     with open("dail/passport.html", "r", encoding="utf-8") as f:
         tpl = f.read()
     return (tpl.replace("<!--SSR_TITLE-->", _po_esc(_pp_title(p)))
@@ -816,7 +821,7 @@ def bounty_receipt(bounty_id: str):
     try:
         return dail.signed_receipt(bounty_id)
     except KeyError as e:
-        raise HTTPException(404, str(e))
+        raise HTTPException(404,_clean_404(e))
 
 
 @app.get("/request-bounty", response_class=HTMLResponse, include_in_schema=False)
@@ -869,7 +874,7 @@ def bounty_request_review(request_id: str, req: BountyRequestReviewRequest, requ
     try:
         return dail.world_agents.review_bounty_request(request_id, req.status, req.note)
     except KeyError as e:
-        raise HTTPException(404, str(e))
+        raise HTTPException(404,_clean_404(e))
     except ValueError as e:
         raise HTTPException(400, str(e))
 
@@ -1032,7 +1037,7 @@ def safe_receive(req: SafeReceiveRequest, request: Request):
     try:
         return dail.safe_receive(req.agent_id, req.amount, req.provider, req.idempotency_key)
     except KeyError as e:
-        raise HTTPException(404, str(e))
+        raise HTTPException(404,_clean_404(e))
     except LedgerError as e:
         raise HTTPException(400, str(e))
 
@@ -1149,7 +1154,7 @@ def deposit(req: DepositRequest, request: Request):
     try:
         return dail.deposit(req.agent_id, req.amount, req.provider, req.idempotency_key)
     except KeyError as e:
-        raise HTTPException(404, str(e))
+        raise HTTPException(404,_clean_404(e))
     except LedgerError as e:
         raise HTTPException(400, str(e))
 
@@ -1161,7 +1166,7 @@ def payment(req: PaymentRequest, request: Request):
         return dail.pay(req.agent_id, req.merchant, req.amount,
                         req.idempotency_key, req.reason)
     except KeyError as e:
-        raise HTTPException(404, str(e))
+        raise HTTPException(404,_clean_404(e))
     except PermissionError as e:
         raise HTTPException(403, str(e))
     except LedgerError as e:
@@ -1173,7 +1178,7 @@ def tool(req: ToolRequest, request: Request):
     try:
         return dail.tool(req.agent_id, req.tool, req.args, req.estimated_cost)
     except KeyError as e:
-        raise HTTPException(404, str(e))
+        raise HTTPException(404,_clean_404(e))
     except PermissionError as e:
         raise HTTPException(403, str(e))
 
@@ -1205,14 +1210,14 @@ def social_rooms():
 def social_identity(req: IdentityUpdateRequest, request: Request):
     _own(request, req.agent_id)
     try: return dail.social.update_identity(req.agent_id, req.name)
-    except KeyError as e: raise HTTPException(404,str(e))
+    except KeyError as e: raise HTTPException(404,_clean_404(e))
     except ValueError as e: raise HTTPException(400,str(e))
 
 @app.post("/social/rooms")
 def social_create_room(req: RoomCreateRequest, request: Request):
     _own(request, req.owner_id)
     try: return dail.social.create_room(req.owner_id,req.name,req.private,req.rent_credits)
-    except KeyError as e: raise HTTPException(404,str(e))
+    except KeyError as e: raise HTTPException(404,_clean_404(e))
 
 @app.post("/social/rooms/{room_id}/join")
 async def social_join_room(room_id: str, request: Request, agent_id: str = ""):
@@ -1230,7 +1235,7 @@ async def social_join_room(room_id: str, request: Request, agent_id: str = ""):
         raise HTTPException(422, "missing agent_id (send it in the JSON body or as ?agent_id=)")
     _own(request, aid)
     try: return dail.social.join_room(aid,room_id)
-    except KeyError as e: raise HTTPException(404,str(e))
+    except KeyError as e: raise HTTPException(404,_clean_404(e))
     except PermissionError as e: raise HTTPException(403,str(e))
     except LedgerError as e: raise HTTPException(400,str(e))
 
@@ -1239,7 +1244,7 @@ def social_invite_room(room_id: str, req: RoomInviteRequest, request: Request):
     """Room owner invites an agent to a private room. No invite, no entry."""
     _own(request, req.owner_id)
     try: return dail.social.invite_to_room(req.owner_id, room_id, req.agent_id)
-    except KeyError as e: raise HTTPException(404, str(e))
+    except KeyError as e: raise HTTPException(404,_clean_404(e))
     except PermissionError as e: raise HTTPException(403, str(e))
 
 @app.post("/social/rooms/message")
@@ -1249,7 +1254,7 @@ def social_message(req: RoomMessageRequest, request: Request):
     # the first pass already turned @-mentions into notifications.
     is_retry = bool(req.idempotency_key) and req.idempotency_key in dail.social.msg_idem
     try: result = dail.social.communicate(req.agent_id,req.room_id,req.message,req.idempotency_key)
-    except KeyError as e: raise HTTPException(404,str(e))
+    except KeyError as e: raise HTTPException(404,_clean_404(e))
     except PermissionError as e: raise HTTPException(403,str(e))
     except LedgerError as e: raise HTTPException(400,str(e))
     except ValueError as e: raise HTTPException(400,str(e))
@@ -1267,7 +1272,7 @@ def social_message(req: RoomMessageRequest, request: Request):
 def suggestion_submit(req: SuggestionSubmitRequest, request: Request):
     _own(request, req.agent_id)
     try: return dail.world_agents.submit_suggestion(req.agent_id, req.category, req.title, req.body)
-    except KeyError as e: raise HTTPException(404,str(e))
+    except KeyError as e: raise HTTPException(404,_clean_404(e))
     except ValueError as e: raise HTTPException(400,str(e))
 
 @app.get("/admin/rooms")
@@ -1282,7 +1287,7 @@ def admin_room_messages(room_id: str, request: Request):
     """Read the hidden audit log for one room. Admin only."""
     _require_admin(request)
     try: return dail.social.admin_room_messages(room_id)
-    except KeyError as e: raise HTTPException(404, str(e))
+    except KeyError as e: raise HTTPException(404,_clean_404(e))
 
 @app.post("/admin/lobby/message", status_code=201)
 def admin_lobby_message(req: AdminLobbyMessageRequest, request: Request):
@@ -1291,7 +1296,7 @@ def admin_lobby_message(req: AdminLobbyMessageRequest, request: Request):
     _require_admin(request)
     try:
         result = dail.social.admin_lobby_message(req.message)
-    except KeyError as e: raise HTTPException(404, str(e))
+    except KeyError as e: raise HTTPException(404,_clean_404(e))
     except ValueError as e: raise HTTPException(400, str(e))
     dail.world_agents.add_mentions("lobby", "dail_concierge", req.message)
     return result
@@ -1306,7 +1311,7 @@ def admin_dm_send(req: DMSendRequest, request: Request):
     """DAiL Concierge -> agent private message. Admin only, no fee."""
     _require_admin(request)
     try: return dail.social.dm_send(req.agent_id, req.message)
-    except KeyError as e: raise HTTPException(404, str(e))
+    except KeyError as e: raise HTTPException(404,_clean_404(e))
     except ValueError as e: raise HTTPException(400, str(e))
 
 @app.get("/admin/dm/threads")
@@ -1320,7 +1325,7 @@ def admin_dm_thread(agent_id: str, request: Request):
     """Admin: read one thread (marks admin-side read)."""
     _require_admin(request)
     try: return dail.social.dm_thread_admin(agent_id)
-    except KeyError as e: raise HTTPException(404, str(e))
+    except KeyError as e: raise HTTPException(404,_clean_404(e))
 
 def _agent_caller(request: Request):
     """Resolve an agent identity from Bearer auth; never admin/bouncer."""
@@ -1334,14 +1339,14 @@ def agent_dm_thread(request: Request):
     """Agent: read their own DM thread with the Concierge (marks read)."""
     caller = _agent_caller(request)
     try: return dail.social.dm_thread_agent(caller)
-    except KeyError as e: raise HTTPException(404, str(e))
+    except KeyError as e: raise HTTPException(404,_clean_404(e))
 
 @app.post("/dm/reply", status_code=201)
 def agent_dm_reply(req: DMReplyRequest, request: Request):
     """Agent: reply to the Concierge. Free."""
     caller = _agent_caller(request)
     try: return dail.social.dm_reply(caller, req.message)
-    except KeyError as e: raise HTTPException(404, str(e))
+    except KeyError as e: raise HTTPException(404,_clean_404(e))
     except ValueError as e: raise HTTPException(400, str(e))
 
 @app.get("/admin/suggestions")
@@ -1353,7 +1358,7 @@ def suggestion_list(request: Request, status: str = ""):
 def suggestion_review(suggestion_id: str, req: SuggestionReviewRequest, request: Request):
     _require_admin(request)
     try: return dail.world_agents.review_suggestion(suggestion_id, req.status, req.note)
-    except KeyError as e: raise HTTPException(404,str(e))
+    except KeyError as e: raise HTTPException(404,_clean_404(e))
     except ValueError as e: raise HTTPException(400,str(e))
 
 
@@ -1366,12 +1371,17 @@ def suggestion_review(suggestion_id: str, req: SuggestionReviewRequest, request:
 def bounty_create(req: BountyCreateRequest, request: Request):
     _own(request, req.agent_id)
     try: return dail.world_agents.post_bounty(req.agent_id, req.title, req.description, req.reward, req.private_submission, req.expires_in_days, req.claim_window_hours, req.work_window_hours)
-    except KeyError as e: raise HTTPException(404,str(e))
+    except KeyError as e: raise HTTPException(404,_clean_404(e))
     except (ValueError, LedgerError) as e: raise HTTPException(400,str(e))
     except PermissionError as e: raise HTTPException(403,str(e))
 
+_BOUNTY_STATUSES = ("open", "claimed", "submitted", "completed", "cancelled", "expired", "paused", "voided")
+
 @app.get("/world/bounties")
 def bounty_list(status: str = "", summary: bool = False, poster: str = "", q: str = "", limit: int = 0, hunter: str = ""):
+    # bnty_0117: a typo'd status silently returned an empty board. Fail loudly.
+    if status and status not in _BOUNTY_STATUSES:
+        raise HTTPException(422, f"unknown status '{status}'; allowed: {', '.join(_BOUNTY_STATUSES)}")
     return dail.world_agents.list_bounties(status, summary, poster, q, limit, hunter)
 
 @app.patch("/world/bounties/{bounty_id}")
@@ -1379,7 +1389,7 @@ def bounty_edit(bounty_id: str, req: BountyEditRequest, request: Request):
     """Poster-only edit of an open bounty's title/description."""
     _own(request, req.agent_id)
     try: return dail.world_agents.edit_bounty(req.agent_id, bounty_id, req.title, req.description)
-    except KeyError as e: raise HTTPException(404,str(e))
+    except KeyError as e: raise HTTPException(404,_clean_404(e))
     except PermissionError as e: raise HTTPException(403,str(e))
     except ValueError as e: raise HTTPException(400,str(e))
 
@@ -1388,7 +1398,7 @@ def bounty_release(bounty_id: str, req: BountyActionRequest, request: Request):
     """Hunter withdraws their own unreviewed claim; the bounty reopens."""
     _own(request, req.agent_id)
     try: return dail.world_agents.release_claim(req.agent_id, bounty_id)
-    except KeyError as e: raise HTTPException(404,str(e))
+    except KeyError as e: raise HTTPException(404,_clean_404(e))
     except PermissionError as e: raise HTTPException(403,str(e))
     except ValueError as e: raise HTTPException(400,str(e))
 
@@ -1410,14 +1420,14 @@ def bounty_submission(bounty_id: str, agent_id: str, request: Request):
     public listing redacts it; only the poster and hunter can read it here."""
     _own(request, agent_id)
     try: return dail.world_agents.bounty_submission_for(agent_id, bounty_id)
-    except KeyError as e: raise HTTPException(404,str(e))
+    except KeyError as e: raise HTTPException(404,_clean_404(e))
     except PermissionError as e: raise HTTPException(403,str(e))
 
 @app.post("/world/bounties/{bounty_id}/claim")
 def bounty_claim(bounty_id: str, req: BountyClaimRequest, request: Request):
     _own(request, req.agent_id)
     try: return dail.world_agents.claim_bounty(req.agent_id, bounty_id, req.submission)
-    except KeyError as e: raise HTTPException(404,str(e))
+    except KeyError as e: raise HTTPException(404,_clean_404(e))
     except ValueError as e:
         # Lost a claim race (or bounty already taken): 409, not 400.
         if "bounty not open" in str(e): raise HTTPException(409, str(e))
@@ -1429,8 +1439,9 @@ def bounty_submit(bounty_id: str, req: BountySubmitRequest, request: Request):
     """Hunter delivers work on a reserved claim. Starts the 72h review clock."""
     _own(request, req.agent_id)
     try: return dail.world_agents.submit_bounty(req.agent_id, bounty_id, req.submission)
-    except KeyError as e: raise HTTPException(404,str(e))
+    except KeyError as e: raise HTTPException(404,_clean_404(e))
     except PermissionError as e: raise HTTPException(403,str(e))
+    except InvalidSubmissionError as e: raise HTTPException(422,str(e))
     except (ValueError, LedgerError) as e: raise HTTPException(400,str(e))
 
 @app.post("/world/bounties/{bounty_id}/raise")
@@ -1438,7 +1449,7 @@ def bounty_raise(bounty_id: str, req: BountyRaiseRequest, request: Request):
     """Poster tops up the reward on an open bounty. Never touches any clock."""
     _own(request, req.agent_id)
     try: return dail.world_agents.raise_bounty(req.agent_id, bounty_id, req.amount)
-    except KeyError as e: raise HTTPException(404,str(e))
+    except KeyError as e: raise HTTPException(404,_clean_404(e))
     except PermissionError as e: raise HTTPException(403,str(e))
     except (ValueError, LedgerError) as e: raise HTTPException(400,str(e))
 
@@ -1447,7 +1458,7 @@ def bounty_request_extension(bounty_id: str, req: BountyExtensionRequest, reques
     """Hunter asks for more work time. Lapse timers suspend while pending."""
     _own(request, req.agent_id)
     try: return dail.world_agents.request_extension(req.agent_id, bounty_id, req.reason, req.extra_hours)
-    except KeyError as e: raise HTTPException(404,str(e))
+    except KeyError as e: raise HTTPException(404,_clean_404(e))
     except PermissionError as e: raise HTTPException(403,str(e))
     except (ValueError, LedgerError) as e: raise HTTPException(400,str(e))
 
@@ -1456,7 +1467,7 @@ def bounty_extension_approve(bounty_id: str, req: BountyActionRequest, request: 
     """Poster approves a pending extension: work_deadline += extra_hours."""
     _own(request, req.agent_id)
     try: return dail.world_agents.review_extension(req.agent_id, bounty_id, True)
-    except KeyError as e: raise HTTPException(404,str(e))
+    except KeyError as e: raise HTTPException(404,_clean_404(e))
     except PermissionError as e: raise HTTPException(403,str(e))
     except (ValueError, LedgerError) as e: raise HTTPException(400,str(e))
 
@@ -1465,7 +1476,7 @@ def bounty_extension_deny(bounty_id: str, req: BountyActionRequest, request: Req
     """Poster denies a pending extension: lapse timers resume."""
     _own(request, req.agent_id)
     try: return dail.world_agents.review_extension(req.agent_id, bounty_id, False)
-    except KeyError as e: raise HTTPException(404,str(e))
+    except KeyError as e: raise HTTPException(404,_clean_404(e))
     except PermissionError as e: raise HTTPException(403,str(e))
     except (ValueError, LedgerError) as e: raise HTTPException(400,str(e))
 
@@ -1474,7 +1485,7 @@ def bounty_withdraw(bounty_id: str, req: BountyActionRequest, request: Request):
     """Hunter pulls back a submission the poster never reviewed in 72h."""
     _own(request, req.agent_id)
     try: return dail.world_agents.withdraw_submission(req.agent_id, bounty_id)
-    except KeyError as e: raise HTTPException(404,str(e))
+    except KeyError as e: raise HTTPException(404,_clean_404(e))
     except PermissionError as e: raise HTTPException(403,str(e))
     except (ValueError, LedgerError) as e: raise HTTPException(400,str(e))
 
@@ -1483,7 +1494,7 @@ def bounty_relist(bounty_id: str, req: BountyActionRequest, request: Request):
     """Poster re-opens a paused bounty. Keeps the original listing clock."""
     _own(request, req.agent_id)
     try: return dail.world_agents.relist_bounty(req.agent_id, bounty_id)
-    except KeyError as e: raise HTTPException(404,str(e))
+    except KeyError as e: raise HTTPException(404,_clean_404(e))
     except PermissionError as e: raise HTTPException(403,str(e))
     except (ValueError, LedgerError) as e: raise HTTPException(400,str(e))
 
@@ -1491,7 +1502,7 @@ def bounty_relist(bounty_id: str, req: BountyActionRequest, request: Request):
 def bounty_accept(bounty_id: str, req: BountyActionRequest, request: Request):
     _own(request, req.agent_id)
     try: return dail.world_agents.accept_bounty(req.agent_id, bounty_id)
-    except KeyError as e: raise HTTPException(404,str(e))
+    except KeyError as e: raise HTTPException(404,_clean_404(e))
     except PermissionError as e: raise HTTPException(403,str(e))
     except (ValueError, LedgerError) as e: raise HTTPException(400,str(e))
 
@@ -1499,7 +1510,7 @@ def bounty_accept(bounty_id: str, req: BountyActionRequest, request: Request):
 def bounty_reject(bounty_id: str, req: BountyActionRequest, request: Request):
     _own(request, req.agent_id)
     try: return dail.world_agents.reject_bounty(req.agent_id, bounty_id, req.reason)
-    except KeyError as e: raise HTTPException(404,str(e))
+    except KeyError as e: raise HTTPException(404,_clean_404(e))
     except PermissionError as e: raise HTTPException(403,str(e))
     except (ValueError, LedgerError) as e: raise HTTPException(400,str(e))
 
@@ -1507,7 +1518,7 @@ def bounty_reject(bounty_id: str, req: BountyActionRequest, request: Request):
 def bounty_cancel(bounty_id: str, req: BountyActionRequest, request: Request):
     _own(request, req.agent_id)
     try: return dail.world_agents.cancel_bounty(req.agent_id, bounty_id)
-    except KeyError as e: raise HTTPException(404,str(e))
+    except KeyError as e: raise HTTPException(404,_clean_404(e))
     except PermissionError as e: raise HTTPException(403,str(e))
     except (ValueError, LedgerError) as e: raise HTTPException(400,str(e))
 
@@ -1555,18 +1566,18 @@ def admin_referral_release(req: ReferralReleaseRequest, request: Request):
 def world_profile(req: AgentProfileRequest, request: Request):
     _own(request, req.agent_id)
     try: return dail.world_agents.update_profile(req.agent_id, req.bio, req.capabilities)
-    except KeyError as e: raise HTTPException(404, str(e))
+    except KeyError as e: raise HTTPException(404,_clean_404(e))
 
 @app.get("/world/profile/{agent_id}")
 def world_profile_get(agent_id: str):
     try: return dail.world_agents.profile(agent_id)
-    except KeyError as e: raise HTTPException(404, str(e))
+    except KeyError as e: raise HTTPException(404,_clean_404(e))
 
 @app.post("/world/services")
 def world_service(req: ServiceCreateRequest, request: Request):
     _own(request, req.provider_id)
     try: return dail.world_agents.create_service(req.provider_id, req.name, req.description, req.price, req.trial_price_dail, req.delivery_hours)
-    except KeyError as e: raise HTTPException(404, str(e))
+    except KeyError as e: raise HTTPException(404,_clean_404(e))
     except (ValueError, LedgerError) as e: raise HTTPException(400, str(e))
 
 @app.patch("/world/services/{service_id}")
@@ -1577,7 +1588,7 @@ def world_service_edit(service_id: str, req: ServiceEditRequest, request: Reques
     try: return dail.world_agents.edit_service(
         req.provider_id, service_id, req.name, req.description,
         req.price, req.delivery_hours, req.trial_price_dail, req.active)
-    except KeyError as e: raise HTTPException(404, str(e))
+    except KeyError as e: raise HTTPException(404,_clean_404(e))
     except PermissionError as e: raise HTTPException(403, str(e))
     except (ValueError, LedgerError) as e: raise HTTPException(400, str(e))
 
@@ -1589,7 +1600,7 @@ def world_services():
 def world_service_purchase(req: ServicePurchaseRequest, request: Request):
     _own(request, req.buyer_id)
     try: return dail.world_agents.purchase_service(req.buyer_id, req.service_id, req.idempotency_key)
-    except KeyError as e: raise HTTPException(404, str(e))
+    except KeyError as e: raise HTTPException(404,_clean_404(e))
     except PermissionError as e: raise HTTPException(403, str(e))
     except LedgerError as e: raise HTTPException(400, str(e))
     except ValueError as e: raise HTTPException(400, str(e))
@@ -1600,7 +1611,7 @@ def world_service_trial(service_id: str, req: ServiceTrialRequest, request: Requ
     # agent per service; the provider sets the trial price (0 = free).
     _own(request, req.agent_id)
     try: return dail.world_agents.purchase_trial(req.agent_id, service_id)
-    except KeyError as e: raise HTTPException(404, str(e))
+    except KeyError as e: raise HTTPException(404,_clean_404(e))
     except (PermissionError, ValueError) as e: raise HTTPException(400, str(e))
     except LedgerError as e: raise HTTPException(400, str(e))
 
@@ -1610,7 +1621,7 @@ def world_bulletin_post(req: BulletinRequest, request: Request):
     Costs 5 DAIL (spam control), visible for 7 days."""
     _own(request, req.agent_id)
     try: return dail.world_agents.post_bulletin(req.agent_id, req.title, req.body, req.service_id)
-    except KeyError as e: raise HTTPException(404, str(e))
+    except KeyError as e: raise HTTPException(404,_clean_404(e))
     except PermissionError as e: raise HTTPException(403, str(e))
     except (ValueError, LedgerError) as e: raise HTTPException(400, str(e))
 
@@ -1622,7 +1633,7 @@ def world_bulletins():
 def world_discover(req: AgentDiscoverRequest, request: Request):
     _own(request, req.agent_id)
     try: return dail.world_agents.discover(req.agent_id, req.query)
-    except KeyError as e: raise HTTPException(404, str(e))
+    except KeyError as e: raise HTTPException(404,_clean_404(e))
 
 @app.post("/world/trades")
 def world_trade(req: TradeRequest, request: Request):
@@ -1632,7 +1643,7 @@ def world_trade(req: TradeRequest, request: Request):
     if not request.state.is_admin and request.state.caller != req.buyer_id:
         raise HTTPException(403, "only_the_buyer_can_initiate_a_trade")
     try: return dail.world_agents.trade(req.seller_id, req.buyer_id, req.amount, req.item, req.idempotency_key)
-    except KeyError as e: raise HTTPException(404, str(e))
+    except KeyError as e: raise HTTPException(404,_clean_404(e))
     except ValueError as e: raise HTTPException(400, str(e))
     except LedgerError as e: raise HTTPException(400, str(e))
     except PermissionError as e: raise HTTPException(403, str(e))
@@ -1656,7 +1667,7 @@ def admin_treasury_loan_disburse(req: TreasuryLoanDisburseRequest, request: Requ
         return dail.world_agents.treasury_loan_disburse(
             req.agent_id, req.amount, req.memo, req.idempotency_key)
     except KeyError as e:
-        raise HTTPException(404, str(e))
+        raise HTTPException(404,_clean_404(e))
     except ValueError as e:
         raise HTTPException(400, str(e))
     except LedgerError as e:
@@ -1693,7 +1704,7 @@ def vault_disburse(req: VaultDisburseRequest, request: Request):
                                  req.agent_id, req.amount, req.purpose, req.idempotency_key)
         return {"tx": tx.id, "vault": dail.vault_status()}
     except KeyError as e:
-        raise HTTPException(404, str(e))
+        raise HTTPException(404,_clean_404(e))
     except LedgerError as e:
         raise HTTPException(400, str(e))
 
@@ -1734,7 +1745,7 @@ def admin_petty_pay(req: PettyPayRequest, request: Request):
                 "task": tx.memo,
                 "petty_balance": dail.petty_status()["balance"]}
     except KeyError as e:
-        raise HTTPException(404, str(e))
+        raise HTTPException(404,_clean_404(e))
     except LedgerError as e:
         raise HTTPException(400, str(e))
 
@@ -1748,7 +1759,7 @@ def admin_petty_commission_open(req: PettyCommissionRequest, request: Request):
         return {"commission": rec,
                 "petty_available": dail.petty_status()["available_balance"]}
     except KeyError as e:
-        raise HTTPException(404, str(e))
+        raise HTTPException(404,_clean_404(e))
     except LedgerError as e:
         raise HTTPException(400, str(e))
 
@@ -1762,7 +1773,7 @@ def admin_petty_commission_complete(cid: str, request: Request):
         return {"commission": rec,
                 "petty_available": dail.petty_status()["available_balance"]}
     except KeyError as e:
-        raise HTTPException(404, str(e))
+        raise HTTPException(404,_clean_404(e))
     except LedgerError as e:
         raise HTTPException(400, str(e))
 
@@ -1776,7 +1787,7 @@ def admin_petty_commission_cancel(cid: str, request: Request):
         return {"commission": rec,
                 "petty_available": dail.petty_status()["available_balance"]}
     except KeyError as e:
-        raise HTTPException(404, str(e))
+        raise HTTPException(404,_clean_404(e))
     except LedgerError as e:
         raise HTTPException(400, str(e))
 
@@ -1817,7 +1828,7 @@ def admin_treasury_loan_repay(loan_id: str, req: TreasuryLoanRepayRequest,
         return dail.world_agents.treasury_loan_repay(
             loan_id, req.amount, req.idempotency_key)
     except KeyError as e:
-        raise HTTPException(404, str(e))
+        raise HTTPException(404,_clean_404(e))
     except ValueError as e:
         raise HTTPException(400, str(e))
     except LedgerError as e:
@@ -1998,7 +2009,7 @@ async def a2a_rpc(request: Request):
 def order_deliver(order_id: str, req: OrderDeliverRequest, request: Request):
     _own(request, req.agent_id)
     try: return dail.world_agents.deliver_order(req.agent_id, order_id, req.delivery)
-    except KeyError as e: raise HTTPException(404, str(e))
+    except KeyError as e: raise HTTPException(404,_clean_404(e))
     except PermissionError as e: raise HTTPException(403, str(e))
     except ValueError as e: raise HTTPException(400, str(e))
 
@@ -2006,7 +2017,7 @@ def order_deliver(order_id: str, req: OrderDeliverRequest, request: Request):
 def order_confirm(order_id: str, req: OrderConfirmRequest, request: Request):
     _own(request, req.agent_id)
     try: return dail.world_agents.confirm_order(req.agent_id, order_id, req.rating)
-    except KeyError as e: raise HTTPException(404, str(e))
+    except KeyError as e: raise HTTPException(404,_clean_404(e))
     except PermissionError as e: raise HTTPException(403, str(e))
     except (ValueError, LedgerError) as e: raise HTTPException(400, str(e))
 
@@ -2014,7 +2025,7 @@ def order_confirm(order_id: str, req: OrderConfirmRequest, request: Request):
 def order_dispute(order_id: str, req: OrderDisputeRequest, request: Request):
     _own(request, req.agent_id)
     try: return dail.world_agents.dispute_order(req.agent_id, order_id, req.reason)
-    except KeyError as e: raise HTTPException(404, str(e))
+    except KeyError as e: raise HTTPException(404,_clean_404(e))
     except PermissionError as e: raise HTTPException(403, str(e))
     except ValueError as e: raise HTTPException(400, str(e))
 
@@ -2022,7 +2033,7 @@ def order_dispute(order_id: str, req: OrderDisputeRequest, request: Request):
 def order_cancel(order_id: str, req: OrderConfirmRequest, request: Request):
     _own(request, req.agent_id)
     try: return dail.world_agents.cancel_order(req.agent_id, order_id)
-    except KeyError as e: raise HTTPException(404, str(e))
+    except KeyError as e: raise HTTPException(404,_clean_404(e))
     except PermissionError as e: raise HTTPException(403, str(e))
     except (ValueError, LedgerError) as e: raise HTTPException(400, str(e))
 
@@ -2031,7 +2042,7 @@ def order_resolve(order_id: str, req: OrderResolveRequest, request: Request):
     # Admin-only (also enforced by the auth gate). Admin key in header only.
     _require_admin(request)
     try: return dail.world_agents.resolve_order(order_id, req.winner)
-    except KeyError as e: raise HTTPException(404, str(e))
+    except KeyError as e: raise HTTPException(404,_clean_404(e))
     except (ValueError, LedgerError) as e: raise HTTPException(400, str(e))
 
 @app.get("/world/orders")
@@ -2074,7 +2085,7 @@ def customer_redeem(req: dict):
         return dail.customers.redeem_invite(
             req.get("code", ""), req.get("name", ""), req.get("email", ""))
     except KeyError as e:
-        raise HTTPException(404, str(e))
+        raise HTTPException(404,_clean_404(e))
     except ValueError as e:
         raise HTTPException(400, str(e))
 
@@ -2203,7 +2214,7 @@ def customer_checkout(req: dict, request: Request):
             cancel_url=f"{base}/dashboard?topup=cancelled",
             idempotency_key=(req.get("idempotency_key") or None))
     except KeyError as e:
-        raise HTTPException(404, str(e))
+        raise HTTPException(404,_clean_404(e))
     except ValueError as e:
         raise HTTPException(400, str(e))
     except Exception as e:
@@ -2253,7 +2264,7 @@ def webhook_list(agent_id: str, request: Request):
 def webhook_delete(agent_id: str, hook_id: str, request: Request):
     _own(request, agent_id)
     try: return dail.world_agents.delete_webhook(agent_id, hook_id)
-    except KeyError as e: raise HTTPException(404, str(e))
+    except KeyError as e: raise HTTPException(404,_clean_404(e))
 
 @app.post("/world/key/rotate")
 def key_rotate(req: BountyActionRequest, request: Request):
@@ -2357,19 +2368,19 @@ def runtime_state():
 def runtime_register(req: RuntimeGoalRequest, request: Request):
     _own(request, req.agent_id)
     try: return agent_runtime.register(req.agent_id, req.goal)
-    except KeyError as e: raise HTTPException(404, str(e))
+    except KeyError as e: raise HTTPException(404,_clean_404(e))
 
 @app.get("/runtime/{agent_id}/observe")
 def runtime_observe(agent_id: str, request: Request):
     _own(request, agent_id)
     try: return agent_runtime.observe(agent_id)
-    except KeyError as e: raise HTTPException(404, str(e))
+    except KeyError as e: raise HTTPException(404,_clean_404(e))
 
 @app.post("/runtime/action")
 def runtime_action(req: RuntimeActionRequest, request: Request):
     _own(request, req.agent_id)
     try: return agent_runtime.act(req.agent_id, req.action, req.payload)
-    except KeyError as e: raise HTTPException(404, str(e))
+    except KeyError as e: raise HTTPException(404,_clean_404(e))
     except PermissionError as e: raise HTTPException(403, str(e))
     except (ValueError, LedgerError) as e: raise HTTPException(400, str(e))
 
@@ -2377,20 +2388,20 @@ def runtime_action(req: RuntimeActionRequest, request: Request):
 def runtime_memory(req: RuntimeMemoryRequest, request: Request):
     _own(request, req.agent_id)
     try: return agent_runtime.remember(req.agent_id, req.key, req.value)
-    except KeyError as e: raise HTTPException(404, str(e))
+    except KeyError as e: raise HTTPException(404,_clean_404(e))
     except ValueError as e: raise HTTPException(400, str(e))
 
 @app.post("/runtime/pause/{agent_id}")
 def runtime_pause(agent_id: str, request: Request):
     _own(request, agent_id)
     try: return agent_runtime.pause(agent_id)
-    except KeyError as e: raise HTTPException(404, str(e))
+    except KeyError as e: raise HTTPException(404,_clean_404(e))
 
 @app.post("/runtime/resume/{agent_id}")
 def runtime_resume(agent_id: str, request: Request):
     _own(request, agent_id)
     try: return agent_runtime.resume(agent_id)
-    except KeyError as e: raise HTTPException(404, str(e))
+    except KeyError as e: raise HTTPException(404,_clean_404(e))
 
 @app.post("/runtime/tick")
 def runtime_tick():
@@ -2402,13 +2413,13 @@ def runtime_tick():
 def runtime_decide(req: RuntimeGoalRequest, request: Request):
     _own(request, req.agent_id)
     try: return agent_runtime.decide(req.agent_id)
-    except KeyError as e: raise HTTPException(404, str(e))
+    except KeyError as e: raise HTTPException(404,_clean_404(e))
 
 @app.post("/runtime/decide-and-act")
 def runtime_decide_and_act(req: RuntimeGoalRequest, request: Request):
     _own(request, req.agent_id)
     try: return agent_runtime.decide_and_act(req.agent_id)
-    except KeyError as e: raise HTTPException(404, str(e))
+    except KeyError as e: raise HTTPException(404,_clean_404(e))
     except PermissionError as e: raise HTTPException(403, str(e))
     except (ValueError, LedgerError) as e: raise HTTPException(400, str(e))
 
@@ -2420,19 +2431,19 @@ def runtime_strategies():
 def runtime_strategy_assign(req: RuntimeStrategyRequest, request: Request):
     _own(request, req.agent_id)
     try: return agent_runtime.strategies.assign(req.agent_id, req.strategy)
-    except KeyError as e: raise HTTPException(404, str(e))
+    except KeyError as e: raise HTTPException(404,_clean_404(e))
 
 @app.get("/runtime/strategies/{agent_id}")
 def runtime_strategy_get(agent_id: str, request: Request):
     _own(request, agent_id)
     try: return agent_runtime.strategies.get(agent_id)
-    except KeyError as e: raise HTTPException(404, str(e))
+    except KeyError as e: raise HTTPException(404,_clean_404(e))
 
 @app.post("/runtime/schedule")
 def runtime_schedule(req: RuntimeScheduleRequest, request: Request):
     _own(request, req.agent_id)
     try: return agent_runtime.scheduler.schedule(req.agent_id, req.action, req.payload, req.delay_ticks)
-    except KeyError as e: raise HTTPException(404, str(e))
+    except KeyError as e: raise HTTPException(404,_clean_404(e))
     except PermissionError as e: raise HTTPException(403, str(e))
     except ValueError as e: raise HTTPException(400, str(e))
 
@@ -2462,20 +2473,20 @@ def runtime_message(req: RuntimeMessageRequest, request: Request):
             raise HTTPException(403, "not_your_agent")
         sender_id = request.state.caller
     try: return agent_runtime.protocol.send(sender_id, req.recipient_id, req.message)
-    except KeyError as e: raise HTTPException(404, str(e))
+    except KeyError as e: raise HTTPException(404,_clean_404(e))
     except ValueError as e: raise HTTPException(400, str(e))
 
 @app.get("/runtime/messages/{agent_id}")
 def runtime_messages(agent_id: str, request: Request):
     _own(request, agent_id)
     try: return agent_runtime.protocol.read(agent_id)
-    except KeyError as e: raise HTTPException(404, str(e))
+    except KeyError as e: raise HTTPException(404,_clean_404(e))
 
 @app.post("/runtime/work/execute")
 def runtime_work_execute(req: RuntimeWorkExecuteRequest, request: Request):
     _own(request, req.worker_id)
     try: return agent_runtime.work.execute(req.job_id, req.worker_id, req.proof)
-    except KeyError as e: raise HTTPException(404, str(e))
+    except KeyError as e: raise HTTPException(404,_clean_404(e))
     except PermissionError as e: raise HTTPException(403, str(e))
     except (ValueError, LedgerError) as e: raise HTTPException(400, str(e))
 

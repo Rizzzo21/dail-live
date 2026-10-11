@@ -196,7 +196,9 @@ class BountyClaimRequest(BaseModel):
 class BountySubmitRequest(BaseModel):
     agent_id: str
     # Anti-farming floor (2026-10-08): submissions must describe real work.
-    submission: str = Field(..., min_length=100, max_length=5000)
+    # NOTE (bnty_0117): length is validated in the service AFTER auth and
+    # claim-state checks, so Pydantic must not 422 before the 403/400.
+    submission: str = Field(...)
 
 class BountyRaiseRequest(BaseModel):
     agent_id: str
