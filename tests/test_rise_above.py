@@ -42,6 +42,14 @@ def _complete_bounty(poster_id, hunter_id, reward=20, title="Rise-above job"):
     return b
 
 
+def _burn_fee_waivers(poster_id, hunter_id):
+    # Tommy 2026-10-11: a non-house poster's first 3 accepted bounties are
+    # fee-free. Burn them so the tests below exercise fee-paying accepts.
+    for i in range(3):
+        _complete_bounty(poster_id, hunter_id, reward=20,
+                         title=f"Waiver burner {poster_id} {i}")
+
+
 # ---------------------------------------------------------------------------
 # 1. Signed portable receipts
 # ---------------------------------------------------------------------------
@@ -170,6 +178,7 @@ def _referral_setup():
 
 def test_referral_cut_enabled_credits_referrer():
     _referral_setup()
+    _burn_fee_waivers("cut_poster1", "cut_hunter1")
     old = svc_mod.REFERRAL_CUT_ENABLED
     svc_mod.REFERRAL_CUT_ENABLED = True
     try:
@@ -177,15 +186,16 @@ def test_referral_cut_enabled_credits_referrer():
         r0 = dail.ledger.balances["cut_referrer1"]
         h0 = dail.ledger.balances["cut_hunter1"]
         _complete_bounty("cut_poster1", "cut_hunter1", reward=100)
-        # fee = 10, cut = 10% of fee = 1; plus the flat 10-DAIL referral
-        # reward (first bounty counts as first real earning).
-        assert dail.ledger.balances["cut_referrer1"] == r0 + 11
+        # fee = 10, cut = 10% of fee = 1. (The flat 10-DAIL referral reward
+        # fired during the waiver burn above, not here.)
+        assert dail.ledger.balances["cut_referrer1"] == r0 + 1
         assert dail.ledger.balances["dail:treasury"] == t0 + 9
         assert dail.ledger.balances["cut_hunter1"] == h0 + 90
-        # Only the vault-funded flat 10 is new DAIL: 100 reward + 10 reward.
+        # Only the vault-funded flat 10 was new DAIL during the burn;
+        # this bounty conserves: 100 reward in, 100 out.
         assert (dail.ledger.balances["cut_referrer1"] - r0) + \
                (dail.ledger.balances["dail:treasury"] - t0) + \
-               (dail.ledger.balances["cut_hunter1"] - h0) == 110
+               (dail.ledger.balances["cut_hunter1"] - h0) == 100
     finally:
         svc_mod.REFERRAL_CUT_ENABLED = old
 
@@ -196,11 +206,13 @@ def test_referral_cut_disabled_by_default():
     _register("cut_poster2", balance=1000)
     dail.world_agents.register_referral("cut_hunter2", "cut_referrer2")
     assert svc_mod.REFERRAL_CUT_ENABLED is False  # default off
+    _burn_fee_waivers("cut_poster2", "cut_hunter2")
     r0 = dail.ledger.balances["cut_referrer2"]
     t0 = dail.ledger.balances["dail:treasury"]
     _complete_bounty("cut_poster2", "cut_hunter2", reward=100)
-    # No fee cut (flag off), but the flat 10-DAIL referral reward fires.
-    assert dail.ledger.balances["cut_referrer2"] == r0 + 10
+    # No fee cut (flag off); the flat 10-DAIL referral reward fired during
+    # the waiver burn above, so nothing more lands here.
+    assert dail.ledger.balances["cut_referrer2"] == r0
     assert dail.ledger.balances["dail:treasury"] == t0 + 10
 
 
@@ -209,6 +221,7 @@ def test_referral_cut_stops_after_three_bounties():
     _register("cut_hunter3")
     _register("cut_poster3", balance=1000)
     dail.world_agents.register_referral("cut_hunter3", "cut_referrer3")
+    _burn_fee_waivers("cut_poster3", "cut_hunter3")
     old = svc_mod.REFERRAL_CUT_ENABLED
     svc_mod.REFERRAL_CUT_ENABLED = True
     try:
@@ -217,8 +230,8 @@ def test_referral_cut_stops_after_three_bounties():
             _complete_bounty("cut_poster3", "cut_hunter3", reward=100,
                              title=f"Cut job {i}")
         # 3 cuts of 1 DAIL; the 4th bounty pays no cut. The flat 10-DAIL
-        # referral reward pays once, on the first bounty.
-        assert dail.ledger.balances["cut_referrer3"] == r0 + 13
+        # referral reward fired during the waiver burn above, not here.
+        assert dail.ledger.balances["cut_referrer3"] == r0 + 3
     finally:
         svc_mod.REFERRAL_CUT_ENABLED = old
 

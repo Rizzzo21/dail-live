@@ -106,6 +106,21 @@ FULL_GRANT_SLOTS = 100
 REDUCED_GRANT = 10
 # Staff allowed to disburse from the vault.
 VAULT_STAFF = {"dail_host", "dail_manager"}
+# Newcomer reserve (Tommy, 2026-10-11): a bounty that repeats a completed
+# one (same poster, same series) reserves its first NEWCOMER_RESERVE_HOURS
+# for hunters with zero completed bounties.
+NEWCOMER_RESERVE_HOURS = 24
+# Fee waiver (Tommy, 2026-10-11): a non-house poster's first
+# FEE_WAIVER_FIRST_N accepted bounties pay no house fee.
+FEE_WAIVER_FIRST_N = 3
+_SERIES_SUFFIX = re.compile(r"\s*(round|part|phase|#)\s*\d+\s*$", re.IGNORECASE)
+
+def _series_key(title):
+    """Normalize a bounty title to its series: lowercase, collapsed
+    whitespace, trailing round/part markers stripped. 'Bug hunt round 5'
+    and 'Bug hunt round 6' share a series."""
+    t = " ".join((title or "").lower().split())
+    return _SERIES_SUFFIX.sub("", t).strip()
 def vault_max_supply():
     try:
         return max(1, int(os.getenv("DAIL_VAULT_MAX_SUPPLY", "10000")))
@@ -226,6 +241,9 @@ class Dail:
         # Migration 2026-10-08 (bounty lifecycle v2): grandfather every
         # pre-v2 bounty -- see _migrate_bounty_lifecycle_v2.
         self.world_agents._migrate_bounty_lifecycle_v2()
+        # Migration 2026-10-11 (newcomer reserve): backtrack open bounties
+        # that repeat a completed one -- see _migrate_newcomer_reserve.
+        self.world_agents._migrate_newcomer_reserve()
         self.world_agents.service_trials = kv.get("service_trials", {})
         self.world_agents.bounty_requests = kv.get("bounty_requests", {})
         self.world_agents.bounty_request_seq = kv.get("bounty_request_seq", 0)
@@ -2657,6 +2675,25 @@ class AgentWorld:
     REVIEW_WINDOW = timedelta(hours=72)   # poster review; then hunter may withdraw
     MAX_EXTENSION_HOURS = 72             # cumulative extra work time per bounty
 
+    def _find_completed_series_match(self, poster_id, series_key, exclude=None):
+        """Id of a COMPLETED bounty by the same poster in the same series,
+        or None. Drives the newcomer reserve (Tommy, 2026-10-11)."""
+        if not series_key:
+            return None
+        for x in self.bounties.values():
+            if x["id"] == exclude:
+                continue
+            if (x.get("poster_id") == poster_id
+                    and x.get("status") == "completed"
+                    and _series_key(x.get("title", "")) == series_key):
+                return x["id"]
+        return None
+
+    def _hunter_completions(self, hunter_id):
+        return sum(1 for x in self.bounties.values()
+                   if x.get("hunter_id") == hunter_id
+                   and x.get("status") == "completed")
+
     def post_bounty(self, agent_id, title, description, reward, private_submission=False, expires_in_days=DEFAULT_BOUNTY_EXPIRY_DAYS, claim_window_hours=None, work_window_hours=None):
         # Lifecycle v2 (2026-10-08): expires_in_days / claim_window_hours are
         # deprecated -- accepted, stored for record, but they no longer drive
@@ -2691,6 +2728,12 @@ class AgentWorld:
             self.bounty_seq+=1
             bid=f"bnty_{self.bounty_seq:04d}"
         now=datetime.now(timezone.utc).isoformat()
+        # Newcomer reserve (Tommy, 2026-10-11): repeating a completed bounty
+        # (same poster, same series) reserves the first 24h of the listing
+        # for hunters with zero completions.
+        repeat_of = self._find_completed_series_match(agent_id, _series_key(title))
+        reserve_until = ((datetime.now(timezone.utc) + timedelta(hours=NEWCOMER_RESERVE_HOURS)).isoformat()
+                         if repeat_of else None)
         # Escrow first: no bounty without a funded reward.
         self.ledger.transfer(agent_id, f"escrow:{bid}", reward,
                              kind="escrow_hold", idem=f"bounty-hold:{bid}")
@@ -2713,9 +2756,16 @@ class AgentWorld:
             "raise_seq":0,
             "status":"open","hunter_id":None,"submission":None,
             "rejected_hunters":[],
-            "created_at":now,"claimed_at":None,"completed_at":None}
+            "created_at":now,"claimed_at":None,"completed_at":None,
+            # Newcomer reserve (Tommy, 2026-10-11).
+            "newcomer_reserve_until":reserve_until,
+            "newcomer_reserve_of":repeat_of}
         self._save_kv()
         self.audit.append("bounty.posted", {"bounty_id":bid,"agent_id":agent_id,"reward":reward})
+        if repeat_of:
+            self.audit.append("bounty.newcomer_reserved",
+                              {"bounty_id":bid,"repeat_of":repeat_of,
+                               "reserve_until":reserve_until})
         self._notify_bounty_matches(self.bounties[bid])
         return self.bounties[bid]
 
@@ -2757,6 +2807,29 @@ class AgentWorld:
                     # Work delivered under the old single status: it reads
                     # "submitted", never "claimed". Idempotent (flips once).
                     b["status"] = "submitted"
+
+    def _migrate_newcomer_reserve(self):
+        """One-time migration 2026-10-11 (newcomer reserve, Tommy): backtrack
+        open bounties that repeat a completed one (same poster, same series)
+        and put the 24h first-timer reserve on them. Idempotent: keyed on the
+        absence of newcomer_reserve_until, so later restarts never touch it."""
+        mig_now = datetime.now(timezone.utc)
+        for b in self.bounties.values():
+            if "newcomer_reserve_until" in b:
+                continue
+            if b.get("status") != "open":
+                b["newcomer_reserve_until"] = None
+                continue
+            repeat_of = self._find_completed_series_match(
+                b.get("poster_id"), _series_key(b.get("title", "")), exclude=b["id"])
+            if repeat_of:
+                b["newcomer_reserve_until"] = (mig_now + timedelta(hours=NEWCOMER_RESERVE_HOURS)).isoformat()
+                b["newcomer_reserve_of"] = repeat_of
+                self.audit.append("bounty.newcomer_reserved",
+                                  {"bounty_id": b["id"], "repeat_of": repeat_of,
+                                   "backtrack": True})
+            else:
+                b["newcomer_reserve_until"] = None
 
     def _notify_bounty_matches(self, bounty):
         """Re-engagement: when a bounty is posted, notify agents whose profile
@@ -2804,6 +2877,30 @@ class AgentWorld:
                     "type": "bounty_mention",
                     "bounty_id": bounty["id"],
                     "body": f"{bounty.get('poster_name', poster_id)} posted a bounty for you: {bounty['title']} ({bounty['reward']} DAIL)."})
+
+    def public_stats(self):
+        """Public marketplace KPI ticker data (Tommy, 2026-10-11). Real
+        numbers only, derived from the bounty record + ledger. No key."""
+        self.sweep_bounties()
+        bs = list(self.bounties.values())
+        by_status = {}
+        for b in bs:
+            s = b.get("status", "?")
+            by_status[s] = by_status.get(s, 0) + 1
+        completed = [b for b in bs if b.get("status") == "completed"]
+        house_done = sum(1 for b in completed if b.get("poster_id") in STAFF_AGENTS)
+        rewards = sorted(b.get("reward", 0) for b in completed)
+        return {
+            "bounties_total": len(bs),
+            "bounties_by_status": by_status,
+            "dail_paid": sum(b.get("reward", 0) for b in completed),
+            "distinct_hunters_paid": len({b.get("hunter_id") for b in completed if b.get("hunter_id")}),
+            "distinct_posters": len({b.get("poster_id") for b in bs if b.get("poster_id")}),
+            "house_share_completed": round(house_done / max(1, len(completed)), 3),
+            "non_house_completions": len(completed) - house_done,
+            "median_reward": rewards[len(rewards) // 2] if rewards else 0,
+            "fee_waivers_granted": sum(1 for b in completed if b.get("fee_waived")),
+        }
 
     def list_bounties(self, status="", summary=False, poster="", q="", limit=0, hunter=""):
         self.sweep_bounties()
@@ -3107,6 +3204,12 @@ class AgentWorld:
                 raise ValueError("poster declined your previous claim")
             if hunter_id in b.get("lapsed_hunters", []):
                 raise ValueError("your earlier claim on this bounty lapsed; it is snipable by others")
+            # Newcomer reserve (Tommy, 2026-10-11): a repeated bounty's first
+            # 24h belong to hunters with zero completions.
+            ru = b.get("newcomer_reserve_until")
+            if ru and datetime.now(timezone.utc) < datetime.fromisoformat(ru):
+                if self._hunter_completions(hunter_id) > 0:
+                    raise ValueError(f"reserved for first-time hunters until {ru}")
             now=datetime.now(timezone.utc)
             submission=(submission or "").strip()
             if submission and (len(submission) < 100 or len(submission) > 5000):
@@ -3305,7 +3408,20 @@ class AgentWorld:
         the 7-day poster review SLA lapsed (documented; the hunter earned it)."""
         bounty_id=b["id"]
         reward=b["reward"]; escrow=f"escrow:{bounty_id}"
-        fee=self._fee(reward); net=reward-fee
+        # Fee waiver (Tommy, 2026-10-11): a non-house poster's first 3
+        # accepted bounties pay no house fee. Counted from the bounty record
+        # (no counter to drift); each waiver is audit-logged and stamped on
+        # the bounty for the record.
+        poster_id=b["poster_id"]
+        fee_waived=False; waiver_no=0
+        if poster_id not in STAFF_AGENTS:
+            prior=sum(1 for x in self.bounties.values()
+                       if x.get("poster_id")==poster_id
+                       and x.get("status")=="completed"
+                       and x["id"]!=bounty_id)
+            if prior < FEE_WAIVER_FIRST_N:
+                fee_waived=True; waiver_no=prior+1
+        fee=0 if fee_waived else self._fee(reward); net=reward-fee
         hunter_id=b["hunter_id"]
         # Tiered referral cut: the referrer earns REFERRAL_FEE_CUT_PCT of the
         # accept fee, carved out of the treasury's share — never minted.
@@ -3336,7 +3452,12 @@ class AgentWorld:
         # Clear any prior settlement-failure flag: the escrow is now released,
         # so the admin reconciliation endpoint must not keep listing it.
         b.pop("settle_failed", None)
-        b["fee"]=fee; b["auto_accepted"]=auto
+        b["fee"]=fee; b["fee_waived"]=fee_waived; b["auto_accepted"]=auto
+        if fee_waived:
+            self.audit.append("bounty.fee_waived",
+                              {"bounty_id":bounty_id,"poster_id":poster_id,
+                               "waiver_number":waiver_no,
+                               "fee_saved":self._fee(reward)})
         self._notify(hunter_id,
             {"type":"bounty_accepted","bounty_id":bounty_id,
              "body":f"Bounty {bounty_id} {'auto-' if auto else ''}accepted: {net} DAIL released (fee {fee})."})

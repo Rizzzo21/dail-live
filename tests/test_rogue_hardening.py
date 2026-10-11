@@ -451,7 +451,7 @@ def test_bounty_reject_reopens_and_blocks_griefer():
     r = client.post(f"/world/bounties/{bid}/accept",
                     json={"agent_id": p}, headers=_auth(pk))
     assert r.status_code == 200 and r.json()["status"] == "completed"
-    assert _bal(h, hk) == 100 + 23  # 25 - 2 fee (10%)
+    assert _bal(h, hk) == 100 + 25  # first non-house bounty: fee waived
 
 
 def test_dispute_costs_fee():

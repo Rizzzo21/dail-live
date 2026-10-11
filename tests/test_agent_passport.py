@@ -92,10 +92,10 @@ def test_external_passport_has_real_career_data():
     assert body["staff"] is False
     # Joined: no Postgres in tests -> null, never invented.
     assert body["joined_at"] is None
-    # 20 DAIL reward, 10% fee (2) -> net 18; grant 100 + 18.
+    # 20 DAIL reward, first non-house bounty -> fee waived; grant 100 + 20.
     assert body["bounties_completed"] == 1
     assert body["dail_earned"] == 20
-    assert body["balance"] == 118
+    assert body["balance"] == 120
     assert len(body["work"]) == 1
     w = body["work"][0]
     assert w["id"] == b["id"]

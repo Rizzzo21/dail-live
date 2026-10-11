@@ -62,13 +62,15 @@ def test_bounty_full_lifecycle():
         "agent_id": hunter, "submission": "Completed the requested deliverable and verified it against the bounty requirements; summary of changes and test evidence included in the attached notes."}, headers=_auth(hunter))
     assert r.status_code == 200, r.text
     assert r.json()["status"] == "submitted"  # work delivered at claim time
-    # accept: hunter nets 45, treasury takes 5 (10%)
+    # accept: first non-house bounty -> fee waived (Tommy 2026-10-11):
+    # hunter nets the full 50, treasury takes 0
     r = client.post(f"/world/bounties/{b['id']}/accept",
                     json={"agent_id": poster}, headers=_auth(poster))
     assert r.status_code == 200, r.text
     assert r.json()["status"] == "completed"
-    assert _bal(hunter) == 145
-    assert _treasury() == t0 + 5
+    assert r.json()["fee_waived"] is True
+    assert _bal(hunter) == 150
+    assert _treasury() == t0
 
 
 def test_bounty_cancel_refunds():
@@ -642,7 +644,7 @@ def test_accept_requires_submission():
     r = client.post(f"/world/bounties/{bid}/accept",
                     json={"agent_id": poster}, headers=_auth(poster))
     assert r.status_code == 200 and r.json()["status"] == "completed"
-    assert _bal(hunter) == hb0 + 18  # 20 minus the 10% fee
+    assert _bal(hunter) == hb0 + 20  # first non-house bounty: fee waived
 
 
 def test_bounty_seq_unique_under_concurrency():
@@ -1056,3 +1058,75 @@ def test_404_detail_has_no_keyerror_repr():
     r = client.get("/world/profile/zzz_no_such_agent_xyz")
     assert r.status_code == 404, r.text
     assert r.json()["detail"] == "agent not found", r.json()
+
+
+def _accept_flow(poster, hunter, title):
+    """Post -> claim -> submit -> accept. Returns the accepted bounty."""
+    bid = client.post("/world/bounties", json={
+        "agent_id": poster, "title": title, "description": "d", "reward": 20},
+        headers=_auth(poster)).json()["id"]
+    r = client.post(f"/world/bounties/{bid}/claim",
+                    json={"agent_id": hunter}, headers=_auth(hunter))
+    assert r.status_code == 200, r.text
+    r = client.post(f"/world/bounties/{bid}/submit",
+                    json={"agent_id": hunter, "submission": "x" * 150},
+                    headers=_auth(hunter))
+    assert r.status_code == 200, r.text
+    r = client.post(f"/world/bounties/{bid}/accept",
+                    json={"agent_id": poster}, headers=_auth(poster))
+    assert r.status_code == 200, r.text
+    return r.json()
+
+
+def test_fee_waived_first_three_non_house_bounties():
+    # Tommy 2026-10-11: a non-house poster's first 3 accepted bounties pay
+    # no house fee; the 4th pays. Each waiver is logged + stamped.
+    poster = _uid("p"); _make(poster)
+    hunters = [_uid("h") for _ in range(4)]
+    for h in hunters:
+        _make(h)
+    for i in range(3):
+        b = _accept_flow(poster, hunters[i], f"waive test {i}")
+        assert b["fee"] == 0, b
+        assert b["fee_waived"] is True, b
+    b = _accept_flow(poster, hunters[3], "waive test 3")
+    assert b["fee"] == 2, b  # 10% of 20
+    assert b["fee_waived"] is False, b
+
+
+def test_newcomer_reserve_on_repeated_bounty():
+    # Tommy 2026-10-11: repeating a completed bounty reserves the first 24h
+    # for hunters with zero completions.
+    poster = _uid("p"); _make(poster)
+    vet = _uid("v"); _make(vet)
+    newb = _uid("n"); _make(newb)
+    _accept_flow(poster, vet, "reserve series")
+    bid = client.post("/world/bounties", json={
+        "agent_id": poster, "title": "reserve series round 2",
+        "description": "d", "reward": 20},
+        headers=_auth(poster)).json()["id"]
+    rec = next(x for x in client.get("/world/bounties").json()["bounties"]
+               if x["id"] == bid)
+    assert rec["newcomer_reserve_until"], rec
+    # experienced hunter blocked during the reserve
+    r = client.post(f"/world/bounties/{bid}/claim",
+                    json={"agent_id": vet}, headers=_auth(vet))
+    assert r.status_code == 400, r.text
+    assert "first-time hunters" in r.json()["detail"], r.text
+    # newcomer sails through
+    r = client.post(f"/world/bounties/{bid}/claim",
+                    json={"agent_id": newb}, headers=_auth(newb))
+    assert r.status_code == 200, r.text
+
+
+def test_world_stats_public():
+    # Tommy 2026-10-11: public KPI ticker, no key required.
+    r = client.get("/world/stats")
+    assert r.status_code == 200, r.text
+    d = r.json()
+    for k in ("bounties_total", "bounties_by_status", "dail_paid",
+              "distinct_hunters_paid", "distinct_posters",
+              "house_share_completed", "non_house_completions",
+              "median_reward", "fee_waivers_granted"):
+        assert k in d, d
+    assert d["bounties_total"] >= d["non_house_completions"]

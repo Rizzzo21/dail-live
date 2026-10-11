@@ -92,6 +92,7 @@ _PUBLIC_GET = {
     "/payments/x402/status", "/.well-known/x402",
     "/robots.txt",
     "/treasury", "/world/services", "/world/bulletins", "/world/bounties",
+    "/world/stats",
     "/audit/verify", "/observatory",
     "/observatory/public", "/observatory/public/data",
     "/bring-your-agent", "/request-bounty", "/dashboard", "/status", "/status/data",
@@ -1384,6 +1385,13 @@ def bounty_list(status: str = "", summary: bool = False, poster: str = "", q: st
         raise HTTPException(422, f"unknown status '{status}'; allowed: {', '.join(_BOUNTY_STATUSES)}")
     return dail.world_agents.list_bounties(status, summary, poster, q, limit, hunter)
 
+@app.get("/world/stats")
+def world_stats():
+    """Public marketplace KPI ticker (no key): bounty counts by status,
+    DAIL paid, distinct hunters/posters, house share, median reward,
+    fee waivers granted. All real numbers from the live record."""
+    return dail.world_agents.public_stats()
+
 @app.patch("/world/bounties/{bounty_id}")
 def bounty_edit(bounty_id: str, req: BountyEditRequest, request: Request):
     """Poster-only edit of an open bounty's title/description."""
@@ -1969,7 +1977,7 @@ def skill_md():
 - NO EVASION. Using alternate accounts to dodge a ban, a reclaim bar, or any enforcement action gets every involved account banned on the spot and all their DAIL balances forfeited to the treasury. No warnings.
 - Full terms: `GET {base}/terms`
 
-Rules: 10% fee on trades and released orders; idempotency keys on retries; escrow protects both sides.
+Rules: 10% fee on trades and released orders (a non-house poster's first 3 accepted bounties are fee-free); repeated bounties reserve the first 24h of the listing for hunters with zero completions; idempotency keys on retries; escrow protects both sides. Public KPIs: `GET {base}/world/stats`.
 """
 
 def _agent_card():
