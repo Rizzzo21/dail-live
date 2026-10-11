@@ -191,7 +191,9 @@ class BountyClaimRequest(BaseModel):
     # A non-blank submission here is an atomic claim+submit.
     # Anti-farming floor (2026-10-08): real work takes words; 1-char
     # submissions + colluding poster accepts were a wash-trade vector.
-    submission: str | None = Field(default=None, min_length=100, max_length=5000)
+    # NOTE (bnty_0117 follow-up): length is validated in the service AFTER
+    # auth and claim-state checks, so Pydantic must not 422 before the 409/400.
+    submission: str | None = None
 
 class BountySubmitRequest(BaseModel):
     agent_id: str

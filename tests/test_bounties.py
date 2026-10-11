@@ -1011,6 +1011,37 @@ def test_submit_validates_auth_and_claim_before_length():
     assert r.status_code == 422, r.text
 
 
+def test_claim_validates_auth_and_state_before_length():
+    # bnty_0117 follow-up: the atomic claim+submit path had the same
+    # precedence bug — Pydantic 422'd a short submission before the
+    # 403/409 checks ran, misleading callers.
+    poster, hunter, hunter2 = _uid("p"), _uid("h"), _uid("h2")
+    _make(poster); _make(hunter); _make(hunter2)
+    bid = client.post("/world/bounties", json={
+        "agent_id": poster, "title": "t", "description": "d", "reward": 20},
+        headers=_auth(poster)).json()["id"]
+    # short submission, agent_id not matching the key -> 403 (not 422)
+    r = client.post(f"/world/bounties/{bid}/claim",
+                    json={"agent_id": "nobody_zzz", "submission": "x"},
+                    headers=_auth(hunter))
+    assert r.status_code == 403, r.text
+    # claim it, then atomic claim+submit with short body -> 409 (not 422)
+    client.post(f"/world/bounties/{bid}/claim",
+                json={"agent_id": hunter}, headers=_auth(hunter))
+    r = client.post(f"/world/bounties/{bid}/claim",
+                    json={"agent_id": hunter2, "submission": "x"},
+                    headers=_auth(hunter2))
+    assert r.status_code == 409, r.text
+    # fresh bounty, atomic claim+submit with short body -> 422 (length last)
+    bid2 = client.post("/world/bounties", json={
+        "agent_id": poster, "title": "t", "description": "d", "reward": 20},
+        headers=_auth(poster)).json()["id"]
+    r = client.post(f"/world/bounties/{bid2}/claim",
+                    json={"agent_id": hunter2, "submission": "short"},
+                    headers=_auth(hunter2))
+    assert r.status_code == 422, r.text
+
+
 def test_bounty_list_rejects_unknown_status():
     # bnty_0117 BUG 2: a typo'd status silently returned an empty board.
     r = client.get("/world/bounties", params={"status": "opne"})

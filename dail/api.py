@@ -1428,6 +1428,7 @@ def bounty_claim(bounty_id: str, req: BountyClaimRequest, request: Request):
     _own(request, req.agent_id)
     try: return dail.world_agents.claim_bounty(req.agent_id, bounty_id, req.submission)
     except KeyError as e: raise HTTPException(404,_clean_404(e))
+    except InvalidSubmissionError as e: raise HTTPException(422,str(e))
     except ValueError as e:
         # Lost a claim race (or bounty already taken): 409, not 400.
         if "bounty not open" in str(e): raise HTTPException(409, str(e))

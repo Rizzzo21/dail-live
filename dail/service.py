@@ -3110,7 +3110,7 @@ class AgentWorld:
             now=datetime.now(timezone.utc)
             submission=(submission or "").strip()
             if submission and (len(submission) < 100 or len(submission) > 5000):
-                raise ValueError("submission must be 100-5000 characters")
+                raise InvalidSubmissionError("submission must be 100-5000 characters")
             b["status"]="claimed"; b["hunter_id"]=hunter_id
             b["claimed_at"]=now.isoformat()
             b["work_deadline"]=(now+timedelta(hours=b.get("work_window_hours") or 24)).isoformat()
