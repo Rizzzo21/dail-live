@@ -2156,6 +2156,9 @@ def customer_post_task(req: dict, request: Request):
             poster, title, description, reward)
     except (KeyError, ValueError, Exception) as e:
         raise HTTPException(400, str(e))
+    # Persist the ownership link (bnty_0133): the customer->task map is
+    # written before we return, so a restart cannot orphan the task.
+    dail.customers.record_task(cid, b)
     return b
 
 

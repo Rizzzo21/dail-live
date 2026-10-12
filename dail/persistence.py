@@ -130,6 +130,34 @@ class WorldStore:
                 ref_id VARCHAR(64) NOT NULL,
                 created_at VARCHAR(64) NOT NULL,
                 PRIMARY KEY (scope, key))""",
+            # bnty_0133 (2026-10-12): human customer identities, invitations,
+            # sessions, and task ownership must survive a restart. Previously
+            # all four lived in CustomerService's in-memory dicts, so a
+            # redeploy silently orphaned every human: their session tokens
+            # stopped working and their posted tasks lost their owner.
+            # Dedicated tables (not a kv blob) keep them queryable and make
+            # the ownership link (customer -> bounty) durable.
+            """CREATE TABLE IF NOT EXISTS dail_customers (
+                id VARCHAR(64) PRIMARY KEY,
+                name VARCHAR(255) NOT NULL DEFAULT '',
+                email VARCHAR(255) NOT NULL DEFAULT '',
+                verified BOOLEAN NOT NULL DEFAULT TRUE,
+                created_at VARCHAR(64) NOT NULL)""",
+            """CREATE TABLE IF NOT EXISTS dail_customer_invites (
+                code VARCHAR(64) PRIMARY KEY,
+                created_at VARCHAR(64) NOT NULL,
+                used_by VARCHAR(64),
+                used_at VARCHAR(64))""",
+            """CREATE TABLE IF NOT EXISTS dail_customer_sessions (
+                token_hash VARCHAR(64) PRIMARY KEY,
+                customer_id VARCHAR(64) NOT NULL,
+                created_at VARCHAR(64) NOT NULL,
+                expires_at VARCHAR(64) NOT NULL)""",
+            """CREATE TABLE IF NOT EXISTS dail_customer_tasks (
+                bounty_id VARCHAR(64) PRIMARY KEY,
+                customer_id VARCHAR(64) NOT NULL,
+                data TEXT NOT NULL,
+                updated_at VARCHAR(64) NOT NULL)""",
         ]
         for s in stmts:
             try:
@@ -439,7 +467,121 @@ class WorldStore:
                 {"s": scope, "k": key}).fetchone()
         return row[0] if row else None
 
-    # ---- reads (startup restore) ----
+    # ---- bnty_0133: human customer state (identities, invites, sessions,
+    # task ownership). All writes are synchronous so a crash or redeploy can
+    # never leave a customer half-registered or a task without an owner. ----
+    def save_customer(self, customer):
+        if not self.enabled:
+            return
+        with self._lock, self.engine.begin() as c:
+            c.execute(text(
+                """INSERT INTO dail_customers (id, name, email, verified, created_at)
+                   VALUES (:id, :name, :email, :verified, :ca)
+                   ON CONFLICT (id) DO UPDATE SET name=EXCLUDED.name,
+                     email=EXCLUDED.email, verified=EXCLUDED.verified"""),
+                {"id": customer["id"], "name": customer.get("name", ""),
+                 "email": customer.get("email", ""),
+                 "verified": bool(customer.get("verified", True)),
+                 "ca": customer.get("created_at") or _now()})
+
+    def load_customers(self):
+        """All customers as {customer_id: record}. [] -> {} when off."""
+        if not self.enabled:
+            return {}
+        out = {}
+        with self.engine.begin() as c:
+            rows = c.execute(text(
+                "SELECT id, name, email, verified, created_at FROM dail_customers")).fetchall()
+        for r in rows:
+            out[r[0]] = {"id": r[0], "name": r[1] or "", "email": r[2] or "",
+                         "created_at": r[4], "verified": bool(r[3])}
+        return out
+
+    def save_invite(self, code, invite):
+        if not self.enabled:
+            return
+        with self._lock, self.engine.begin() as c:
+            c.execute(text(
+                """INSERT INTO dail_customer_invites (code, created_at, used_by, used_at)
+                   VALUES (:code, :ca, :ub, :ua)
+                   ON CONFLICT (code) DO UPDATE SET used_by=EXCLUDED.used_by,
+                     used_at=EXCLUDED.used_at"""),
+                {"code": code, "ca": invite.get("created_at") or _now(),
+                 "ub": invite.get("used_by"), "ua": invite.get("used_at")})
+
+    def load_invites(self):
+        if not self.enabled:
+            return {}
+        out = {}
+        with self.engine.begin() as c:
+            rows = c.execute(text(
+                "SELECT code, created_at, used_by, used_at FROM dail_customer_invites")).fetchall()
+        for r in rows:
+            out[r[0]] = {"created_at": r[1], "used_by": r[2], "used_at": r[3]}
+        return out
+
+    def save_session(self, token_hash, session):
+        if not self.enabled:
+            return
+        with self._lock, self.engine.begin() as c:
+            c.execute(text(
+                """INSERT INTO dail_customer_sessions
+                   (token_hash, customer_id, created_at, expires_at)
+                   VALUES (:th, :cid, :ca, :ea)
+                   ON CONFLICT (token_hash) DO UPDATE SET
+                     customer_id=EXCLUDED.customer_id,
+                     expires_at=EXCLUDED.expires_at"""),
+                {"th": token_hash, "cid": session["customer_id"],
+                 "ca": session.get("created_at") or _now(),
+                 "ea": session["expires_at"]})
+
+    def delete_session(self, token_hash):
+        if not self.enabled:
+            return
+        with self._lock, self.engine.begin() as c:
+            c.execute(text("DELETE FROM dail_customer_sessions WHERE token_hash=:th"),
+                      {"th": token_hash})
+
+    def load_sessions(self):
+        if not self.enabled:
+            return {}
+        out = {}
+        with self.engine.begin() as c:
+            rows = c.execute(text(
+                "SELECT token_hash, customer_id, created_at, expires_at FROM dail_customer_sessions")).fetchall()
+        for r in rows:
+            out[r[0]] = {"customer_id": r[1], "created_at": r[2],
+                         "expires_at": r[3]}
+        return out
+
+    def save_customer_task(self, customer_id, bounty_id, data):
+        """Record task ownership: customer -> bounty. The ownership link must
+        survive a restart, otherwise /customers/me/tasks leaks an empty list
+        and accept/reject 403 the real owner."""
+        if not self.enabled:
+            return
+        with self._lock, self.engine.begin() as c:
+            c.execute(text(
+                """INSERT INTO dail_customer_tasks (bounty_id, customer_id, data, updated_at)
+                   VALUES (:bid, :cid, :data, :now)
+                   ON CONFLICT (bounty_id) DO UPDATE SET
+                     customer_id=EXCLUDED.customer_id, data=EXCLUDED.data,
+                     updated_at=EXCLUDED.updated_at"""),
+                {"bid": bounty_id, "cid": customer_id,
+                 "data": json.dumps(data), "now": _now()})
+
+    def load_customer_tasks(self):
+        """{bounty_id: customer_id} ownership map."""
+        if not self.enabled:
+            return {}
+        out = {}
+        with self.engine.begin() as c:
+            rows = c.execute(text(
+                "SELECT bounty_id, customer_id FROM dail_customer_tasks")).fetchall()
+        for r in rows:
+            out[r[0]] = r[1]
+        return out
+
     def load_all(self):
         """Returns (agent_rows, tx_rows, order_rows, kv_dict, service_rows, bulletin_rows)."""
         if not self.enabled:

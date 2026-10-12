@@ -1242,6 +1242,13 @@ class AgentWorld:
         these paths — that's a product decision, not enforced here.)"""
         agent = self.agents.get(agent_id)
         if agent is None:
+            # bnty_0133: human customers post bounties under a shadow id
+            # ("customer:cust_0001") that has no Agent record. The customer
+            # route enforces affordability (balance >= reward) before posting,
+            # so there is no spending_limit to read here. Real unknown ids
+            # still fail closed.
+            if agent_id.startswith("customer:"):
+                return
             raise KeyError("agent not found")
         if amount > agent.spending_limit:
             raise PermissionError("spending_limit_exceeded")
@@ -2688,10 +2695,23 @@ class AgentWorld:
             items=[r for r in items if r["status"]==status]
         return {"requests":items,"count":len(items)}
 
-    def review_bounty_request(self, request_id, decision, admin_note=""):
+    def review_bounty_request(self, request_id, decision, admin_note="", funder_id=None):
         r=self.bounty_requests.get(request_id)
         if r is None: raise KeyError("request not found")
         if decision not in ("approved","dismissed"): raise ValueError("decision must be approved|dismissed")
+        # bnty_0132 fix: an approved request must produce a FUNDED bounty, not
+        # just flip status. Delegate to the approval-to-post bridge (idempotent;
+        # funds escrow from the request's funding source and returns the bounty).
+        if decision == "approved":
+            from .approve_bridge import approve_bounty_request
+            posted = approve_bounty_request(self, request_id, admin_note=admin_note,
+                                            funder_id=funder_id)
+            if posted is not r:
+                r["bounty_id"] = posted.get("id")
+                self.audit.append("bounty_request.reviewed",
+                                  {"request_id":request_id,"decision":decision,
+                                   "bounty_id":posted.get("id")})
+            return r
         r["status"]=decision; r["admin_note"]=(admin_note or "")[:500]
         r["reviewed_at"]=datetime.now(timezone.utc).isoformat()
         self._save_kv()
