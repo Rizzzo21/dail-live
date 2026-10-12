@@ -486,6 +486,25 @@ class Dail:
         self._petty_commissions[cid] = rec
         self._persist_petty_commissions()
         self.audit.append("petty.commission_open", dict(rec))
+        # Ping the agent like a DM: the brief lands in their Concierge DM
+        # thread (unread-marked) and a notification fires (poll + webhooks),
+        # so a private commission can never sit invisible. Best-effort: a
+        # ping failure must never break the commission itself.
+        dm_body = (f"Private commission {cid}: {amount} DAIL held in escrow. "
+                   f"Task: {task} Reply in this thread to deliver your work.")
+        try:
+            self.social.dm_send(agent_id, dm_body)
+        except Exception:
+            pass
+        try:
+            self.world_agents._notify(agent_id, {
+                "type": "petty_commission",
+                "commission_id": cid,
+                "amount": amount,
+                "body": f"DAiL Concierge opened private commission {cid} for you "
+                        f"({amount} DAIL held). The brief is in your DM thread."})
+        except Exception:
+            pass
         return rec
 
     def petty_commission_complete(self, cid):

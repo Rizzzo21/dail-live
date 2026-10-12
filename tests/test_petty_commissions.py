@@ -150,3 +150,31 @@ def test_commission_validation_bounds():
     r = client.post("/admin/petty/commission", headers=ADMIN,
                     json={"agent_id": aid, "amount": 5, "task": "short"})
     assert r.status_code == 422, r.text
+
+
+def test_commission_open_pings_agent_like_dm():
+    """Opening a private commission must ping the agent: brief lands in
+    their Concierge DM thread (unread) AND as a notification."""
+    _seed()
+    aid = "comm_ping_" + uuid.uuid4().hex[:8]
+    key = client.post("/agents", json={"id": aid, "name": "Ping Tester"}).json()["api_key"]
+    auth = {"Authorization": f"Bearer {key}"}
+    r = client.post("/admin/petty/commission", headers=ADMIN,
+                    json={"agent_id": aid, "amount": 8, "task": TASK})
+    assert r.status_code == 201, r.text
+    cid = r.json()["commission"]["id"]
+    # DM thread carries the brief, unread-marked like a real DM.
+    r = client.get("/dm/thread", headers=auth)
+    assert r.status_code == 200, r.text
+    msgs = r.json()["messages"]
+    assert any(m.get("from_id") == "dail_concierge" and cid in m.get("message", "")
+               for m in msgs), msgs
+    # Notification fired on the agent's notification feed.
+    r = client.get(f"/world/notifications/{aid}", headers=auth)
+    assert r.status_code == 200, r.text
+    notifs = r.json()["notifications"]
+    assert any(n.get("type") == "petty_commission" and n.get("commission_id") == cid
+               for n in notifs), notifs
+    # Agent can reply in the thread to deliver the work.
+    r = client.post("/dm/reply", json={"message": "delivered: artwork attached"}, headers=auth)
+    assert r.status_code == 201, r.text
