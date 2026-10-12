@@ -1731,7 +1731,8 @@ class AgentWorld:
         with self._mutation_lock:
             if order["status"] not in ("awaiting_delivery","delivered"):
                 raise ValueError("order not disputable")
-            if order["status"]=="awaiting_delivery" and agent_id==order["provider_id"]:
+            pre_status=order["status"]
+            if pre_status=="awaiting_delivery" and agent_id==order["provider_id"]:
                 # No grievance exists yet: the buyer has only paid. A provider
                 # disputing pre-delivery is pure grief -- it freezes the buyer's
                 # escrow and kills their instant-cancel path for 48h. If the
@@ -1746,13 +1747,24 @@ class AgentWorld:
                                      kind="dispute_fee", idem=f"dispute-fee:{order_id}")
                 self._sync_balance(agent_id)
             order["status"]="disputed"
+            # F1 FIX 2026-10-12 (bnty_0141): stamp the pre-dispute status.
+            # A dispute filed from "awaiting_delivery" means no work was
+            # delivered, so the sweep's 48h buyer auto-refund stays valid.
+            # A dispute filed from "delivered" means the buyer already has the
+            # work -- auto-refunding would let the buyer keep the work AND the
+            # escrow (escrow theft for a 1-DAIL dispute fee). Those disputes
+            # are held for explicit admin resolution instead.
+            order["dispute_filed_from"]=pre_status
             order["dispute_reason"]=(reason or "")[:500]
         svc=self.services.get(order["service_id"])
         if svc:
             svc["orders_disputed"]=svc.get("orders_disputed",0)+1
             if self.store: self.store.save_service(svc)
         # 48h resolution SLA: if no admin resolution by resolve_by, the sweep
-        # auto-refunds the buyer. Documented in /quickstart.
+        # auto-refunds the buyer -- but ONLY for disputes filed from
+        # "awaiting_delivery". Disputes filed from "delivered" (F1 FIX 2026-10-12)
+        # are held for explicit admin resolution; the sweep extends the hold
+        # instead of refunding. Documented in /quickstart.
         order["resolve_by"]=(datetime.now(timezone.utc)+DISPUTE_SLA).isoformat()
         order["disputed_by"]=agent_id
         self._save_order(order)
@@ -1807,7 +1819,10 @@ class AgentWorld:
         - awaiting-delivery orders past deliver_by nudge the buyer once
           (they can cancel for a full refund)
         - disputed orders with no admin resolution past DISPUTE_SLA auto-refund
-          the buyer (documented 48h SLA)"""
+          the buyer (documented 48h SLA) -- EXCEPT disputes filed after
+          delivery, which are held for explicit admin resolution instead
+          (F1 FIX 2026-10-12: auto-refunding post-delivery disputes would let
+          the buyer keep the work AND the escrow for a 1-DAIL dispute fee)"""
         now=datetime.now(timezone.utc)
         released=0
         for order in self.orders.values():
@@ -1848,6 +1863,22 @@ class AgentWorld:
             elif order["status"]=="disputed" and not order.get("resolution") and order.get("resolve_by"):
                 try:
                     if datetime.fromisoformat(order["resolve_by"])<=now:
+                        # F1 FIX 2026-10-12 (bnty_0141): disputes filed AFTER
+                        # delivery never auto-refund the buyer. The buyer already
+                        # holds the delivered work; a 48h auto-refund would hand
+                        # them the work AND the full escrow for a 1-DAIL fee.
+                        # Hold the escrow for explicit admin resolution instead
+                        # (POST /world/orders/{id}/resolve, admin-only).
+                        if order.get("dispute_filed_from","awaiting_delivery")=="delivered":
+                            order["resolve_by"]=(now+DISPUTE_SLA).isoformat()
+                            order["dispute_admin_hold"]=True
+                            self._save_order(order)
+                            for aid in (order["buyer_id"], order["provider_id"]):
+                                self._notify(aid,
+                                    {"type":"dispute_admin_hold","order_id":order["id"],
+                                     "body":f"Order {order['id']}: dispute was filed after delivery, so the 48h auto-refund does not apply. Funds stay frozen for admin resolution."})
+                            self.audit.append("order.dispute_admin_hold", {"order_id":order["id"]})
+                            continue
                         self.ledger.transfer(f"escrow:{order['id']}", order["buyer_id"],
                                              order["amount"], kind="escrow_refund",
                                              idem=f"escrow-refund:{order['id']}")
