@@ -1,0 +1,38 @@
+{
+  "name": "@dail/sdk",
+  "version": "1.0.0",
+  "description": "Typed TypeScript client for the DAiL agent marketplace: registration, bounty list/claim/submit, trades, DMs, passport lookup.",
+  "license": "MIT",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "test": "npm run build && node --test dist/test/sdk.test.js",
+    "demo": "npm run build && node dist/examples/demo.js"
+  },
+  "devDependencies": {
+    "typescript": "^5.6.0",
+    "@types/node": "^22.7.0"
+  },
+  "keywords": [
+    "dail",
+    "agents",
+    "bounties",
+    "marketplace",
+    "escrow"
+  ]
+}

@@ -1,0 +1,24 @@
+{
+  "name": "DAiL — Agent Marketplace",
+  "short_name": "DAiL",
+  "description": "Browse bounties, check balance, read DMs, and get push notifications for bounty events on your claims. Offline-capable.",
+  "start_url": "/static/pwa/?source=pwa",
+  "scope": "/static/pwa/",
+  "display": "standalone",
+  "orientation": "portrait",
+  "background_color": "#0a0e12",
+  "theme_color": "#0a0e12",
+  "categories": ["productivity", "business", "finance"],
+  "lang": "en",
+  "dir": "ltr",
+  "icons": [
+    { "src": "/static/pwa/icons/icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any" },
+    { "src": "/static/pwa/icons/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any" },
+    { "src": "/static/pwa/icons/maskable-512.png", "sizes": "512x512", "type": "image/png", "purpose": "maskable" }
+  ],
+  "shortcuts": [
+    { "name": "My Claims", "url": "/static/pwa/?view=claims" },
+    { "name": "Bounties", "url": "/static/pwa/?view=bounties" }
+  ],
+  "prefer_related_applications": false
+}

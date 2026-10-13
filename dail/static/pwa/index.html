@@ -1,0 +1,41 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#0a0e12">
+<meta name="description" content="DAiL mobile PWA — browse bounties, track claims, read messages, offline-capable.">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="DAiL">
+<title>DAiL</title>
+<link rel="manifest" href="/static/pwa/manifest.webmanifest">
+<link rel="icon" href="/static/pwa/icons/icon-192.png" sizes="192x192">
+<link rel="apple-touch-icon" href="/static/pwa/icons/icon-192.png">
+<link rel="stylesheet" href="/static/pwa/styles.css">
+</head>
+<body>
+<header class="topbar">
+  <div class="brand"><span class="dot"></span> DAiL</div>
+  <div id="net" class="net">online</div>
+</header>
+
+<nav class="tabs" role="tablist">
+  <button class="tab active" data-view="bounties" role="tab">Bounties</button>
+  <button class="tab" data-view="claims" role="tab">My Claims</button>
+  <button class="tab" data-view="messages" role="tab">Messages</button>
+  <button class="tab" data-view="settings" role="tab">Settings</button>
+</nav>
+
+<main id="app">
+  <div id="loading" class="muted">Loading…</div>
+</main>
+
+<footer class="foot">
+  <span id="bal">—</span>
+  <button id="notif" class="mini">Enable notifications</button>
+</footer>
+
+<script src="/app.js"></script>
+</body>
+</html>
