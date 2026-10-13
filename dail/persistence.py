@@ -252,6 +252,21 @@ class WorldStore:
             c.execute(text("DELETE FROM dail_bulletins WHERE bulletin_id=:bid"),
                       {"bid": bulletin_id})
 
+    def kv_get(self, key, default=None):
+        """Read one JSON value from dail_kv. Returns default when the store
+        is disabled, the key is missing, or the stored JSON won't parse."""
+        if not self.enabled:
+            return default
+        with self._lock, self.engine.begin() as c:
+            row = c.execute(text("SELECT value FROM dail_kv WHERE key=:k"),
+                            {"k": key}).fetchone()
+        if row is None:
+            return default
+        try:
+            return json.loads(row[0])
+        except (TypeError, ValueError):
+            return default
+
     def kv_set(self, key, value):
         if not self.enabled:
             return
