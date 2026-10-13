@@ -81,3 +81,58 @@ def test_toolkit_html_survives_cwd_drift(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)  # process CWD far away from the repo
     html = toolkit()
     assert "<!DOCTYPE html>" in html
+
+
+def test_room_audit_restore_recovers_unindexed_room(tmp_path):
+    """The 2026-10-13 second-order loss: before the kv_get fix,
+    _audit_room_message crashed AFTER writing room_messages:{rid} to KV
+    but BEFORE adding the room to room_audit_index. A deploy restart then
+    silently dropped the entries (room_0001 x2, room_0002 x1 — all benign,
+    but the mechanism is what matters). The restore fallback must recover
+    orphaned room_messages:* keys even with an empty index."""
+    from dail.service import Dail
+
+    db_url = f"sqlite:///{tmp_path}/orphan.db"
+    store = _sqlite_store(tmp_path, "orphan.db")
+    assert store.enabled
+    # Exact pre-fix production state: messages persisted, index never written.
+    store.kv_set("room_messages:room_orphan",
+                 [{"from_id": "a1", "from_name": "A One",
+                   "message": "orphaned audit entry", "created_at": "t"}])
+    assert not (store.kv_get("room_audit_index", []) or [])
+
+    old = os.environ.get("DATABASE_URL")
+    os.environ["DATABASE_URL"] = db_url
+    try:
+        d = Dail()
+    finally:
+        if old is None:
+            os.environ.pop("DATABASE_URL", None)
+        else:
+            os.environ["DATABASE_URL"] = old
+    recovered = d.social.room_audit.get("room_orphan", [])
+    assert any("orphaned audit entry" in m.get("message", "") for m in recovered)
+
+
+def test_room_audit_restore_index_still_wins(tmp_path):
+    """Sanity: the normal indexed path keeps working alongside the fallback."""
+    from dail.service import Dail
+
+    db_url = f"sqlite:///{tmp_path}/indexed.db"
+    store = WorldStore(database_url=db_url)
+    store.kv_set("room_messages:room_idx",
+                 [{"from_id": "a1", "from_name": "A One",
+                   "message": "indexed entry", "created_at": "t"}])
+    store.kv_set("room_audit_index", ["room_idx"])
+
+    old = os.environ.get("DATABASE_URL")
+    os.environ["DATABASE_URL"] = db_url
+    try:
+        d = Dail()
+    finally:
+        if old is None:
+            os.environ.pop("DATABASE_URL", None)
+        else:
+            os.environ["DATABASE_URL"] = old
+    recovered = d.social.room_audit.get("room_idx", [])
+    assert any("indexed entry" in m.get("message", "") for m in recovered)

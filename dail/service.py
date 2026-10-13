@@ -276,6 +276,20 @@ class Dail:
             msgs = kv.get(f"room_messages:{rid}", [])
             if msgs:
                 self.social.room_audit[rid] = msgs
+        # Fallback (2026-10-13): a room whose messages were persisted but
+        # whose index entry was never written must not go dark on restart.
+        # Before the WorldStore.kv_get fix, _audit_room_message crashed
+        # after the message write and before the index write, so the
+        # ~11:51 PDT deploy restart silently dropped 3 benign entries
+        # (hustle-cad self-tests x2, dail_host diagnostic x1). Scanning for
+        # orphaned room_messages:* keys keeps any future partial write
+        # from silently losing audit history again.
+        for key, val in kv.items():
+            if not key.startswith("room_messages:"):
+                continue
+            rid = key[len("room_messages:"):]
+            if rid not in self.social.room_audit and val:
+                self.social.room_audit[rid] = val[-200:]
         # DM threads survive restarts (Tommy needs the history).
         self.social.dm_threads = kv.get("dm_threads") or {}
         # seqs must at least cover restored orders
