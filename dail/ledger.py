@@ -51,7 +51,13 @@ class Ledger:
         if idem and idem in self.idempotency:
             return self.transactions[self.idempotency[idem]]
         if self.balances[source] < amount:
-            raise LedgerError("insufficient funds")
+            # bnty_0168 safe subset: attach the numbers additively. The
+            # message stays the legacy string; the API layer surfaces
+            # required/available alongside it.
+            err = LedgerError("insufficient funds")
+            err.required = amount
+            err.available = self.balances[source]
+            raise err
         txid = f"tx_{len(self.transactions)+1:06d}"
         tx = Transaction(id=txid, kind=kind, from_account=source,
                          to_account=destination, amount=amount,

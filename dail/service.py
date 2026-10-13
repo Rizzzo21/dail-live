@@ -25,6 +25,20 @@ TRADE_FEE_BPS = int(os.getenv("DAIL_TRADE_FEE_BPS", "1000"))  # 10%
 
 class InvalidSubmissionError(ValueError):
     """Submission body fails the 100-5000 char floor. Maps to HTTP 422."""
+
+class ClaimError(ValueError):
+    """Enriched bounty-claim failure (bnty_0168 safe subset).
+
+    The message stays the exact legacy string so existing string-matching
+    clients keep working; code/hint/extra are additive structured fields
+    the API layer includes alongside `detail`.
+    """
+    def __init__(self, message, code="", hint="", status_code=400, **extra):
+        super().__init__(message)
+        self.code = code
+        self.hint = hint
+        self.status_code = status_code
+        self.extra = extra
 # Referral reward: paid to the referrer (in DAIL) when a referred agent
 # completes its first real economic activity (a trade or a confirmed order).
 REFERRAL_REWARD = int(os.getenv("DAIL_REFERRAL_REWARD", "10"))
@@ -3031,6 +3045,24 @@ class AgentWorld:
             out=out[:int(limit)]
         return {"bounties":out,"count":total}
 
+    def get_bounty_public(self, bounty_id):
+        """Single-bounty public view for GET /world/bounties/{id}. Same
+        shaping as list_bounties: poster_last_accepted liveness signal plus
+        private-submission redaction for security bounties."""
+        self.sweep_bounties()
+        b=self._get_bounty(bounty_id)
+        item=dict(b)
+        last=None
+        for other in self.bounties.values():
+            if other["poster_id"]==b["poster_id"] and other["status"]=="completed" \
+                    and other.get("completed_at"):
+                if not last or other["completed_at"]>last:
+                    last=other["completed_at"]
+        item["poster_last_accepted"]=last
+        if item.get("private_submission") and item.get("submission"):
+            item["submission"]="[private submission — visible to poster and hunter only]"
+        return item
+
     def _lapse_claim(self, b, now):
         """Work-phase lapse (lifecycle v2): a claimed bounty with no
         submission blew the 4h stall limit or the work deadline. The claim
@@ -3272,6 +3304,71 @@ class AgentWorld:
             raise PermissionError("not_poster_or_hunter")
         return {"bounty_id": bounty_id, "submission": b.get("submission")}
 
+    def _claim_closed_error(self, bounty_id, b, hunter_id):
+        """Additive structured detail for the legacy 'bounty not open' 409
+        (bnty_0168 safe subset). The message stays byte-identical; the code,
+        hint, and extra fields tell the caller which closed state it is and
+        what to do next."""
+        st = b["status"]
+        base = dict(bounty_id=bounty_id, status=st)
+        open_board = "See GET /world/bounties?status=open for claimable bounties."
+        if st == "claimed":
+            if b.get("hunter_id") == hunter_id:
+                return ClaimError(
+                    "bounty not open",
+                    code="already_claimed_by_you",
+                    hint="You hold this claim. Submit via POST /world/bounties/<id>/submit "
+                         "before stall_deadline, or POST /world/bounties/<id>/request-extension.",
+                    status_code=409,
+                    stall_deadline=b.get("stall_deadline"),
+                    **base)
+            return ClaimError(
+                "bounty not open",
+                code="already_claimed",
+                hint="Another hunter holds this claim. " + open_board,
+                status_code=409,
+                hunter_id=b.get("hunter_id"),
+                stall_deadline=b.get("stall_deadline"),
+                **base)
+        if st == "submitted":
+            return ClaimError(
+                "bounty not open",
+                code="already_submitted",
+                hint="Work is delivered and awaiting poster review; this bounty cannot be claimed.",
+                status_code=409,
+                hunter_id=b.get("hunter_id"),
+                **base)
+        if st == "completed":
+            return ClaimError(
+                "bounty not open",
+                code="bounty_closed",
+                hint="This bounty completed and paid out; it cannot be claimed. " + open_board,
+                status_code=409,
+                completed_at=b.get("completed_at"),
+                **base)
+        if st == "cancelled":
+            return ClaimError(
+                "bounty not open",
+                code="bounty_closed",
+                hint="The poster cancelled this bounty and escrow was returned. " + open_board,
+                status_code=409,
+                cancelled_at=b.get("cancelled_at"),
+                **base)
+        if st == "paused":
+            return ClaimError(
+                "bounty not open",
+                code="bounty_paused",
+                hint="The poster paused this bounty; it may be relisted. " + open_board,
+                status_code=409,
+                **base)
+        # expired, voided, or anything else not open
+        return ClaimError(
+            "bounty not open",
+            code="bounty_closed",
+            hint="This bounty is no longer open. " + open_board,
+            status_code=409,
+            **base)
+
     def claim_bounty(self, hunter_id, bounty_id, submission=None):
         # Lifecycle v2 (2026-10-08): a claim is a RESERVE. Submission is
         # optional -- omit it to reserve, then POST /submit with the work.
@@ -3287,8 +3384,15 @@ class AgentWorld:
         # gets "bounty not open" (409 at the API layer).
         with self._mutation_lock:
             b=self._get_bounty(bounty_id)
-            if b["status"]!="open": raise ValueError("bounty not open")
-            if b["poster_id"]==hunter_id: raise ValueError("cannot claim own bounty")
+            if b["status"]!="open": raise self._claim_closed_error(bounty_id, b, hunter_id)
+            if b["poster_id"]==hunter_id:
+                raise ClaimError(
+                    "cannot claim own bounty",
+                    code="cannot_claim_own_bounty",
+                    hint="You posted this bounty; manage it with POST /world/bounties/<id>/raise "
+                         "or POST /world/bounties/<id>/cancel instead.",
+                    status_code=400,
+                    bounty_id=bounty_id)
             if hunter_id in b.get("rejected_hunters", []):
                 raise ValueError("poster declined your previous claim")
             if hunter_id in b.get("lapsed_hunters", []):

@@ -40,11 +40,38 @@ from .models import (
 from .service import Dail
 from .runtime import AgentRuntime
 from .ledger import LedgerError
-from .service import InvalidSubmissionError
+from .service import InvalidSubmissionError, ClaimError
 
 def _clean_404(e: KeyError) -> str:
     """bnty_0117: str(KeyError('x')) renders as "'x'" — unwrap to the plain message."""
     return str(e.args[0]) if e.args else "not found"
+
+def _err(status_code: int, detail: str, error: str = "", hint: str = "", **extra):
+    """Additive error envelope (bnty_0168 safe subset).
+
+    `detail` keeps the exact legacy string so existing string-matching
+    clients keep working; `error`/`hint`/extras are new structured fields.
+    """
+    body = {"detail": detail}
+    if error:
+        body["error"] = error
+    if hint:
+        body["hint"] = hint
+    body.update(extra)
+    return JSONResponse(status_code=status_code, content=body)
+
+def _ledger_err(e):
+    """Additive LedgerError envelope: legacy detail string kept, with the
+    required/available numbers when the ledger attached them."""
+    extra = {}
+    if getattr(e, "required", None) is not None:
+        extra["required"] = e.required
+        extra["available"] = getattr(e, "available", 0)
+    code, hint = "", ""
+    if "insufficient funds" in str(e):
+        code = "insufficient_funds"
+        hint = "Lower the amount or top up: POST /payments/checkout."
+    return _err(400, str(e), code, hint, **extra)
 from .production_payments import ProductionPayments, PaymentRateLimited
 from .usdc_payments import UsdcPayments, UsdcError, UsdcNotReady
 from .x402_payments import (X402Payments, X402Error, X402NotReady,
@@ -128,6 +155,8 @@ def _classify(method: str, path: str) -> str:
             return "public"
         if path.startswith(_PUBLIC_GET_PREFIXES):
             return "public"
+        if path.startswith("/world/bounties/") and path.count("/") == 3:
+            return "public"  # single-bounty read; /submission stays key-gated
     if method == "POST" and path == "/agents":
         return "public"  # registration is open; it issues the API key
     if method == "POST" and path == "/request-bounty":
@@ -287,7 +316,16 @@ async def auth_gate(request: Request, call_next):
         request.state.caller = ident
         request.state.is_admin = False
         return await call_next(request)
-    return JSONResponse({"detail": "agent_auth_required"}, status_code=401)
+    # bnty_0168 safe subset: distinguish "no credential sent" from "bad
+    # credential". `detail` keeps the legacy string; the code is additive.
+    had_cred = bool(request.headers.get("authorization", "").strip()
+                    or request.headers.get("x-dail-admin-key")
+                    or request.headers.get("x-dail-bouncer-key"))
+    if had_cred:
+        return _err(401, "agent_auth_required", "invalid_api_key",
+                    "Key not recognised. Check for a typo or a rotated key (POST /world/key/rotate).")
+    return _err(401, "agent_auth_required", "auth_missing",
+                "Send 'Authorization: Bearer <api_key>'. New agents get a key at registration (see /skill.md).")
 
 
 class RuntimeActionRequest(BaseModel):
@@ -1375,7 +1413,8 @@ def bounty_create(req: BountyCreateRequest, request: Request):
     _own(request, req.agent_id)
     try: return dail.world_agents.post_bounty(req.agent_id, req.title, req.description, req.reward, req.private_submission, req.expires_in_days, req.claim_window_hours, req.work_window_hours)
     except KeyError as e: raise HTTPException(404,_clean_404(e))
-    except (ValueError, LedgerError) as e: raise HTTPException(400,str(e))
+    except LedgerError as e: return _ledger_err(e)
+    except ValueError as e: raise HTTPException(400,str(e))
     except PermissionError as e: raise HTTPException(403,str(e))
 
 _BOUNTY_STATUSES = ("open", "claimed", "submitted", "completed", "cancelled", "expired", "paused", "voided")
@@ -1386,6 +1425,18 @@ def bounty_list(status: str = "", summary: bool = False, poster: str = "", q: st
     if status and status not in _BOUNTY_STATUSES:
         raise HTTPException(422, f"unknown status '{status}'; allowed: {', '.join(_BOUNTY_STATUSES)}")
     return dail.world_agents.list_bounties(status, summary, poster, q, limit, hunter)
+
+@app.get("/world/bounties/{bounty_id}")
+def bounty_get(bounty_id: str):
+    """Read one bounty by id (public, no key). Agents probing this path
+    used to 405; now it returns the same public shaping as the list."""
+    try:
+        return dail.world_agents.get_bounty_public(bounty_id)
+    except KeyError as e:
+        msg = _clean_404(e)
+        return _err(404, msg, "bounty_not_found",
+                    "No bounty with that id. Open ones: GET /world/bounties?status=open.",
+                    bounty_id=bounty_id)
 
 @app.get("/world/stats")
 def world_stats():
@@ -1437,8 +1488,16 @@ def bounty_submission(bounty_id: str, agent_id: str, request: Request):
 def bounty_claim(bounty_id: str, req: BountyClaimRequest, request: Request):
     _own(request, req.agent_id)
     try: return dail.world_agents.claim_bounty(req.agent_id, bounty_id, req.submission)
-    except KeyError as e: raise HTTPException(404,_clean_404(e))
+    except KeyError as e:
+        msg = _clean_404(e)
+        if msg == "bounty not found":
+            return _err(404, msg, "bounty_not_found",
+                        "No bounty with that id. Open ones: GET /world/bounties?status=open.",
+                        bounty_id=bounty_id)
+        raise HTTPException(404, msg)
     except InvalidSubmissionError as e: raise HTTPException(422,str(e))
+    except ClaimError as e:
+        return _err(e.status_code, str(e), e.code, e.hint, **e.extra)
     except ValueError as e:
         # Lost a claim race (or bounty already taken): 409, not 400.
         if "bounty not open" in str(e): raise HTTPException(409, str(e))
