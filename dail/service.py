@@ -2319,22 +2319,41 @@ class AgentWorld:
         # FIX 3: check the DB too -- if a crash happened between the ledger
         # transfers and the record insert, the in-memory map is gone but the
         # DB row (or the ledger idempotency) still dedups the retry.
-        prior_id = self.trade_idem.get(idem)
-        if prior_id and prior_id in self.trades:
-            return self.trades[prior_id]
-        if self.store:
-            db_tid = self.store.find_trade_by_idem(idem)
-            if db_tid and db_tid in self.trades:
-                self.trade_idem[idem] = db_tid
-                return self.trades[db_tid]
+        # SECURITY FIX 2026-10-13: idempotency keys are scoped per caller
+        # (buyer_id, key). The old global namespace let a colliding key return
+        # ANOTHER agent's trade record (HTTP 200) while the caller's transfer
+        # silently no-op'd -- leaking that trade's item string to the collider.
+        # Only the buyer may initiate a trade (2026-10-07 gate), so buyer_id is
+        # the caller identity here, matching the purchase path's (buyer_id, key).
+        scope = f"{buyer_id}:{idem}"
+        def _prior_trade():
+            tid = self.trade_idem.get(scope)
+            if tid and tid in self.trades:
+                return self.trades[tid]
+            if self.store:
+                db_tid = self.store.find_trade_by_idem(scope)
+                if db_tid and db_tid in self.trades:
+                    self.trade_idem[scope] = db_tid
+                    return self.trades[db_tid]
+            # Pre-fix back-compat: bare-key entries recorded before scoping.
+            # Honored only when the recorded buyer matches this caller --
+            # a colliding key from another agent never sees their record.
+            tid = self.trade_idem.get(idem)
+            if tid and tid in self.trades and self.trades[tid].get("buyer_id") == buyer_id:
+                self.trade_idem[scope] = tid
+                return self.trades[tid]
+            return None
+        prior = _prior_trade()
+        if prior:
+            return prior
         # House cut: buyer pays `amount`; the seller nets amount-fee and the
         # fee flows to dail:treasury. Distinct idempotency keys keep replays safe.
         fee=self._fee(amount)
         tx=self.ledger.transfer(buyer_id, seller_id, amount, kind="trade",
-                                idem=f"{idem}:principal")
+                                idem=f"{scope}:principal")
         if fee:
             self.ledger.transfer(seller_id, "dail:treasury", fee, kind="trade_fee",
-                                 idem=f"{idem}:fee")
+                                 idem=f"{scope}:fee")
         self._sync_balance(buyer_id, seller_id)
         # Monotonic trade IDs under the lock: len(trades) would collide
         # under concurrency (two threads, same length, one overwrites).
@@ -2346,9 +2365,9 @@ class AgentWorld:
                               "amount":amount,"fee":fee,"seller_net":amount-fee,
                               "principal_amount":amount,"fee_amount":fee,
                               "total_amount":amount,"item":item,"status":"settled",
-                              "transaction_id":tx.id,"idempotency_key":idem,
+                              "transaction_id":tx.id,"idempotency_key":scope,
                               "created_at":now,"completed_at":now}
-            self.trade_idem[idem] = tid
+            self.trade_idem[scope] = tid
         # FIX 3: write-through to the dedicated dail_trades table. The
         # UNIQUE(idempotency_key) constraint is the final backstop: if two
         # racing retries both passed the checks, only one row wins and the
@@ -2357,12 +2376,12 @@ class AgentWorld:
             try:
                 self.store.save_trade(self.trades[tid])
             except Exception:
-                db_tid = self.store.find_trade_by_idem(idem)
+                db_tid = self.store.find_trade_by_idem(scope)
                 if db_tid:
                     winner = self.store.load_trades().get(db_tid)
                     if winner:
                         self.trades[db_tid] = winner
-                        self.trade_idem[idem] = db_tid
+                        self.trade_idem[scope] = db_tid
                         return winner
                 raise
         self._save_kv()

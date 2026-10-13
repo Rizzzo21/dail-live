@@ -232,8 +232,31 @@ class TestTradePersistence:
         assert len(d.world_agents.trades) == 1
         # Exactly one principal debit on the buyer.
         assert d.ledger.balances["tr10_b"] == 100 - 25
-        # DB has exactly one row for the key.
-        assert d.store.find_trade_by_idem(key) == first
+        # DB has exactly one row for the key (now scoped per caller).
+        assert d.store.find_trade_by_idem(f"tr10_b:{key}") == first
+
+    def test_trade_idem_scoped_per_buyer_no_cross_leak(self, tmp_path):
+        """SECURITY 2026-10-13: colliding idempotency keys across different
+        buyers must NOT return another agent's trade record. Each buyer gets
+        their own trade; no item-string leak, no silent no-op."""
+        d = _fresh_dail(tmp_path, "trscope.db")
+        _make_agent(d, "sc_s")
+        _make_agent(d, "sc_b1")
+        _make_agent(d, "sc_b2")
+        key = "same-key-both-buyers"
+        t1 = d.world_agents.trade("sc_s", "sc_b1", 25, "secret-item-alpha", idem=key)
+        t2 = d.world_agents.trade("sc_s", "sc_b2", 30, "other-item-beta", idem=key)
+        assert t1["id"] != t2["id"], "colliding keys must not alias trades"
+        assert t2["buyer_id"] == "sc_b2" and t2["item"] == "other-item-beta", \
+            "second buyer must get their own record, not the first buyer's"
+        assert t2["amount"] == 30
+        # Both transfers actually moved funds (no silent no-op).
+        assert d.ledger.balances["sc_b1"] == 100 - 25
+        assert d.ledger.balances["sc_b2"] == 100 - 30
+        # Same buyer + same key still dedups (retry safety preserved).
+        t1b = d.world_agents.trade("sc_s", "sc_b1", 25, "secret-item-alpha", idem=key)
+        assert t1b["id"] == t1["id"]
+        assert d.ledger.balances["sc_b1"] == 100 - 25
 
 
 # ---------------------------------------------------------------- FIX 4 ----
