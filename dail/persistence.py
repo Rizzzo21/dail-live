@@ -482,6 +482,21 @@ class WorldStore:
                 {"s": scope, "k": key}).fetchone()
         return row[0] if row else None
 
+    def idem_release(self, scope, key):
+        """Release a (scope, key) reservation claimed by idem_claim.
+
+        Used when the attempt that reserved the key fails before creating
+        its record (bnty_0173 fix): without this, a crash between the
+        reservation and the record insert would poison the key forever --
+        every retry would find a ref_id with no backing order and fork.
+        """
+        if not self.enabled or not key:
+            return
+        with self._lock, self.engine.begin() as c:
+            c.execute(text(
+                "DELETE FROM dail_idempotency WHERE scope=:s AND key=:k"),
+                {"s": scope, "k": key})
+
     # ---- bnty_0133: human customer state (identities, invites, sessions,
     # task ownership). All writes are synchronous so a crash or redeploy can
     # never leave a customer half-registered or a task without an owner. ----

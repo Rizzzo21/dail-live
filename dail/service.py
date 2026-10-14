@@ -1586,7 +1586,13 @@ class AgentWorld:
         the same (buyer, key) returns the original order instead of creating
         a second escrow hold. FIX 5: a provided key must be well-formed
         (blank keys are rejected, not silently ignored); the DB-level
-        dail_idempotency registry backstops the in-memory map."""
+        dail_idempotency registry backstops the in-memory map.
+        SECURITY FIX 2026-10-14 (bnty_0173): the whole idem-check -> reserve
+        -> escrow-hold -> order-create sequence runs under _mutation_lock,
+        and the DB idempotency key is RESERVED before any money moves.
+        Previously the check-then-create was lock-free and the DB claim ran
+        after the escrow transfer, so N concurrent same-key purchases forked
+        N orders and N escrow holds while every client saw one order_id."""
         if buyer_id not in self.social.identities: raise KeyError("agent not found")
         if service_id not in self.services: raise KeyError("service not found")
         scope_key = None
@@ -1595,58 +1601,79 @@ class AgentWorld:
             # caller opted out of idempotency (API allows it).
             idem = self._require_idem(idem, where="service purchase")
             scope_key = f"{buyer_id}:{idem}"
-            prior_id = self.purchase_idem.get(scope_key)
-            if prior_id and prior_id in self.orders:
-                return self._public_order(self._get_order(prior_id))
-            if self.store:
-                db_oid = self.store.idem_lookup("purchase", scope_key)
-                if db_oid and db_oid in self.orders:
-                    self.purchase_idem[scope_key] = db_oid
-                    return self._public_order(self._get_order(db_oid))
-        svc=self.services[service_id]
-        if not svc["active"]: raise PermissionError("service_inactive")
-        if svc["provider_id"]==buyer_id:
-            # No self-dealing: buying your own service manufactures fake
-            # orders_completed and 5-star ratings for the 1-DAIL fee.
-            raise ValueError("cannot buy your own service")
-        price=svc["price"]
-        self._enforce_spending_cap(buyer_id, price)
-        self.order_seq+=1
-        oid=f"ord_{self.order_seq:04d}"
-        now=datetime.now(timezone.utc).isoformat()
-        self.ledger.transfer(buyer_id, f"escrow:{oid}", price,
-                             kind="escrow_hold", idem=f"escrow-hold:{oid}")
-        self._sync_balance(buyer_id)
-        order={"id":oid,"service_id":service_id,"service_name":svc["name"],
-               "provider_id":svc["provider_id"],"buyer_id":buyer_id,
-               "amount":price,"status":"awaiting_delivery",
-               "created_at":now,"deliver_by":(datetime.now(timezone.utc)+timedelta(hours=svc.get("delivery_hours",DEFAULT_DELIVERY_HOURS))).isoformat(),
-               "overdue_notified":False,
-               "delivery":None,"delivered_at":None,
-               "completed_at":None,"dispute_reason":None,"resolution":None,"resolve_by":None,
-               "rating":None}
-        self.orders[oid]=order
-        self._save_order(order); self._save_kv()
-        if scope_key:
-            # Record the idempotency mapping only after the order is fully
-            # created and persisted, so a retry can never fork two orders.
-            # FIX 5: claim the DB-level registry too; if a racing retry
-            # claimed it first, return the winner's order.
-            self.purchase_idem[scope_key]=oid
-            if self.store:
+        with self._mutation_lock:
+            if scope_key:
+                prior_id = self.purchase_idem.get(scope_key)
+                if prior_id and prior_id in self.orders:
+                    return self._public_order(self._get_order(prior_id))
+                if self.store:
+                    db_oid = self.store.idem_lookup("purchase", scope_key)
+                    if db_oid and db_oid in self.orders:
+                        self.purchase_idem[scope_key] = db_oid
+                        return self._public_order(self._get_order(db_oid))
+                    if db_oid:
+                        # Stale reservation: a previous attempt claimed the
+                        # key but never created its order (crash). Release it
+                        # so this attempt claims cleanly instead of forking.
+                        self.store.idem_release("purchase", scope_key)
+            svc=self.services[service_id]
+            if not svc["active"]: raise PermissionError("service_inactive")
+            if svc["provider_id"]==buyer_id:
+                # No self-dealing: buying your own service manufactures fake
+                # orders_completed and 5-star ratings for the 1-DAIL fee.
+                raise ValueError("cannot buy your own service")
+            price=svc["price"]
+            self._enforce_spending_cap(buyer_id, price)
+            self.order_seq+=1
+            oid=f"ord_{self.order_seq:04d}"
+            reserved=False
+            if scope_key and self.store:
+                # Reserve BEFORE any money moves. The DB PRIMARY KEY is the
+                # single serialization point across processes and restarts:
+                # exactly one same-key attempt can proceed to the transfer.
                 winner = self.store.idem_claim("purchase", scope_key, oid)
-                if winner and winner != oid and winner in self.orders:
-                    self.purchase_idem[scope_key] = winner
-                    self._save_kv()
-                    return self._public_order(self._get_order(winner))
-            self._save_kv()
-        self._notify(svc["provider_id"], 
-            {"type":"order_received","order_id":oid,"service_id":service_id,
-             "buyer_id":buyer_id,"amount":price,
-             "body":f"New order {oid}: deliver via POST /world/orders/{oid}/deliver, then the buyer confirms release."})
-        self.audit.append("order.created", {"order_id":oid,"service_id":service_id,
-                                            "buyer_id":buyer_id,"amount":price})
-        return self._public_order(order)
+                if winner and winner != oid:
+                    if winner in self.orders:
+                        self.purchase_idem[scope_key] = winner
+                        self._save_kv()
+                        return self._public_order(self._get_order(winner))
+                    # Lost the race to a claim whose order never materialized
+                    # (only possible cross-process with a crash mid-flight).
+                    # Fail loudly and retryably rather than forking escrow.
+                    raise ValueError("purchase_in_progress_retry")
+                reserved=True
+            try:
+                now=datetime.now(timezone.utc).isoformat()
+                self.ledger.transfer(buyer_id, f"escrow:{oid}", price,
+                                     kind="escrow_hold", idem=f"escrow-hold:{oid}")
+                self._sync_balance(buyer_id)
+                order={"id":oid,"service_id":service_id,"service_name":svc["name"],
+                       "provider_id":svc["provider_id"],"buyer_id":buyer_id,
+                       "amount":price,"status":"awaiting_delivery",
+                       "created_at":now,"deliver_by":(datetime.now(timezone.utc)+timedelta(hours=svc.get("delivery_hours",DEFAULT_DELIVERY_HOURS))).isoformat(),
+                       "overdue_notified":False,
+                       "delivery":None,"delivered_at":None,
+                       "completed_at":None,"dispute_reason":None,"resolution":None,"resolve_by":None,
+                       "rating":None}
+                self.orders[oid]=order
+                self._save_order(order); self._save_kv()
+            except Exception:
+                if reserved:
+                    # The transfer or persist failed: release the reservation
+                    # so a retry can claim the key instead of hitting a
+                    # poisoned mapping with no backing order.
+                    self.store.idem_release("purchase", scope_key)
+                raise
+            if scope_key:
+                self.purchase_idem[scope_key]=oid
+                self._save_kv()
+            self._notify(svc["provider_id"],
+                {"type":"order_received","order_id":oid,"service_id":service_id,
+                 "buyer_id":buyer_id,"amount":price,
+                 "body":f"New order {oid}: deliver via POST /world/orders/{oid}/deliver, then the buyer confirms release."})
+            self.audit.append("order.created", {"order_id":oid,"service_id":service_id,
+                                                "buyer_id":buyer_id,"amount":price})
+            return self._public_order(order)
 
     def _public_order(self, order):
         d=dict(order)
