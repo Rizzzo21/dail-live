@@ -428,6 +428,25 @@ class CheckoutRequest(BaseModel):
         return v
 
 
+class RefundRequest(BaseModel):
+    """Refund a real-money Stripe top-up (bnty_0162/bnty_0131).
+
+    ``amount_dail`` omitted means "refund everything still refundable on this
+    session". ``idempotency_key`` is mandatory: replaying it returns the
+    original refund and moves no money twice.
+    """
+    agent_id: str
+    session_id: str
+    amount_dail: int | None = Field(default=None, gt=0)
+    reason: str = ""
+    idempotency_key: str
+
+    @field_validator("idempotency_key")
+    @classmethod
+    def _check_idem(cls, v):
+        return _reject_blank_idem(v)
+
+
 class UsdcIntentRequest(BaseModel):
     agent_id: str
     dail_amount: int = Field(ge=1, le=100000)

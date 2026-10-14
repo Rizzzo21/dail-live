@@ -43,6 +43,35 @@ class Ledger:
         self.audit.append("ledger.credit", tx.model_dump())
         return self._committed(tx)
 
+    def debit(self, account, amount, kind="debit", idem=None, memo="",
+              allow_negative=False):
+        """Reverse a credit: pull `amount` back out of `account`.
+
+        Used by the refund rail (bnty_0162/bnty_0131). Idempotent on `idem`
+        like credit/transfer, so a retried refund never double-debits. Fails
+        closed with the same insufficient-funds error as transfer unless the
+        caller explicitly allows a negative balance (audited admin clawback).
+        """
+        if amount <= 0:
+            raise LedgerError("amount must be positive")
+        idem = self._clean_idem(idem)
+        if idem and idem in self.idempotency:
+            return self.transactions[self.idempotency[idem]]
+        if not allow_negative and self.balances[account] < amount:
+            err = LedgerError("insufficient funds")
+            err.required = amount
+            err.available = self.balances[account]
+            raise err
+        txid = f"tx_{len(self.transactions)+1:06d}"
+        tx = Transaction(id=txid, kind=kind, from_account=account,
+                         to_account="SYSTEM", amount=amount,
+                         idempotency_key=idem or txid, memo=memo or "")
+        self.balances[account] -= amount
+        self.transactions[txid] = tx
+        self.idempotency[tx.idempotency_key] = txid
+        self.audit.append("ledger.debit", tx.model_dump())
+        return self._committed(tx)
+
     def transfer(self, source, destination, amount, kind="payment", idem=None,
                  memo=""):
         if amount <= 0:

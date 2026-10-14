@@ -83,23 +83,73 @@ class ProductionPayments:
         return {"provider": "stripe", "mode": self.mode, "production_enabled": self.enabled, "production_ready": self.ready, "live_ready": self.live_ready, "real_money": self.live_ready, "persistent_database_configured": bool(self.database_url), "dail_per_usd": self.dail_per_usd}
 
     def _init_db(self):
-        # CREATE and the migration ALTER run in separate transactions: on
-        # PostgreSQL a failed statement aborts the whole transaction, so a
-        # duplicate-column error from the migration must never be able to
-        # roll back the table creation.
+        """CREATE and the migration ALTER run in separate transactions: on
+        PostgreSQL a failed statement aborts the whole transaction, so a
+        duplicate-column error from the migration must never be able to
+        roll back the table creation.
+        """
         with self.engine.begin() as c:
             c.execute(text("""CREATE TABLE IF NOT EXISTS dail_payments (
                 id VARCHAR(255) PRIMARY KEY, agent_id VARCHAR(255) NOT NULL,
                 session_id VARCHAR(255) UNIQUE NOT NULL, usd_cents INTEGER NOT NULL,
                 dail_amount INTEGER NOT NULL, status VARCHAR(32) NOT NULL,
                 created_at VARCHAR(64) NOT NULL, paid_at VARCHAR(64),
-                transaction_id VARCHAR(255)
+                transaction_id VARCHAR(255), payment_intent VARCHAR(255)
             )"""))
+        # Webhook delivery bookkeeping (bnty_0163). Two tables:
+        #   dail_webhook_events   — one row per processed Stripe event id, so a
+        #                           replayed event (same id) is a no-op even if
+        #                           it arrives with a different type/shape.
+        #   dail_webhook_deferred — a charge.refunded that arrived BEFORE the
+        #                           checkout.session.completed that pays the
+        #                           session. The refund cannot be applied yet
+        #                           (no paid payment row), so it is parked here
+        #                           and drained the moment the credit lands.
+        #                           Otherwise the agent keeps DAIL for a charge
+        #                           Stripe already refunded.
+        with self.engine.begin() as c:
+            c.execute(text("""CREATE TABLE IF NOT EXISTS dail_webhook_events (
+                event_id VARCHAR(255) PRIMARY KEY,
+                event_type VARCHAR(64),
+                received_at VARCHAR(64) NOT NULL
+            )"""))
+        with self.engine.begin() as c:
+            c.execute(text("""CREATE TABLE IF NOT EXISTS dail_webhook_deferred (
+                payment_intent VARCHAR(255) PRIMARY KEY,
+                amount_refunded_cents INTEGER NOT NULL,
+                created_at VARCHAR(64) NOT NULL
+            )"""))
+        # Migrations for databases created before a column landed. SQLite does
+        # not support "ADD COLUMN IF NOT EXISTS", so probe the column list and
+        # add only what is missing (idempotent on both SQLite and Postgres).
+        self._ensure_columns("dail_payments",
+                             {"transaction_id": "VARCHAR(255)",
+                              "payment_intent": "VARCHAR(255)"})
+
+    def _ensure_columns(self, table, columns):
+        if not self.engine:
+            return
         try:
             with self.engine.begin() as c:
-                c.execute(text("ALTER TABLE dail_payments ADD COLUMN IF NOT EXISTS transaction_id VARCHAR(255)"))
+                existing = {row[1] for row in
+                            c.execute(text(f"PRAGMA table_info({table})")).fetchall()}
         except Exception:
-            pass
+            existing = None
+        if existing is not None:  # SQLite path
+            for col, ddl in columns.items():
+                if col not in existing:
+                    try:
+                        with self.engine.begin() as c:
+                            c.execute(text(f"ALTER TABLE {table} ADD COLUMN {col} {ddl}"))
+                    except Exception:
+                        pass
+            return
+        for col, ddl in columns.items():  # Postgres path
+            try:
+                with self.engine.begin() as c:
+                    c.execute(text(f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS {col} {ddl}"))
+            except Exception:
+                pass
 
     def list_payments(self, limit=100):
         """Admin reconciliation view: newest payments first. Returns [] when
@@ -132,6 +182,85 @@ class ProductionPayments:
     def _record(row):
         return {"session_id": row[2], "agent_id": row[1], "usd_cents": row[3],
                 "dail_amount": row[4], "status": row[5], "transaction_id": row[8]}
+
+    def get_payment(self, session_id):
+        """Full payment record for a checkout session, or None.
+
+        The refund rail (bnty_0162/bnty_0131) reads ``agent_id``,
+        ``dail_amount``, ``status`` and the payment_intent off this record.
+        Returns None when the rail is not configured or the session is
+        unknown, so callers get a clean 404 instead of an AttributeError.
+        """
+        if not self.engine:
+            return None
+        self._init_db()
+        row = self._get(session_id)
+        if not row:
+            return None
+        rec = self._record(row)
+        rec["id"] = row[0]
+        rec["paid_at"] = row[7]
+        rec["payment_intent"] = self.payment_intent_for(session_id)
+        return rec
+
+    def payment_intent_for(self, session_id):
+        """The Stripe payment_intent behind a paid session, or None.
+
+        The checkout webhook stores the session id, not the intent; the intent
+        is what ``stripe.Refund.create`` needs. Recorded at webhook time when
+        Stripe supplies it, otherwise recovered from the live Stripe API.
+        """
+        if not self.engine:
+            return None
+        try:
+            with self.engine.begin() as c:
+                v = c.execute(text("SELECT payment_intent FROM dail_payments "
+                                   "WHERE session_id=:sid"), {"sid": session_id}).scalar()
+        except Exception:
+            v = None
+        if v:
+            return v
+        if stripe is None or not self.stripe_secret:
+            return None
+        try:
+            s = stripe.checkout.Session.retrieve(session_id)
+            pi = getattr(s, "payment_intent", None) or (
+                s.get("payment_intent") if isinstance(s, dict) else None)
+            if pi:
+                self.record_payment_intent(session_id, pi)
+            return pi
+        except Exception:
+            return None
+
+    def record_payment_intent(self, session_id, payment_intent):
+        """Persist the payment_intent for a session so refunds are offline-safe."""
+        if not self.engine or not payment_intent:
+            return
+        try:
+            with self.engine.begin() as c:
+                c.execute(text("UPDATE dail_payments SET payment_intent=:pi "
+                               "WHERE session_id=:sid"),
+                          {"pi": payment_intent, "sid": session_id})
+        except Exception:
+            pass
+
+    def get_payment_by_intent(self, payment_intent):
+        """Payment record for a Stripe payment_intent (webhook reconciliation)."""
+        if not self.engine or not payment_intent:
+            return None
+        self._init_db()
+        with self.engine.begin() as c:
+            row = c.execute(text(
+                "SELECT id, agent_id, session_id, usd_cents, dail_amount, status,"
+                " created_at, paid_at, transaction_id FROM dail_payments"
+                " WHERE payment_intent=:pi ORDER BY created_at DESC LIMIT 1"),
+                {"pi": payment_intent}).fetchone()
+        if not row:
+            return None
+        rec = self._record(row)
+        rec["id"] = row[0]
+        rec["payment_intent"] = payment_intent
+        return rec
 
     def create_checkout(self, agent_id, usd_cents, success_url, cancel_url, idempotency_key=None):
         return self._create_checkout_for(agent_id, usd_cents, success_url,
@@ -199,6 +328,67 @@ class ProductionPayments:
         result["checkout_url"] = session.url
         return result
 
+    def _event_seen(self, event_id):
+        """Record a Stripe event id; True if this id was already processed.
+
+        A single INSERT with a PRIMARY KEY does the dedup atomically: the
+        loser of a concurrent race gets IntegrityError and is treated as a
+        duplicate. Events without an id (test fixtures, older payloads) are
+        never deduped here — the session/intent-keyed idempotency below still
+        protects the money movement.
+        """
+        if not event_id:
+            return False
+        try:
+            with self.engine.begin() as c:
+                c.execute(text("INSERT INTO dail_webhook_events "
+                               "(event_id, event_type, received_at) "
+                               "VALUES (:e,:t,:n)"),
+                          {"e": event_id, "t": None, "n": _now()})
+            return False
+        except IntegrityError:
+            return True
+
+    def _defer_refund(self, payment_intent, amount_refunded_cents):
+        """Park a charge.refunded that arrived before its payment was credited.
+
+        Keeps the highest cumulative amount_refunded seen for the intent so a
+        later replay cannot lower the parked total (out-of-order partials).
+        """
+        if not payment_intent:
+            return
+        with self.engine.begin() as c:
+            c.execute(text(
+                "INSERT INTO dail_webhook_deferred "
+                "(payment_intent, amount_refunded_cents, created_at) "
+                "VALUES (:pi,:amt,:n) "
+                "ON CONFLICT(payment_intent) DO UPDATE SET "
+                "amount_refunded_cents=MAX(dail_webhook_deferred.amount_refunded_cents, "
+                "excluded.amount_refunded_cents)"),
+                {"pi": payment_intent, "amt": int(amount_refunded_cents or 0),
+                 "n": _now()})
+
+    def _drain_deferred_refund(self, payment_intent):
+        """Apply (once) a parked refund now that the payment is credited."""
+        if not payment_intent:
+            return None
+        with self.engine.begin() as c:
+            row = c.execute(text("SELECT amount_refunded_cents FROM "
+                                 "dail_webhook_deferred WHERE payment_intent=:pi"),
+                            {"pi": payment_intent}).fetchone()
+        if not row:
+            return None
+        rail = getattr(self.dail, "refunds", None)
+        if rail is None:
+            return None
+        res = rail.reconcile_charge_refunded(payment_intent, int(row[0]))
+        if res.get("reconciled") or res.get("reason") != "unknown_payment_intent":
+            # Applied, or already applied: drop the parked row.
+            with self.engine.begin() as c:
+                c.execute(text("DELETE FROM dail_webhook_deferred "
+                               "WHERE payment_intent=:pi"), {"pi": payment_intent})
+        return res
+
     def webhook(self, payload, signature):
         self._require_ready()
         self._init_db()  # self-healing: ensure the payments table exists
@@ -207,12 +397,26 @@ class ProductionPayments:
         except Exception as e:
             raise ValueError(f"invalid webhook: {e}")
         etype = event["type"]
+        # Event-id dedup (bnty_0163): a replayed event is a no-op. Only after
+        # this check do we look at the type, so a duplicate of any event type
+        # is cheap and side-effect free.
+        eid = event.get("id") if isinstance(event, dict) else None
+        if self._event_seen(eid):
+            return {"received": True, "handled": True, "duplicate": True,
+                    "event": etype, "event_id": eid, "reason": "event_replayed"}
         if etype in EXPIRED_EVENTS:
             return self._handle_expired(event)
+        if etype in ("charge.refunded", "charge.refund.updated"):
+            return self._handle_charge_refunded(event)
         if etype not in PAID_EVENTS:
             return {"received": True, "handled": False, "event": etype}
         session = event["data"]["object"]
         sid = session["id"]
+        # Persist the payment_intent so the refund rail never has to call
+        # Stripe just to learn it (bnty_0162/bnty_0131).
+        pi = session.get("payment_intent") if isinstance(session, dict) else None
+        if pi:
+            self.record_payment_intent(sid, pi)
         with self._lock:
             row = self._get(sid)
             if not row:
@@ -256,6 +460,13 @@ class ProductionPayments:
             self.dail.audit.append("payment.stripe_verified",
                                    {"session_id": sid, "agent_id": agent_id,
                                     "amount_dail": dail_amount, "transaction": tx.id})
+            # Out-of-order healing (bnty_0163): if a charge.refunded for this
+            # payment_intent was parked because it arrived before this credit,
+            # apply it now so the DAIL does not stay credited for a refunded
+            # charge. Idempotent: the refund rail only reverses the not-yet
+            # reversed delta, and the parked row is dropped once applied.
+            if pi:
+                self._drain_deferred_refund(pi)
             if updated == 0:
                 # A concurrent delivery marked it paid first; our credit was
                 # deduplicated by the idempotency key, so nothing was lost.
@@ -282,6 +493,36 @@ class ProductionPayments:
             c.execute(text("UPDATE dail_payments SET status='expired' WHERE session_id=:sid AND status='pending'"),
                       {"sid": sid})
         return {"received": True, "handled": True, "event": "checkout.session.expired", "session_id": sid}
+
+    def _handle_charge_refunded(self, event):
+        """charge.refunded is the authoritative signal for a refund.
+
+        A refund issued from the Stripe dashboard never touches our endpoint;
+        this heals it by debiting the DAIL the refund reversed. Idempotent:
+        the rail only applies the not-yet-debited delta, keyed on the
+        payment_intent. Returns a handled=False shape when the charge is not
+        one of our payments (e.g. a charge created outside checkout).
+        """
+        obj = event["data"]["object"]
+        pi = obj.get("payment_intent") if isinstance(obj, dict) else None
+        amount_refunded = obj.get("amount_refunded", 0) if isinstance(obj, dict) else 0
+        rail = getattr(self.dail, "refunds", None)
+        if rail is None:
+            return {"received": True, "handled": False,
+                    "event": "charge.refunded", "reason": "refund_rail_absent"}
+        res = rail.reconcile_charge_refunded(pi, amount_refunded)
+        if not res.get("reconciled") and res.get("reason") == "unknown_payment_intent":
+            # Out-of-order delivery (bnty_0163): the refund arrived before the
+            # checkout.session.completed that pays the session. Park it so the
+            # credit path can apply it the moment the payment lands; dropping
+            # it would leave the agent holding DAIL for a refunded charge.
+            self._defer_refund(pi, amount_refunded)
+            return {"received": True, "handled": True, "event": "charge.refunded",
+                    "payment_intent": pi, "amount_refunded": amount_refunded,
+                    "deferred": True, "reason": "awaiting_payment_credit"}
+        return {"received": True, "handled": True, "event": "charge.refunded",
+                "payment_intent": pi, "amount_refunded": amount_refunded,
+                **res}
 
     def announce_to(self, agent_id):
         """Tell one agent the top-up rail exists and how to use it."""

@@ -26,6 +26,7 @@ from pathlib import Path
 from .models import (
     Agent, DepositRequest, PaymentRequest, ToolRequest, AgentCreateRequest, JobCreateRequest, JobBidRequest, JobAcceptRequest, JobCompleteRequest, JobReviewRequest, MissionCreateRequest, MissionClaimRequest, GovernanceProposalRequest, GovernanceVoteRequest, PresenceRequest, MemoryWriteRequest, EventSubscribeRequest,
     SafeReceiveRequest, SafeWithdrawRequest, IdentityUpdateRequest, RoomCreateRequest, RoomInviteRequest, RoomMessageRequest, AgentProfileRequest, ServiceCreateRequest, ServicePurchaseRequest, ServiceTrialRequest, TradeRequest, BulletinRequest, AgentDiscoverRequest, RuntimeStrategyRequest, RuntimeScheduleRequest, RuntimeMessageRequest, RuntimeWorkExecuteRequest, CheckoutRequest, UsdcIntentRequest, UsdcConfirmRequest,
+ RefundRequest,
     OrderDeliverRequest, OrderConfirmRequest, OrderDisputeRequest, OrderResolveRequest, ReferralReleaseRequest,
     SuggestionSubmitRequest, SuggestionReviewRequest, BountyRequestReviewRequest, AdminLobbyMessageRequest,
     BountyCreateRequest, BountyClaimRequest, BountyActionRequest, BountyEditRequest,
@@ -88,6 +89,12 @@ agent_runtime = AgentRuntime(dail)
 production_payments = ProductionPayments(dail)
 usdc_payments = UsdcPayments(dail)
 x402_payments = X402Payments(dail)
+# Refund rail (bnty_0162/bnty_0131): the missing counterpart to the Stripe
+# top-up path. Attached to `dail` so the payment webhook can reach it for
+# charge.refunded reconciliation.
+from .refunds import RefundRail, RefundError
+refunds = RefundRail(dail, production_payments)
+dail.refunds = refunds
 if production_payments.ready:
     # Fresh deploy with the rail configured: tell every agent it exists.
     production_payments.announce()
@@ -372,6 +379,85 @@ async def payment_webhook(request: Request):
         return production_payments.webhook(await request.body(), signature)
     except ValueError as e: raise HTTPException(400, str(e))
     except RuntimeError as e: raise HTTPException(503, str(e))
+
+def _refund_http(e: RefundError):
+    """Map a RefundError to its HTTP status, keeping the machine-readable code."""
+    status = {"unknown_session": 404, "unknown_refund": 404,
+              "not_owned": 403, "nothing_to_refund": 409,
+              "exceeds_refundable": 409,
+              "insufficient_unrefunded_balance": 409,
+              "not_pending": 409, "bad_amount": 422,
+              "refund_rail_not_ready": 503, "stripe_unavailable": 503,
+              "stripe_refund_failed": 502}.get(e.code, 400)
+    return _err(status, e.detail, e.code, **e.extra)
+
+
+@app.post("/payments/refund")
+def payment_refund(req: RefundRequest, request: Request):
+    """Refund a real-money Stripe top-up (bnty_0162/bnty_0131).
+
+    Agent-scoped: the caller must own ``agent_id``. The admin key is a
+    superuser and its presence is the approval gate — an admin request
+    executes immediately, an agent request is queued as ``pending_approval``
+    and no money moves until ``POST /admin/payments/refunds/{id}/approve``.
+    Idempotent on ``idempotency_key``: a replay returns the original refund.
+    """
+    _own(request, req.agent_id)
+    approved_by = "admin" if request.state.is_admin else None
+    try:
+        return refunds.request(req.agent_id, req.session_id,
+                               amount_dail=req.amount_dail, reason=req.reason,
+                               idempotency_key=req.idempotency_key,
+                               approved_by=approved_by)
+    except RefundError as e:
+        return _refund_http(e)
+
+
+@app.get("/payments/refunds")
+def payment_refunds_list(request: Request, agent_id: str | None = None,
+                         session_id: str | None = None):
+    """List refunds. Agents see only their own; admin sees all."""
+    if not request.state.is_admin:
+        if not agent_id or agent_id != request.state.caller:
+            return _err(403, "not_your_agent", "not_owned")
+    return {"refunds": refunds.list(agent_id=agent_id, session_id=session_id)}
+
+
+@app.post("/admin/payments/refunds/{refund_id}/approve")
+def admin_refund_approve(refund_id: str, request: Request):
+    """Admin approval gate: this is the only agent-path way money moves."""
+    _require_admin(request)
+    try:
+        return refunds.approve(refund_id, approved_by="admin")
+    except RefundError as e:
+        return _refund_http(e)
+
+
+@app.post("/admin/payments/refunds/{refund_id}/reject")
+def admin_refund_reject(refund_id: str, request: Request, reason: str = ""):
+    _require_admin(request)
+    try:
+        return refunds.reject(refund_id, reason=reason)
+    except RefundError as e:
+        return _refund_http(e)
+
+
+@app.post("/admin/payments/refunds/force")
+def admin_refund_force(req: RefundRequest, request: Request):
+    """Audited negative-balance clawback. Admin-only.
+
+    The one path allowed to push a balance negative (the agent spent the
+    DAIL before the refund landed). Every use is written to the audit log
+    with ``forced: true`` and the row is flagged, so repeat abuse is visible.
+    """
+    _require_admin(request)
+    try:
+        return refunds.request(req.agent_id, req.session_id,
+                               amount_dail=req.amount_dail, reason=req.reason,
+                               idempotency_key=req.idempotency_key,
+                               approved_by="admin", force=True)
+    except RefundError as e:
+        return _refund_http(e)
 
 @app.get("/payments/info")
 def payment_info():
