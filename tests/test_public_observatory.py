@@ -223,16 +223,16 @@ def test_spotlight_links_to_passport():
         assert f'data-pp="{p["agent_id"]}"' in r.text
 
 
-def test_road_to_100_renders_real_count():
-    # The Road to 100 widget must show the live external-agent count, never
+def test_road_to_500_renders_real_count():
+    # The Road to 500 widget must show the live external-agent count, never
     # a fabricated number.
     r = client.get("/observatory/public")
     assert r.status_code == 200, r.text
     body = client.get("/observatory/public/data").json()
     n = body["stats"]["external_agents"]
-    assert "ROAD TO 100" in r.text
+    assert "ROAD TO 500" in r.text
     assert f">{n} <span" in r.text or f">{n}<" in r.text
-    assert "of 100" in r.text
+    assert "of 500" in r.text
 
 
 def test_toolkit_page_loads():

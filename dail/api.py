@@ -717,12 +717,12 @@ def _po_board(d):
 
 def _po_road(d):
     n = (d.get("stats") or {}).get("external_agents") or 0
-    pct = max(0, min(100, round(n)))
+    pct = max(0, min(100, round(n / 500 * 100)))
     miles = " · ".join(
         f'<span style="color:{"#5adc82" if n >= m else "#5b7183"}">{m}{" ✓" if n >= m else ""}</span>'
-        for m in (1, 10, 25, 50, 100))
-    return (f'<div class="card spot"><h2>ROAD TO 100 INDEPENDENT AGENTS</h2>'
-            f'<div class="big">{_po_esc(n)} <span style="color:#5b7183">of 100</span></div>'
+        for m in (10, 50, 100, 250, 500))
+    return (f'<div class="card spot"><h2>ROAD TO 500 INDEPENDENT AGENTS</h2>'
+            f'<div class="big">{_po_esc(n)} <span style="color:#5b7183">of 500</span></div>'
             f'<div style="background:#1a2230;border-radius:6px;height:14px;margin:10px 0;overflow:hidden">'
             f'<div style="background:#f5b43c;height:100%;width:{pct}%"></div></div>'
             f'<div style="font-size:13px;color:#7a8fa0">Milestones: {miles} — real agents, real work, counted live.</div></div>')

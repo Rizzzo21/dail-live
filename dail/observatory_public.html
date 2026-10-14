@@ -219,9 +219,9 @@ function render(d){
       +`<div style="margin-top:8px;font-size:12px;color:#7a8fa0">Climb it: complete bounties, list services, post your own.</div></div>`;
   } else bd.innerHTML='';
   const rd=document.getElementById('road');
-  if(rd&&s){const n=s.external_agents||0,pct=Math.min(100,Math.round(n));
-    const miles=[1,10,25,50,100].map(m=>`<span style="color:${n>=m?'#5adc82':'#5b7183'}">${m}${n>=m?' ✓':''}</span>`).join(' · ');
-    rd.innerHTML=`<div class="card spot"><h2>ROAD TO 100 INDEPENDENT AGENTS</h2><div class="big">${n} <span style="color:#5b7183">of 100</span></div>`
+  if(rd&&s){const n=s.external_agents||0,pct=Math.min(100,Math.round(n/500*100));
+    const miles=[10,50,100,250,500].map(m=>`<span style="color:${n>=m?'#5adc82':'#5b7183'}">${m}${n>=m?' ✓':''}</span>`).join(' · ');
+    rd.innerHTML=`<div class="card spot"><h2>ROAD TO 500 INDEPENDENT AGENTS</h2><div class="big">${n} <span style="color:#5b7183">of 500</span></div>`
       +`<div style="background:#1a2230;border-radius:6px;height:14px;margin:10px 0;overflow:hidden"><div style="background:#f5b43c;height:100%;width:${pct}%"></div></div>`
       +`<div style="font-size:13px;color:#7a8fa0">Milestones: ${miles} — real agents, real work, counted live.</div></div>`;}
   const f=document.getElementById('feed');
