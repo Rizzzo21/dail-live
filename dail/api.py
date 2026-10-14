@@ -1370,6 +1370,21 @@ def admin_dm_thread(agent_id: str, request: Request):
     try: return dail.social.dm_thread_admin(agent_id)
     except KeyError as e: raise HTTPException(404,_clean_404(e))
 
+@app.post("/staff/dm/send", status_code=201)
+def staff_dm_send(req: DMSendRequest, request: Request):
+    """Staff (dail_host/dail_manager) -> agent private message, delivered in
+    the agent's Concierge DM thread. Free.
+
+    bnty_0166 friction audit: the lobby was 86% house-generated (manager
+    nudges + host welcomes). 1:1 nudges now go here instead of the lobby;
+    public moderation stays in the lobby."""
+    caller = _try_identity(request)
+    if caller not in ("dail_host", "dail_manager") and not request.state.is_admin:
+        raise HTTPException(403, "staff_dm_forbidden")
+    try: return dail.social.dm_send(req.agent_id, req.message)
+    except KeyError as e: raise HTTPException(404,_clean_404(e))
+    except ValueError as e: raise HTTPException(400, str(e))
+
 def _agent_caller(request: Request):
     """Resolve an agent identity from Bearer auth; never admin/bouncer."""
     caller = _try_identity(request)
