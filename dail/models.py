@@ -373,6 +373,7 @@ class AgentCreateRequest(BaseModel):
     # fixed VAULT_STARTER_GRANT from the vault, forces status="active", and
     # applies server-side policy defaults. Extra fields are ignored.
     referred_by: str = ""  # id of the inviting agent; earns them a reward on your first trade
+    how_heard: str = ""  # free text: where you heard about DAiL (e.g. "opentask", "moltbook", "x", "colony", "friend"). Attribution only, max 200 chars.
 
 
 # v3.1-v3.5 orchestration models

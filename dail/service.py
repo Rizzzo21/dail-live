@@ -218,6 +218,7 @@ class Dail:
         self.world_agents.bulletin_seq = kv.get("bulletin_seq", 0)
         self.world_agents.service_seq = kv.get("service_seq", 0)
         self.world_agents.referrals = kv.get("referrals", {})
+        self.world_agents.how_heard = kv.get("how_heard", {})
         self.world_agents.reg_ips = kv.get("reg_ips", {})
         self.world_agents.agent_ips = kv.get("agent_ips", {})
         self.world_agents.agent_created = kv.get("agent_created", {})
@@ -1297,6 +1298,9 @@ class AgentWorld:
         self.orders={}
         self.order_seq=0
         self.referrals={}
+        # Attribution: free-text "how did you hear about us" per agent id
+        # (2026-10-13). Persisted in dail_kv; read at GET /admin/attribution.
+        self.how_heard={}
         # Anti-farming: registration IP log (ip -> [epoch seconds]) plus
         # per-agent registration IP and timestamp. Used for the registration
         # rate limit and for wash-trade detection on referral rewards.
@@ -1373,6 +1377,7 @@ class AgentWorld:
             self.store.kv_set("bulletin_seq", self.bulletin_seq)
             self.store.kv_set("service_seq", self.service_seq)
             self.store.kv_set("referrals", self.referrals)
+            self.store.kv_set("how_heard", self.how_heard)
             self.store.kv_set("reg_ips", self.reg_ips)
             self.store.kv_set("agent_ips", self.agent_ips)
             self.store.kv_set("agent_created", self.agent_created)
@@ -1940,6 +1945,25 @@ class AgentWorld:
         self._save_kv()
         self.audit.append("referral.registered", {"new":new_id,"referrer":referrer_id})
         return True
+
+    def record_how_heard(self, agent_id, value):
+        """Store free-text attribution ('how did you hear about us').
+
+        Attribution only — never affects grants, limits, or rewards.
+        Capped at 200 chars; blank values are ignored (not stored)."""
+        value=(value or "").strip()[:200]
+        if not value: return False
+        self.how_heard[agent_id]=value
+        self._save_kv()
+        self.audit.append("agent.how_heard", {"agent":agent_id,"value":value})
+        return True
+
+    def attribution_summary(self):
+        """Counts per normalized how-heard value + total answered. Admin-only."""
+        from collections import Counter
+        counts=Counter(v.strip().lower() for v in self.how_heard.values() if v and v.strip())
+        return {"total_answered": len(self.how_heard),
+                "by_source": dict(counts.most_common())}
 
     # ---- Registration faucet guard --------------------------------------
     def _prune_reg_ips(self, now_ts):
