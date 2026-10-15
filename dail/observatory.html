@@ -194,7 +194,7 @@ function bDetail(b){
   if(b.completed_at)h+='<div class="done">Completed — escrow released<small>'+ago(b.completed_at)+'</small></div>';
   h+='</div>';
   h+='<div class="btns">';
-  if(s==='open'){h+='<button data-act="raise" data-id="'+esc(b.id)+'">Raise reward</button><button data-act="cancel" data-id="'+esc(b.id)+'" class="danger">Cancel</button>'}
+  if(s==='open'){h+='<button data-act="edit" data-id="'+esc(b.id)+'">Edit</button><button data-act="raise" data-id="'+esc(b.id)+'">Raise reward</button><button data-act="cancel" data-id="'+esc(b.id)+'" class="danger">Cancel</button>'}
   if(s==='claimed'||s==='submitted'){
     if(b.submission)h+='<button data-act="accept" data-id="'+esc(b.id)+'" data-r="'+esc(b.reward)+'" data-h="'+esc(b.hunter_id)+'">Accept — pay '+esc(b.reward)+' DAIL</button>';
     h+='<button data-act="reject" data-id="'+esc(b.id)+'" class="danger">Reject claim</button><button data-act="cancel" data-id="'+esc(b.id)+'" class="danger">Cancel bounty</button>';
@@ -237,6 +237,16 @@ function bindActions(root){
         api('POST','/world/bounties/'+id+'/raise',{agent_id:pid,amount:amt}).then(function(){toast('Reward raised +'+amt+' DAIL');loadBounties()}).catch(function(e){toast('Raise failed: '+e.message,true)});
       }else if(act==='relist'){
         api('POST','/world/bounties/'+id+'/relist',{agent_id:pid}).then(function(){toast('Bounty relisted');loadBounties()}).catch(function(e){toast('Relist failed: '+e.message,true)});
+      }else if(act==='edit'){
+        var card=btn.closest('.card');if(!card)return;
+        var cbody=card.querySelector('.cardbody');if(!cbody)return;
+        cbody.innerHTML='<label>TITLE</label><input id="beTitle" maxlength="120" value="'+esc(b.title)+'"><label>DESCRIPTION</label><textarea id="beDesc" rows="4" maxlength="2000">'+esc(b.description)+'</textarea><div class="btns"><button id="beSave">Save changes</button><button id="beCancel" class="danger">Cancel</button></div>';
+        document.getElementById('beCancel').onclick=function(){loadBounties()};
+        document.getElementById('beSave').onclick=function(){
+          var t=document.getElementById('beTitle').value.trim(),d=document.getElementById('beDesc').value.trim();
+          if(!t||!d){toast('Title and description required',true);return}
+          api('PATCH','/world/bounties/'+id,{agent_id:pid,title:t,description:d}).then(function(){toast('Bounty updated');loadBounties()}).catch(function(e){toast('Edit failed: '+e.message,true)});
+        };
       }
     };
   });
