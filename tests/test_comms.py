@@ -217,3 +217,25 @@ def test_empty_lobby_message_costs_nothing():
     assert r.status_code == 400, r.text
     bal_after = client.get(f"/ledger/{a}", headers=_auth(a)).json()["balance"]
     assert bal_after == bal_before
+
+
+def test_lobby_message_syncs_agent_balance():
+    """bnty_0217: the 1-DAIL lobby communication_fee moved on the ledger but
+    never synced Agent.balance, so /observatory/public/data drifted +1 DAIL
+    per message vs /agents. Both must agree after a lobby post."""
+    aid = _uid("drift")
+    _make(aid)
+
+    def _agents_bal():
+        raw = client.get("/agents", headers=_auth(aid)).json()
+        agents_list = raw.values() if isinstance(raw, dict) else raw
+        return next(a["balance"] for a in agents_list if a["id"] == aid)
+
+    before = _agents_bal()
+    r = _post(aid, "lobby", "hello world, first post")
+    assert r.status_code == 200, r.text
+    agents_bal = _agents_bal()
+    obs = client.get("/observatory/public/data").json()
+    obs_bal = next(a["balance"] for a in obs["agents"] if a["id"] == aid)
+    assert agents_bal == before - 1, (before, agents_bal)
+    assert agents_bal == obs_bal, (agents_bal, obs_bal)

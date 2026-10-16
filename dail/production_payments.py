@@ -20,7 +20,7 @@ Safety properties:
 - Stripe idempotency keys are supported so client retries never create
   duplicate checkout sessions.
 """
-import os, threading
+import os, threading, hashlib
 from datetime import datetime, timezone
 from sqlalchemy import create_engine, text
 from sqlalchemy.exc import IntegrityError
@@ -37,6 +37,22 @@ MAX_PENDING_PER_AGENT = 25
 
 class PaymentRateLimited(Exception):
     """Too many pending checkout sessions for this agent."""
+    pass
+
+
+class PaymentIdempotencyConflict(Exception):
+    """A Stripe idempotency key was replayed with different parameters.
+
+    Surfaces as HTTP 409, not a 500 leaking Stripe internals (bnty_0227).
+    """
+    pass
+
+
+class PaymentBadAmount(Exception):
+    """A checkout amount failed validation (e.g. not a multiple of 100 cents).
+
+    Surfaces as HTTP 422 (bnty_0227).
+    """
     pass
 
 
@@ -285,6 +301,12 @@ class ProductionPayments:
             raise KeyError("agent not found")
         if usd_cents < 100 or usd_cents > 1000000:
             raise ValueError("amount must be between $1 and $10,000")
+        # bnty_0227 finding 2: DAIL is integer-only (1 DAIL = 100 cents).
+        # Accepting e.g. 199 cents credited 1 DAIL and stranded 99 cents in
+        # Stripe — the refund rail can only move whole DAIL.
+        if usd_cents % 100 != 0:
+            raise PaymentBadAmount(
+                "usd_cents must be a multiple of 100 (1 DAIL = 100 cents)")
         dail_amount = (usd_cents * self.dail_per_usd) // 100
         if dail_amount <= 0:
             raise ValueError("amount produces zero DAIL")
@@ -293,6 +315,14 @@ class ProductionPayments:
         if idempotency_key is not None:
             idempotency_key = self.dail.world_agents._require_idem(
                 idempotency_key, where="stripe checkout")
+            # bnty_0227 finding 1: scope the key to (account, operation)
+            # before it reaches Stripe. Stripe idempotency keys are global
+            # per merchant account — forwarding the raw caller string let
+            # one agent's key collide with another's (or across checkout vs
+            # refund), surfacing Stripe's IdempotencyError as a 500.
+            idempotency_key = "dail:" + hashlib.sha256(
+                f"{account_id}:checkout:{idempotency_key}".encode()
+            ).hexdigest()[:48]
         with self.engine.begin() as c:
             pending = c.execute(
                 text("SELECT COUNT(*) FROM dail_payments WHERE agent_id=:a AND status='pending'"),
@@ -309,7 +339,19 @@ class ProductionPayments:
             success_url=success_url, cancel_url=cancel_url,
             metadata={"agent_id": account_id, "dail_amount": str(dail_amount)})
         if idempotency_key:
-            session = stripe.checkout.Session.create(idempotency_key=idempotency_key, **create_kwargs)
+            try:
+                session = stripe.checkout.Session.create(idempotency_key=idempotency_key, **create_kwargs)
+            except Exception as e:
+                # bnty_0227 finding 1: a replayed key with different
+                # parameters must be a 409 Conflict, not a 500 leaking
+                # Stripe's internal request id. (Checked by class name so
+                # this holds across stripe SDK major versions.)
+                if type(e).__name__ == "IdempotencyError":
+                    raise PaymentIdempotencyConflict(
+                        "idempotency_key was already used with different "
+                        "parameters: replay the original request or use a "
+                        "new key")
+                raise
         else:
             session = stripe.checkout.Session.create(**create_kwargs)
         try:

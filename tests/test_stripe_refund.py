@@ -427,3 +427,101 @@ def test_refund_route_is_in_the_openapi_contract(client):
     assert "/payments/refund" in spec["paths"], "refund route missing from openapi"
     assert "/payments/refunds" in spec["paths"]
     assert "/admin/payments/refunds/{refund_id}/approve" in spec["paths"]
+
+
+# ------------------------------------------------- bnty_0227 regression tests
+def test_checkout_rejects_non_multiple_of_100_cents(client):
+    """bnty_0227 finding 2: usd_cents=199 used to credit 1 DAIL and strand
+    99 cents in Stripe (the refund rail only moves whole DAIL). Now 422."""
+    key = _agent(client, "rf_cents")
+    body = {"agent_id": "rf_cents", "usd_cents": 199,
+            "success_url": "https://dail-3dci.onrender.com/launch?payment=success",
+            "cancel_url": "https://dail-3dci.onrender.com/launch?payment=cancelled"}
+    r = client.post("/payments/checkout", json=body, headers=_auth(key))
+    assert r.status_code == 422, r.text
+    assert "multiple of 100" in r.text
+    # Multiples of 100 still work.
+    body["usd_cents"] = 200
+    r = client.post("/payments/checkout", json=body, headers=_auth(key))
+    assert r.status_code == 200, r.text
+
+
+def test_idempotency_key_namespaced_per_agent(client):
+    """bnty_0227 finding 1: the raw caller key must never reach Stripe —
+    two agents using the same key get different Stripe keys, so one
+    agent's key cannot collide with another's."""
+    ka = _agent(client, "rf_idem_a")
+    kb = _agent(client, "rf_idem_b")
+    seen = []
+
+    orig_cm = _SessionAPI.__dict__["create"]  # the classmethod object
+    orig_fn = orig_cm.__func__  # underlying function for direct calls
+
+    @classmethod
+    def spy(cls, **kwargs):
+        seen.append(kwargs.get("idempotency_key"))
+        return orig_fn(cls, **kwargs)
+
+    _SessionAPI.create = spy
+    try:
+        for aid, key in (("rf_idem_a", ka), ("rf_idem_b", kb)):
+            body = {"agent_id": aid, "usd_cents": 100,
+                    "idempotency_key": "shared-key-0001",
+                    "success_url": "https://dail-3dci.onrender.com/launch?payment=success",
+                    "cancel_url": "https://dail-3dci.onrender.com/launch?payment=cancelled"}
+            r = client.post("/payments/checkout", json=body, headers=_auth(key))
+            assert r.status_code == 200, r.text
+    finally:
+        _SessionAPI.create = orig_cm
+    assert len(seen) == 2 and seen[0] and seen[1]
+    assert seen[0] != "shared-key-0001", "raw caller key reached Stripe"
+    assert seen[0] != seen[1], "cross-agent idempotency key collision"
+
+
+def test_stripe_idempotency_error_maps_to_409(client, monkeypatch):
+    """bnty_0227 finding 1: a replayed key with different parameters is a
+    409 Conflict — never a 500 leaking Stripe's internal request id."""
+    key = _agent(client, "rf_409")
+
+    class FakeIdempotencyError(Exception):
+        pass
+    FakeIdempotencyError.__name__ = "IdempotencyError"
+
+    def boom(**kwargs):
+        raise FakeIdempotencyError(
+            "Request req_test123: Keys for idempotent requests can only be "
+            "used with the same parameters they were first used with.")
+
+    monkeypatch.setattr(_SessionAPI, "create", classmethod(lambda cls, **kw: boom(**kw)))
+    body = {"agent_id": "rf_409", "usd_cents": 100,
+            "idempotency_key": "conflict-key-0001",
+            "success_url": "https://dail-3dci.onrender.com/launch?payment=success",
+            "cancel_url": "https://dail-3dci.onrender.com/launch?payment=cancelled"}
+    r = client.post("/payments/checkout", json=body, headers=_auth(key))
+    assert r.status_code == 409, r.text
+    assert "req_test123" not in r.text, "Stripe request id leaked"
+
+
+def test_refunds_list_defaults_to_caller(client):
+    """bnty_0227 finding 3: omitting agent_id defaults to the caller (the
+    OpenAPI contract marks it optional) instead of 403ing."""
+    key = _agent(client, "rf_def")
+    sid = _topup(client, "rf_def", key, 100)
+    _refund(client, "rf_def", key, sid, "rf-def-0001")
+    r = client.get("/payments/refunds", headers=_auth(key))
+    assert r.status_code == 200, r.text
+    assert any(x["session_id"] == sid for x in r.json()["refunds"])
+    # Explicit other-agent access still 403s with the legacy error strings.
+    nope = client.get("/payments/refunds?agent_id=rf_list", headers=_auth(key))
+    assert nope.status_code == 403 and "not_your_agent" in nope.text
+
+
+def test_stripe_webhook_alias_and_sanitized_400(client):
+    """bnty_0227 finding 4: /stripe/webhook routes to the same
+    signature-verified handler (no 401 trap), and a bad signature yields
+    a fixed 400 message instead of the raw Stripe SDK string."""
+    r = client.post("/stripe/webhook", content=b"{}",
+                    headers={"stripe-signature": "t=1,v1=deadbeef"})
+    assert r.status_code == 400, r.text
+    assert r.json()["detail"] == "invalid webhook signature"
+    assert "No signatures found" not in r.text

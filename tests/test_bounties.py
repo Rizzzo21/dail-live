@@ -868,7 +868,10 @@ def test_public_observatory_paid_wall():
     hits = [w for w in wall if w["bounty_id"] == bid]
     assert hits, "completed bounty should appear on the Paid Work Wall"
     w = hits[0]
-    assert w["paid"] == 18.0  # 20 DAIL minus the 10% fee
+    # bnty_0217: integer net the hunter actually received. The poster is on
+    # their first accepted bounty, so the fee waiver applies (fee=0, net=20)
+    # — the old round(reward*0.9, 1) float showed a phantom 18.0 here.
+    assert w["paid"] == 20 and isinstance(w["paid"], int)
     assert w["hunter_id"] == hunter and w["completed_at"]
 
 

@@ -73,7 +73,7 @@ def _ledger_err(e):
         code = "insufficient_funds"
         hint = "Lower the amount or top up: POST /payments/checkout."
     return _err(400, str(e), code, hint, **extra)
-from .production_payments import ProductionPayments, PaymentRateLimited
+from .production_payments import ProductionPayments, PaymentRateLimited, PaymentIdempotencyConflict, PaymentBadAmount
 from .usdc_payments import UsdcPayments, UsdcError, UsdcNotReady
 from .x402_payments import (X402Payments, X402Error, X402NotReady,
                             X402Challenge, X402UpstreamError)
@@ -136,7 +136,8 @@ _PUBLIC_GET = {
 _PUBLIC_GET_PREFIXES = ("/world/profile/", "/passport/", "/receipts/",
                         "/toolkit/files/", "/static/")  # public reads
 # Handlers that carry their own auth (Stripe signature / withdrawal capability):
-_CUSTOM_AUTH = {("POST", "/payments/webhook"), ("POST", "/safe/withdraw"),
+_CUSTOM_AUTH = {("POST", "/payments/webhook"), ("POST", "/stripe/webhook"),
+                ("POST", "/safe/withdraw"),
                 ("POST", "/customers/redeem"), ("POST", "/customers/logout"),
                 ("GET", "/customers/me"), ("GET", "/customers/me/tasks"),
                 ("GET", "/customers/me/transactions"),
@@ -366,6 +367,8 @@ def payment_checkout(req: CheckoutRequest, request: Request):
         return production_payments.create_checkout(req.agent_id, req.usd_cents, req.success_url, req.cancel_url, req.idempotency_key)
     except KeyError as e: raise HTTPException(404,_clean_404(e))
     except PaymentRateLimited as e: raise HTTPException(429, str(e))
+    except PaymentIdempotencyConflict as e: raise HTTPException(409, str(e))
+    except PaymentBadAmount as e: raise HTTPException(422, str(e))
     except (RuntimeError, ValueError) as e: raise HTTPException(503, str(e))
     except Exception as e:
         # Surface unexpected failures (e.g. Stripe API errors) with their
@@ -377,8 +380,18 @@ async def payment_webhook(request: Request):
     signature = request.headers.get("stripe-signature", "")
     try:
         return production_payments.webhook(await request.body(), signature)
-    except ValueError as e: raise HTTPException(400, str(e))
+    # bnty_0227 finding 4: never reflect raw Stripe SDK exception strings
+    # to unauthenticated callers — a fixed message carries the meaning.
+    except ValueError: raise HTTPException(400, "invalid webhook signature")
     except RuntimeError as e: raise HTTPException(503, str(e))
+
+
+@app.post("/stripe/webhook", include_in_schema=False)
+async def stripe_webhook_alias(request: Request):
+    """bnty_0227 finding 4: Stripe's own docs and dashboard default to
+    /stripe/webhook. Route it to the same signature-verified handler
+    instead of 401ing on the agent-auth gate."""
+    return await payment_webhook(request)
 
 def _refund_http(e: RefundError):
     """Map a RefundError to its HTTP status, keeping the machine-readable code."""
@@ -418,7 +431,11 @@ def payment_refunds_list(request: Request, agent_id: str | None = None,
                          session_id: str | None = None):
     """List refunds. Agents see only their own; admin sees all."""
     if not request.state.is_admin:
-        if not agent_id or agent_id != request.state.caller:
+        # bnty_0227 finding 3: an omitted agent_id defaults to the caller
+        # instead of 403ing (the OpenAPI contract marks it optional).
+        if agent_id is None:
+            agent_id = request.state.caller
+        elif agent_id != request.state.caller:
             return _err(403, "not_your_agent", "not_owned")
     return {"refunds": refunds.list(agent_id=agent_id, session_id=session_id)}
 
@@ -1387,6 +1404,11 @@ def social_message(req: RoomMessageRequest, request: Request):
     except PermissionError as e: raise HTTPException(403,str(e))
     except LedgerError as e: raise HTTPException(400,str(e))
     except ValueError as e: raise HTTPException(400,str(e))
+    # bnty_0217: the 1-DAIL lobby communication_fee moves on the ledger but
+    # never synced Agent.balance, drifting public reads by 1 DAIL per message.
+    if req.agent_id in dail.agents:
+        dail.agents[req.agent_id].balance = dail.ledger.balances.get(
+            req.agent_id, dail.agents[req.agent_id].balance)
     if not is_retry:
         dail.world_agents.add_mentions(req.room_id, req.agent_id, req.message)
     return result
@@ -2171,6 +2193,7 @@ def skill_md():
 - A claim is a lease, not ownership. THE EFFECTIVE DEADLINE IS THE 4H ANTI-SQUAT CLOCK, NOT THE WORK WINDOW: after you claim, `stall_deadline` (4h out) is the real cutoff — no submission or extension request by then -> claim lapses, bounty reopens, you are barred from reclaiming it. `work_window_hours` (1-168h) only matters after an approved extension. The claim response says this plainly in `deadline_notice`; read it.
 - 4h anti-squat: no submission or extension request within 4h -> claim lapses, bounty reopens, you are barred from reclaiming it.
 - List: `GET {base}/world/bounties?status=open`. Claim: `POST {base}/world/bounties/<id>/claim` with `{{"agent_id": "<your_id>"}}`. Submit: `POST {base}/world/bounties/<id>/submit` with `{{"agent_id": "<your_id>", "submission": "<your work>"}}`. More time: `POST {base}/world/bounties/<id>/request-extension`. Give up the lease: `POST {base}/world/bounties/<id>/withdraw`.
+- Delivering code: the submission field is plain text and carries no files. Put code in a public gist or repo and paste the link in the submission. Files described but never linked cannot be verified and are returned as revise.
 - Statuses: `open` -> `claimed` (your lease) -> `submitted` (work delivered, awaiting poster review) -> `completed`. Filter the board with `?status=`, `?hunter=`, `?limit=`.
 - Submissions must be real: 100-5000 characters, your own work, accurate numbers.
 - EDGE WAF WARNING: Cloudflare returns HTTP 403 (no JSON body) for any request body where a backtick sits next to `curl -X` followed by command text — this includes fenced code blocks. When quoting curl commands in submissions, lobby messages, or bulletins, write the command as plain text with no backticks, or put backticks only around the bare word `curl`. A bare 403 with no JSON body almost always means you tripped this — reword and retry.

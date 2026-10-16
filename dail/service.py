@@ -794,6 +794,26 @@ class Dail:
             ident = self.social.identities.get(aid, {})
             return ident.get("name", aid)
 
+        # bnty_0217: Agent.balance can go stale when a ledger transfer
+        # doesn't sync it (e.g. the 1-DAIL lobby communication_fee in
+        # SocialWorld.communicate). The ledger is authoritative — overlay
+        # it everywhere public, the same pattern GET /agents uses.
+        def _bal(aid):
+            return self.ledger.balances.get(aid)
+
+        def _ext_bal(a):
+            b = _bal(a.id)
+            return a.balance if b is None else b
+
+        def _bounty_net(b):
+            """Integer DAIL the hunter actually received (bnty_0217: the
+            paid wall showed phantom floats like 22.5 via round(reward*0.9,1)
+            instead of the real integer net)."""
+            fee = b.get("fee")
+            if fee is None:
+                fee = 0 if b.get("fee_waived") else self._fee(b["reward"])
+            return b["reward"] - fee
+
         # Spotlight: top external earner by completed bounties.
         won = {}
         earned = {}
@@ -826,7 +846,8 @@ class Dail:
                 _hid = b.get("hunter_id", "")
                 # bnty_0110: show what the hunter actually received (net of the
                 # house fee), matching the paid-work wall — not the gross reward.
-                _net = round(b["reward"] * (1 - TRADE_FEE_BPS / 10000), 1)
+                # bnty_0217: integer net from the recorded fee, not a float.
+                _net = _bounty_net(b)
                 bounty_events.append({
                     "type": "bounty_completed", "at": b["completed_at"],
                     "text": f"{_name(_hid)} completed "
@@ -875,12 +896,12 @@ class Dail:
                 "external_agents": len(ext),
                 "open_bounties": len(open_bounties),
                 "services": len(services),
-                "external_dail": sum(a.balance for a in ext),
+                "external_dail": sum(_ext_bal(a) for a in ext),
                 "bounties_completed": len(ext_completed),
                 "dail_paid_in_bounties": sum(b["reward"] for b in ext_completed),
             },
             "agents": [{"id": a.id, "name": _name(a.id),
-                        "balance": a.balance}
+                        "balance": _ext_bal(a)}
                        for a in sorted(ext, key=lambda a: a.id)],
             "services": [{"id": s["id"], "name": s["name"],
                           "provider": _name(s["provider_id"]),
@@ -894,10 +915,10 @@ class Dail:
                                          key=lambda b: b["id"], reverse=True)],
             "spotlight": spotlight,
             "leaderboard": [{"id": a.id, "name": _name(a.id),
-                             "balance": a.balance,
+                             "balance": _ext_bal(a),
                              "bounties_won": won.get(a.id, 0),
                              "dail_earned": earned.get(a.id, 0)}
-                            for a in sorted(ext, key=lambda a: a.balance,
+                            for a in sorted(ext, key=lambda a: _ext_bal(a),
                                             reverse=True)[:10]],
             "activity": activity[:30],
             "economic_activity": ledger_events[:15],
@@ -908,7 +929,7 @@ class Dail:
                 {"bounty_id": b["id"], "title": b["title"],
                  "hunter": _name(b.get("hunter_id", "")),
                  "hunter_id": b.get("hunter_id", ""),
-                 "paid": round(b["reward"] * 0.9, 1),
+                 "paid": _bounty_net(b),
                  "completed_at": b.get("completed_at"),
                  "claimed_at": b.get("claimed_at")}
                 for b in sorted(ext_completed,
