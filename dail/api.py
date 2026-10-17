@@ -73,7 +73,10 @@ def _ledger_err(e):
         code = "insufficient_funds"
         hint = "Lower the amount or top up: POST /payments/checkout."
     return _err(400, str(e), code, hint, **extra)
-from .production_payments import ProductionPayments, PaymentRateLimited, PaymentIdempotencyConflict, PaymentBadAmount
+from .production_payments import (
+    ProductionPayments, PaymentRateLimited, PaymentIdempotencyConflict,
+    PaymentBadAmount, PaymentCardDeclined, PaymentInvalidSession,
+    PaymentUpstreamOutage)
 from .usdc_payments import UsdcPayments, UsdcError, UsdcNotReady
 from .x402_payments import (X402Payments, X402Error, X402NotReady,
                             X402Challenge, X402UpstreamError)
@@ -366,14 +369,18 @@ def payment_checkout(req: CheckoutRequest, request: Request):
     try:
         return production_payments.create_checkout(req.agent_id, req.usd_cents, req.success_url, req.cancel_url, req.idempotency_key)
     except KeyError as e: raise HTTPException(404,_clean_404(e))
+    except PaymentCardDeclined as e: raise HTTPException(402, str(e))
+    except PaymentInvalidSession as e: raise HTTPException(400, str(e))
     except PaymentRateLimited as e: raise HTTPException(429, str(e))
     except PaymentIdempotencyConflict as e: raise HTTPException(409, str(e))
     except PaymentBadAmount as e: raise HTTPException(422, str(e))
+    except PaymentUpstreamOutage as e: raise HTTPException(502, str(e))
     except (RuntimeError, ValueError) as e: raise HTTPException(503, str(e))
-    except Exception as e:
-        # Surface unexpected failures (e.g. Stripe API errors) with their
-        # message so agents can tell a config problem from a bug.
-        raise HTTPException(500, f"{type(e).__name__}: {e}")
+    except Exception:
+        raise HTTPException(
+            502,
+            "payment provider temporarily unavailable: please wait a moment and "
+            "retry. Your card was not charged and your DAIL balance was not modified.")
 
 @app.post("/payments/webhook", include_in_schema=False)
 async def payment_webhook(request: Request):
@@ -2439,23 +2446,43 @@ def customer_checkout(req: dict, request: Request):
     """Customer self-serve top-up: creates a Stripe Checkout session.
     Returns {checkout_url} — the dashboard redirects the human there."""
     cid = _customer_session(request)
+    if not isinstance(req, dict):
+        raise HTTPException(400, "invalid request body")
+    raw_cents = req.get("usd_cents", 0)
+    if isinstance(raw_cents, bool):
+        raise HTTPException(400, "usd_cents must be an integer")
     try:
-        usd_cents = int(req.get("usd_cents", 0))
+        usd_cents = int(raw_cents)
     except (TypeError, ValueError):
         raise HTTPException(400, "usd_cents must be an integer")
+    raw_idem = req.get("idempotency_key")
+    idem_key = None if (raw_idem is None or raw_idem == "") else raw_idem
     base = str(request.base_url).rstrip("/")
     try:
         result = production_payments.create_customer_checkout(
             cid, usd_cents,
             success_url=f"{base}/dashboard?topup=success",
             cancel_url=f"{base}/dashboard?topup=cancelled",
-            idempotency_key=(req.get("idempotency_key") or None))
+            idempotency_key=idem_key)
     except KeyError as e:
         raise HTTPException(404,_clean_404(e))
-    except ValueError as e:
+    except PaymentCardDeclined as e:
+        raise HTTPException(402, str(e))
+    except (PaymentInvalidSession, PaymentBadAmount, ValueError) as e:
         raise HTTPException(400, str(e))
-    except Exception as e:
-        raise HTTPException(503, f"{type(e).__name__}: {e}")
+    except PaymentIdempotencyConflict as e:
+        raise HTTPException(409, str(e))
+    except PaymentRateLimited as e:
+        raise HTTPException(429, str(e))
+    except PaymentUpstreamOutage as e:
+        raise HTTPException(502, str(e))
+    except RuntimeError as e:
+        raise HTTPException(503, str(e))
+    except Exception:
+        raise HTTPException(
+            502,
+            "payment provider temporarily unavailable: please wait a moment and "
+            "retry. Your card was not charged and your DAIL balance was not modified.")
     return {"checkout_url": result["checkout_url"]}
 
 

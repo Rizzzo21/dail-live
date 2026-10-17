@@ -17,6 +17,7 @@ old in-memory version (tests).
 """
 import hashlib
 import secrets
+import threading
 from datetime import datetime, timezone, timedelta
 
 SESSION_TTL_HOURS = 72
@@ -28,6 +29,7 @@ class CustomerService:
         self.dail = dail
         self.ledger = dail.ledger
         self.store = getattr(dail, "store", None)
+        self._lock = threading.Lock()
         # customer_id -> {id, name, email, created_at, verified}
         self.customers = {}
         # invite_code -> {created_at, used_by, used_at}
@@ -76,32 +78,61 @@ class CustomerService:
         ]
 
     # --- Registration ---
+    def _mint_customer_id(self):
+        """Mint an unguessable, collision-resistant customer ID (bnty_0240).
+
+        Uses 64 bits of cryptographic entropy ('cust_' + 16 hex chars) and
+        checks against existing in-memory records (including grandfathered
+        sequential cust_NNNN IDs).
+        """
+        for _ in range(64):
+            cid = f"cust_{secrets.token_hex(8)}"
+            if cid not in self.customers:
+                return cid
+        raise RuntimeError("unable to mint unique customer id")
+
     def redeem_invite(self, code, name, email=""):
-        inv = self.invites.get(code)
-        if not inv:
-            raise KeyError("invalid invite code")
-        if inv["used_by"]:
-            raise ValueError("invite code already used")
-        self.seq += 1
-        cid = f"cust_{self.seq:04d}"
-        now = datetime.now(timezone.utc).isoformat()
-        self.customers[cid] = {
-            "id": cid,
-            "name": (name or "Customer").strip()[:60],
-            "email": (email or "").strip()[:120],
-            "created_at": now,
-            "verified": True,  # invite-only = pre-verified
-        }
-        inv["used_by"] = cid
-        inv["used_at"] = now
-        # Write the identity AND the invite's used-mark before issuing the
-        # session: a crash between them must never let the code be redeemed
-        # twice (which would fork two customers off one invite).
-        if self.store and self.store.enabled:
-            self.store.save_customer(self.customers[cid])
-            self.store.save_invite(code, inv)
-        # Shadow ledger account starts at 0 — customer funds via Stripe
-        return self._new_session(cid)
+        with self._lock:
+            inv = self.invites.get(code)
+            if not inv:
+                raise KeyError("invalid invite code")
+            if inv["used_by"]:
+                raise ValueError("invite code already used")
+            now = datetime.now(timezone.utc).isoformat()
+            clean_name = (name or "Customer").strip()[:60]
+            clean_email = (email or "").strip()[:120]
+            cid = None
+            for _ in range(64):
+                candidate = self._mint_customer_id()
+                rec = {
+                    "id": candidate,
+                    "name": clean_name,
+                    "email": clean_email,
+                    "created_at": now,
+                    "verified": True,  # invite-only = pre-verified
+                }
+                if self.store and self.store.enabled:
+                    insert_fn = getattr(self.store, "insert_customer", None)
+                    if callable(insert_fn):
+                        if not insert_fn(rec):
+                            continue
+                    else:
+                        self.store.save_customer(rec)
+                cid = candidate
+                self.customers[cid] = rec
+                break
+            if cid is None:
+                raise RuntimeError("unable to mint unique customer id")
+            self.seq += 1
+            inv["used_by"] = cid
+            inv["used_at"] = now
+            # Write the identity AND the invite's used-mark before issuing the
+            # session: a crash between them must never let the code be redeemed
+            # twice (which would fork two customers off one invite).
+            if self.store and self.store.enabled:
+                self.store.save_invite(code, inv)
+            # Shadow ledger account starts at 0 — customer funds via Stripe
+            return self._new_session(cid)
 
     def _new_session(self, customer_id):
         token = secrets.token_hex(32)

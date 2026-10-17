@@ -514,6 +514,25 @@ class WorldStore:
                  "verified": bool(customer.get("verified", True)),
                  "ca": customer.get("created_at") or _now()})
 
+    def insert_customer(self, customer):
+        """Insert a brand-new customer row without overwriting an existing ID (bnty_0240).
+
+        Returns True when the row was inserted (or when persistence is disabled),
+        and False if the customer ID already exists in dail_customers.
+        """
+        if not self.enabled:
+            return True
+        with self._lock, self.engine.begin() as c:
+            res = c.execute(text(
+                """INSERT INTO dail_customers (id, name, email, verified, created_at)
+                   VALUES (:id, :name, :email, :verified, :ca)
+                   ON CONFLICT (id) DO NOTHING"""),
+                {"id": customer["id"], "name": customer.get("name", ""),
+                 "email": customer.get("email", ""),
+                 "verified": bool(customer.get("verified", True)),
+                 "ca": customer.get("created_at") or _now()})
+            return res.rowcount == 1
+
     def load_customers(self):
         """All customers as {customer_id: record}. [] -> {} when off."""
         if not self.enabled:

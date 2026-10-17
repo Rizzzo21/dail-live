@@ -31,6 +31,7 @@ except ImportError:  # pragma: no cover
 
 PAID_EVENTS = ("checkout.session.completed", "checkout.session.async_payment_succeeded")
 EXPIRED_EVENTS = ("checkout.session.expired",)
+FAILED_EVENTS = ("checkout.session.async_payment_failed", "payment_intent.payment_failed")
 
 MAX_PENDING_PER_AGENT = 25
 
@@ -51,9 +52,69 @@ class PaymentIdempotencyConflict(Exception):
 class PaymentBadAmount(Exception):
     """A checkout amount failed validation (e.g. not a multiple of 100 cents).
 
-    Surfaces as HTTP 422 (bnty_0227).
+    Surfaces as HTTP 422 on /payments/checkout and HTTP 400 on /customers/me/checkout.
     """
     pass
+
+
+class PaymentCardDeclined(Exception):
+    """Card or payment method was declined by Stripe.
+
+    Surfaces as HTTP 402 with a plain, actionable message and zero ledger mutation (bnty_0241).
+    """
+    pass
+
+
+class PaymentInvalidSession(Exception):
+    """Checkout session or payment request parameters are expired or invalid.
+
+    Surfaces as HTTP 400 with a plain message (bnty_0241).
+    """
+    pass
+
+
+class PaymentUpstreamOutage(Exception):
+    """Stripe is unreachable, rate-limiting, or returning a 5xx/API error.
+
+    Surfaces as HTTP 502 with retry guidance and zero ledger mutation (bnty_0241).
+    """
+    pass
+
+
+def _raise_clean_checkout_error(e):
+    """Map any Stripe SDK or transport exception during checkout session
+    creation to a clean, sanitized domain exception with zero internal
+    request IDs or stack traces (bnty_0241).
+    """
+    if isinstance(e, (PaymentRateLimited, PaymentIdempotencyConflict,
+                      PaymentBadAmount, PaymentCardDeclined,
+                      PaymentInvalidSession, PaymentUpstreamOutage)):
+        raise e
+    ename = type(e).__name__
+    code = str(getattr(e, "code", "") or "").lower()
+    if ename == "IdempotencyError":
+        raise PaymentIdempotencyConflict(
+            "idempotency_key was already used with different "
+            "parameters: replay the original request or use a "
+            "new key")
+    if ename == "CardError" or code in (
+        "card_declined", "insufficient_funds", "expired_card",
+        "incorrect_cvc", "processing_error", "incorrect_number",
+    ):
+        raise PaymentCardDeclined(
+            "card declined: your card was not charged. Please check your card "
+            "details or try another payment method.")
+    if ename in ("InvalidRequestError", "InvalidSessionError") or code in (
+        "session_expired", "resource_missing", "url_invalid",
+        "parameter_invalid_empty", "parameter_invalid_integer",
+        "amount_too_small", "amount_too_large", "invalid_session",
+    ):
+        raise PaymentInvalidSession(
+            "invalid or expired checkout session: please start a new top-up "
+            "from your dashboard.")
+    raise PaymentUpstreamOutage(
+        "payment provider temporarily unavailable: please wait a moment and "
+        "retry. Your card was not charged and your DAIL balance was not modified.")
 
 
 def _now():
@@ -313,6 +374,8 @@ class ProductionPayments:
         # FIX 5: a client-supplied Stripe idempotency key must be
         # well-formed; blank keys are rejected, not silently dropped.
         if idempotency_key is not None:
+            if not isinstance(idempotency_key, str):
+                raise ValueError("idempotency_key must be a string")
             idempotency_key = self.dail.world_agents._require_idem(
                 idempotency_key, where="stripe checkout")
             # bnty_0227 finding 1: scope the key to (account, operation)
@@ -339,21 +402,17 @@ class ProductionPayments:
             success_url=success_url, cancel_url=cancel_url,
             metadata={"agent_id": account_id, "dail_amount": str(dail_amount)})
         if idempotency_key:
-            try:
-                session = stripe.checkout.Session.create(idempotency_key=idempotency_key, **create_kwargs)
-            except Exception as e:
-                # bnty_0227 finding 1: a replayed key with different
-                # parameters must be a 409 Conflict, not a 500 leaking
-                # Stripe's internal request id. (Checked by class name so
-                # this holds across stripe SDK major versions.)
-                if type(e).__name__ == "IdempotencyError":
-                    raise PaymentIdempotencyConflict(
-                        "idempotency_key was already used with different "
-                        "parameters: replay the original request or use a "
-                        "new key")
-                raise
-        else:
+            create_kwargs["idempotency_key"] = idempotency_key
+        try:
             session = stripe.checkout.Session.create(**create_kwargs)
+        except Exception as e:
+            _raise_clean_checkout_error(e)
+        if (getattr(session, "status", None) == "expired"
+                or not getattr(session, "id", None)
+                or not getattr(session, "url", None)):
+            raise PaymentInvalidSession(
+                "invalid or expired checkout session: please start a new top-up "
+                "from your dashboard.")
         try:
             with self.engine.begin() as c:
                 c.execute(text(
@@ -438,6 +497,8 @@ class ProductionPayments:
             event = stripe.Webhook.construct_event(payload, signature, self.webhook_secret)
         except Exception as e:
             raise ValueError(f"invalid webhook: {e}")
+        if not isinstance(event, dict) or not event.get("type"):
+            raise ValueError("invalid webhook: missing event type")
         etype = event["type"]
         # Event-id dedup (bnty_0163): a replayed event is a no-op. Only after
         # this check do we look at the type, so a duplicate of any event type
@@ -448,12 +509,17 @@ class ProductionPayments:
                     "event": etype, "event_id": eid, "reason": "event_replayed"}
         if etype in EXPIRED_EVENTS:
             return self._handle_expired(event)
+        if etype in FAILED_EVENTS:
+            return self._handle_failed(event)
         if etype in ("charge.refunded", "charge.refund.updated"):
             return self._handle_charge_refunded(event)
         if etype not in PAID_EVENTS:
             return {"received": True, "handled": False, "event": etype}
-        session = event["data"]["object"]
-        sid = session["id"]
+        try:
+            session = event["data"]["object"]
+            sid = session["id"]
+        except (KeyError, TypeError):
+            raise ValueError("invalid webhook: missing session id")
         # Persist the payment_intent so the refund rail never has to call
         # Stripe just to learn it (bnty_0162/bnty_0131).
         pi = session.get("payment_intent") if isinstance(session, dict) else None
@@ -530,11 +596,32 @@ class ProductionPayments:
                     "session_id": sid, "transaction_id": tx.id}
 
     def _handle_expired(self, event):
-        sid = event["data"]["object"]["id"]
+        try:
+            sid = event["data"]["object"]["id"]
+        except (KeyError, TypeError):
+            raise ValueError("invalid webhook: missing session id")
         with self.engine.begin() as c:
             c.execute(text("UPDATE dail_payments SET status='expired' WHERE session_id=:sid AND status='pending'"),
                       {"sid": sid})
         return {"received": True, "handled": True, "event": "checkout.session.expired", "session_id": sid}
+
+    def _handle_failed(self, event):
+        """Mark a pending payment failed without ever crediting DAIL (bnty_0241)."""
+        try:
+            obj = event["data"]["object"]
+            sid = obj.get("id") if isinstance(obj, dict) else None
+            pi = obj.get("payment_intent") if isinstance(obj, dict) else None
+        except (AttributeError, KeyError, TypeError):
+            raise ValueError("invalid webhook: malformed failed event")
+        with self.engine.begin() as c:
+            if sid:
+                c.execute(text("UPDATE dail_payments SET status='failed' WHERE session_id=:sid AND status='pending'"),
+                          {"sid": sid})
+            if pi:
+                c.execute(text("UPDATE dail_payments SET status='failed' WHERE payment_intent=:pi AND status='pending'"),
+                          {"pi": pi})
+        return {"received": True, "handled": True, "event": event.get("type"),
+                "session_id": sid, "credited": False}
 
     def _handle_charge_refunded(self, event):
         """charge.refunded is the authoritative signal for a refund.
