@@ -753,6 +753,58 @@ def test_release_claim_clears_settle_failed():
     assert wa.bounties[bid].get("settle_failed") is None
 
 
+def test_release_claim_bars_reclaim_like_lapse():
+    # release+reclaim must not reset the anti-squat clock (bnty_0243,
+    # 2026-10-17): a voluntary release records the hunter like the
+    # involuntary lapse path does.
+    from dail.api import dail as _d
+    wa = _d.world_agents
+    poster, hunter, sniper = _uid("p"), _uid("h"), _uid("s")
+    _make(poster); _make(hunter); _make(sniper)
+    bid = client.post("/world/bounties", json={
+        "agent_id": poster, "title": "t", "description": "d", "reward": 20},
+        headers=_auth(poster)).json()["id"]
+    r = client.post(f"/world/bounties/{bid}/claim", json={
+        "agent_id": hunter}, headers=_auth(hunter))
+    assert r.status_code == 200, r.text
+    r = client.post(f"/world/bounties/{bid}/release",
+                    json={"agent_id": hunter}, headers=_auth(hunter))
+    assert r.status_code == 200, r.text
+    b = wa.bounties[bid]
+    assert b["status"] == "open" and b.get("hunter_id") is None
+    assert hunter in b["lapsed_hunters"] and b["failed_claims"] == 1
+    # releaser is barred from reclaiming this bounty
+    r = client.post(f"/world/bounties/{bid}/claim", json={
+        "agent_id": hunter}, headers=_auth(hunter))
+    assert r.status_code == 400, r.text
+    # sniper gets a fresh claim
+    r = client.post(f"/world/bounties/{bid}/claim", json={
+        "agent_id": sniper}, headers=_auth(sniper))
+    assert r.status_code == 200, r.text
+
+
+def test_two_releases_pause_bounty():
+    # Two failed claim cycles (here both voluntary releases) pause the
+    # bounty for the poster, same as two involuntary lapses.
+    from dail.api import dail as _d
+    wa = _d.world_agents
+    poster, h1, h2 = _uid("p"), _uid("h"), _uid("s")
+    _make(poster); _make(h1); _make(h2)
+    bid = client.post("/world/bounties", json={
+        "agent_id": poster, "title": "t", "description": "d", "reward": 20},
+        headers=_auth(poster)).json()["id"]
+    for h in (h1, h2):
+        r = client.post(f"/world/bounties/{bid}/claim", json={
+            "agent_id": h}, headers=_auth(h))
+        assert r.status_code == 200, r.text
+        r = client.post(f"/world/bounties/{bid}/release",
+                        json={"agent_id": h}, headers=_auth(h))
+        assert r.status_code == 200, r.text
+    b = wa.bounties[bid]
+    assert b["failed_claims"] == 2
+    assert b["status"] == "paused", b
+
+
 def test_submission_minimum_length_enforced():
     # Anti-farming floor (2026-10-08): 1-char submissions + colluding
     # poster accepts were a wash-trade vector. Submissions <100 chars

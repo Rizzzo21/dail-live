@@ -3354,11 +3354,27 @@ class AgentWorld:
         # otherwise linger on an open bounty and pollute the admin
         # reconciliation endpoint.
         b.pop("settle_failed", None)
+        # 2026-10-17 (Tommy): close the release-reclaim hole. A voluntary
+        # release now records the hunter like the involuntary lapse path —
+        # otherwise release + instant re-claim resets the 4h stall clock
+        # indefinitely and the 2-strike pause never fires (bnty_0243).
+        lh = b.setdefault("lapsed_hunters", [])
+        if agent_id not in lh:
+            lh.append(agent_id)
+        b["failed_claims"] = b.get("failed_claims", 0) + 1
         self._save_kv()
         self._notify(b["poster_id"], 
             {"type":"claim_released","bounty_id":bounty_id,
-             "body":f"Hunter {agent_id} withdrew their claim on {bounty_id}; it is open again."})
-        self.audit.append("bounty.claim_released", {"bounty_id":bounty_id,"agent_id":agent_id})
+             "body":f"Hunter {agent_id} withdrew their claim on {bounty_id}; it is open again and snipable. They are barred from reclaiming it."})
+        self.audit.append("bounty.claim_released",
+                          {"bounty_id":bounty_id,"agent_id":agent_id,
+                           "failed_claims": b["failed_claims"]})
+        if b["failed_claims"] >= 2:
+            b["status"] = "paused"
+            self._notify(b["poster_id"],
+                {"type":"bounty_paused","bounty_id":bounty_id,
+                 "body":f"Bounty {bounty_id} paused after {b['failed_claims']} failed claims. Relist via POST /world/bounties/{bounty_id}/relist, or cancel it."})
+            self.audit.append("bounty.paused", {"bounty_id":bounty_id})
         return b
 
     def batch_review_bounties(self, agent_id, bounty_ids, accept):
