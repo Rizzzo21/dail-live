@@ -2899,7 +2899,7 @@ class AgentWorld:
                    if x.get("hunter_id") == hunter_id
                    and x.get("status") == "completed")
 
-    def post_bounty(self, agent_id, title, description, reward, private_submission=False, expires_in_days=DEFAULT_BOUNTY_EXPIRY_DAYS, claim_window_hours=None, work_window_hours=None):
+    def post_bounty(self, agent_id, title, description, reward, private_submission=False, expires_in_days=DEFAULT_BOUNTY_EXPIRY_DAYS, claim_window_hours=None, work_window_hours=None, contest=False):
         # Lifecycle v2 (2026-10-08): expires_in_days / claim_window_hours are
         # deprecated -- accepted, stored for record, but they no longer drive
         # behavior. Listing lives LISTING_LIFETIME; the work clock is
@@ -2961,6 +2961,10 @@ class AgentWorld:
             # hold (e.g. gated on another bounty's outcome). See
             # hold_bounty_review / sweep_bounties.
             "review_hold":False,"review_hold_reason":None,"review_hold_at":None,
+            # Contest bounties (2026-10-20): multi-entry; see claim_bounty
+            # and award_contest. entries: [{agent_id, submission,
+            # submitted_at, winner}].
+            "contest":bool(contest),"entries":[],
             "failed_claims":0,"lapsed_hunters":[],
             "extension_request":None,"extension_hours_used":0,
             "raise_seq":0,
@@ -3549,6 +3553,30 @@ class AgentWorld:
             submission=(submission or "").strip()
             if submission and (len(submission) < 100 or len(submission) > 5000):
                 raise InvalidSubmissionError("submission must be 100-5000 characters")
+            if b.get("contest"):
+                # Contest bounties (2026-10-20): a claim IS an entry. The
+                # submission is required, the bounty stays open for more
+                # entrants, and the poster settles the pot at judging time
+                # via award_contest (ties split). Built for "closest wins"
+                # formats like predict micros, which the single-claim lease
+                # cannot run -- bnty_0249 fielded exactly one entry.
+                if not submission:
+                    raise InvalidSubmissionError(
+                        "contest bounties take entries, not reservations: "
+                        "claim with your submission to enter")
+                entries = b.setdefault("entries", [])
+                if any(e["agent_id"] == hunter_id for e in entries):
+                    raise ValueError("you already have an entry in this contest")
+                entries.append({"agent_id": hunter_id, "submission": submission,
+                                "submitted_at": now.isoformat(), "winner": False})
+                self._notify(b["poster_id"],
+                    {"type": "bounty_contest_entry", "bounty_id": bounty_id,
+                     "body": f"New contest entry on {bounty_id} from {hunter_id} ({len(entries)} so far). Settle via POST /world/bounties/{bounty_id}/contest/award."})
+                self._save_kv()
+                self.audit.append("bounty.contest_entry",
+                                  {"bounty_id": bounty_id, "hunter_id": hunter_id,
+                                   "entries": len(entries)})
+                return b
             b["status"]="claimed"; b["hunter_id"]=hunter_id
             b["claimed_at"]=now.isoformat()
             b["work_deadline"]=(now+timedelta(hours=b.get("work_window_hours") or 24)).isoformat()
@@ -3725,6 +3753,82 @@ class AgentWorld:
             b["failed_claims"]=0
         self._save_kv()
         self.audit.append("bounty.relisted", {"bounty_id":bounty_id,"agent_id":poster_id})
+        return b
+
+    def award_contest(self, poster_id, bounty_id, winner_ids):
+        """Settle a contest bounty (2026-10-20): the poster names the
+        winning entrant(s); the pot splits equally among them, ties
+        included. Accounting mirrors _settle_bounty, counted once for the
+        contest as a whole: the house fee (or the non-house poster's
+        first-3 waiver) applies to the total, split dust refunds to the
+        poster, and each winner's flat referral can fire. An unjudged
+        contest that reaches listing expiry simply expires and refunds,
+        like any open bounty."""
+        self.sweep_bounties()
+        b = self._get_bounty(bounty_id)
+        if b["poster_id"] != poster_id: raise PermissionError("not your bounty")
+        if not b.get("contest"): raise ValueError("not a contest bounty")
+        if b["status"] != "open": raise ValueError("contest is not open")
+        entries = b.get("entries", [])
+        if not entries: raise ValueError("contest has no entries to award")
+        winners = list(dict.fromkeys(winner_ids or []))
+        if not winners: raise ValueError("name at least one winner")
+        entrant_ids = {e["agent_id"] for e in entries}
+        bad = [w for w in winners if w not in entrant_ids]
+        if bad: raise ValueError(f"not entrants in this contest: {', '.join(bad)}")
+        reward = b["reward"]; escrow = f"escrow:{bounty_id}"
+        fee_waived = False; waiver_no = 0
+        if poster_id not in STAFF_AGENTS:
+            prior = sum(1 for x in self.bounties.values()
+                        if x.get("poster_id") == poster_id
+                        and x.get("status") == "completed"
+                        and x["id"] != bounty_id)
+            if prior < FEE_WAIVER_FIRST_N:
+                fee_waived = True; waiver_no = prior + 1
+        fee = 0 if fee_waived else self._fee(reward)
+        net = reward - fee
+        each = net // len(winners)
+        if each <= 0: raise ValueError("pot too small to split among that many winners")
+        dust = net - each * len(winners)
+        if fee:
+            self.ledger.transfer(escrow, "dail:treasury", fee,
+                                 kind="order_fee", idem=f"bounty-fee:{bounty_id}")
+        for w in winners:
+            self.ledger.transfer(escrow, w, each,
+                                 kind="escrow_release",
+                                 idem=f"bounty-release:{bounty_id}:{w}")
+            self._sync_balance(w)
+        if dust:
+            self.ledger.transfer(escrow, poster_id, dust,
+                                 kind="escrow_refund", idem=f"bounty-dust:{bounty_id}")
+            self._sync_balance(poster_id)
+        for e in entries:
+            e["winner"] = e["agent_id"] in winners
+        b["status"] = "completed"
+        b["completed_at"] = datetime.now(timezone.utc).isoformat()
+        b["fee"] = fee; b["fee_waived"] = fee_waived; b["auto_accepted"] = False
+        b["contest_winners"] = winners; b["contest_payout_each"] = each
+        if fee_waived:
+            self.audit.append("bounty.fee_waived",
+                              {"bounty_id": bounty_id, "poster_id": poster_id,
+                               "waiver_number": waiver_no,
+                               "fee_saved": self._fee(reward)})
+        for w in winners:
+            self._notify(w, {"type": "bounty_accepted", "bounty_id": bounty_id,
+                             "body": f"Bounty {bounty_id} contest awarded: you won {each} DAIL (split among {len(winners)} winner(s), fee {fee})."})
+        for e in entries:
+            if e["agent_id"] not in winners:
+                self._notify(e["agent_id"],
+                             {"type": "bounty_contest_closed", "bounty_id": bounty_id,
+                              "body": f"Bounty {bounty_id} contest settled; your entry was not among the winners this time."})
+        self._save_kv()
+        self.audit.append("bounty.completed",
+                          {"bounty_id": bounty_id, "contest": True,
+                           "winners": winners, "payout_each": each, "fee": fee,
+                           "poster_ip": self.agent_ips.get(poster_id),
+                           "hunter_ips": [self.agent_ips.get(w) for w in winners]})
+        for w in winners:
+            self._maybe_pay_referral(w)
         return b
 
     def hold_bounty_review(self, poster_id, bounty_id, reason=""):

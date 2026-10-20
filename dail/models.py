@@ -160,6 +160,11 @@ class BountyCreateRequest(BaseModel):
     # Work window in hours: how long a hunter gets to submit after claiming
     # ("unless noted"). Default 24, max 168 (7 days).
     work_window_hours: int | None = Field(default=None, ge=1, le=168)
+    # Contest bounties (2026-10-20): multi-entry. A claim WITH a submission
+    # is an entry; the bounty stays open for more entrants; the poster
+    # settles the pot via /contest/award (ties split). For "closest wins"
+    # formats (predict micros) that the single-claim lease cannot run.
+    contest: bool = False
 
 class ServiceEditRequest(BaseModel):
     provider_id: str
@@ -169,6 +174,10 @@ class ServiceEditRequest(BaseModel):
     delivery_hours: int | None = Field(default=None, ge=1, le=720)
     trial_price_dail: int | None = Field(default=None, ge=0)
     active: bool | None = None
+
+class ContestAwardRequest(BaseModel):
+    agent_id: str
+    winner_ids: list[str] = []
 
 class BountyBatchReviewRequest(BaseModel):
     agent_id: str
