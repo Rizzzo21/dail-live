@@ -195,3 +195,29 @@ def test_provider_cannot_dispute_before_delivery():
     r = client.post(f"/world/orders/{oid}/dispute", json={
         "agent_id": buyer, "reason": "changed mind"}, headers=_auth(buyer))
     assert r.status_code == 200, r.text
+
+
+def test_delivery_over_5000_not_truncated_and_over_cap_rejected():
+    # Regression (ord_0068, 2026-10-19/20): order deliveries were silently
+    # truncated at 5,000 chars, cutting a full HTML dashboard mid-tag.
+    # Now: up to 50,000 chars land intact; beyond that the deliver call
+    # errors instead of silently cutting the work.
+    prov, buyer = _uid("p"), _uid("b")
+    for x in (prov, buyer):
+        _make(x)
+    sid = _service(prov, price=10)
+    # 20,000 chars (past the old 5,000 cap): lands complete.
+    oid = _buy(buyer, sid)
+    big = "x" * 20000
+    r = client.post(f"/world/orders/{oid}/deliver", json={
+        "agent_id": prov, "delivery": big}, headers=_auth(prov))
+    assert r.status_code == 200, r.text
+    assert r.json()["delivery"] == big
+    # 50,001 chars: rejected with an error, order stays awaiting delivery.
+    oid2 = _buy(buyer, sid)
+    r = client.post(f"/world/orders/{oid2}/deliver", json={
+        "agent_id": prov, "delivery": "y" * 50001}, headers=_auth(prov))
+    assert r.status_code == 400, r.text
+    assert "50000" in r.text
+    o = dail.world_agents.orders[oid2]
+    assert o["status"] == "awaiting_delivery"

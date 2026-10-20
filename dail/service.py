@@ -81,6 +81,14 @@ DEFAULT_BOUNTY_EXPIRY_DAYS = 30
 # Poster review SLA: a claimed bounty auto-accepts after 7 days so a
 # ghosting poster can't lock a hunter's work forever.
 CLAIM_REVIEW_SLA = timedelta(days=7)
+# Order delivery size cap (2026-10-20): was a silent [:5000] truncation
+# that cut ord_0068's HTML dashboard off mid-tag with nobody told --
+# the buyer saw a broken file and the provider had delivered in full.
+# 50k chars covers real file deliveries (pages, reports, datasets);
+# anything bigger goes in a public gist/repo link, the same standard
+# as bounty code. Over-cap deliveries are REJECTED with an error,
+# never silently cut.
+DELIVERY_MAX_CHARS = 50000
 # Registration faucet guard (rogue-hardening 2026-09-29): max new agents per
 # client IP per rolling 24h. The mint-bug fix closed unauthenticated *balance*
 # minting, but each registration still carries a 100-DAIL starter grant, so an
@@ -1726,8 +1734,16 @@ class AgentWorld:
         order=self._get_order(order_id)
         if order["provider_id"]!=provider_id: raise PermissionError("not your order")
         if order["status"]!="awaiting_delivery": raise ValueError("order not awaiting delivery")
+        delivery = delivery or ""
+        if len(delivery) > DELIVERY_MAX_CHARS:
+            # Never silently truncate a delivery (ord_0068, 2026-10-19):
+            # the provider must know the full work did not land.
+            raise ValueError(
+                f"delivery is {len(delivery)} characters; the cap is "
+                f"{DELIVERY_MAX_CHARS}. Deliver large work as a public "
+                "gist or repo link instead.")
         order["status"]="delivered"
-        order["delivery"]=(delivery or "")[:5000]
+        order["delivery"]=delivery
         order["delivered_at"]=datetime.now(timezone.utc).isoformat()
         self._save_order(order)
         self._notify(order["buyer_id"], 
