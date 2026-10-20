@@ -1185,3 +1185,105 @@ def test_world_stats_public():
               "median_reward", "fee_waivers_granted"):
         assert k in d, d
     assert d["bounties_total"] >= d["non_house_completions"]
+
+
+def _submitted_bounty(poster, hunter, reward=20, days_since_submit=8):
+    """Post + claim + submit a bounty, then age the submission."""
+    from dail.api import dail as _d
+    wa = _d.world_agents
+    bid = client.post("/world/bounties", json={
+        "agent_id": poster, "title": "t", "description": "d", "reward": reward},
+        headers=_auth(poster)).json()["id"]
+    client.post(f"/world/bounties/{bid}/claim",
+                json={"agent_id": hunter,
+                      "submission": "real work, delivered in full, honest numbers, every figure checked against the primary source and reproduced twice"},
+                headers=_auth(hunter))
+    b = wa.bounties[bid]
+    b["submitted_at"] = (
+        datetime.now(timezone.utc) - timedelta(days=days_since_submit)).isoformat()
+    return wa, bid
+
+
+def test_review_hold_pauses_auto_accept():
+    # Regression (bnty_0150, 2026-10-20): a bounty under a documented hold
+    # must NOT auto-accept when the 7-day review SLA lapses.
+    poster, hunter = _uid("p"), _uid("h")
+    _make(poster); _make(hunter)
+    wa, bid = _submitted_bounty(poster, hunter)
+    r = client.post(f"/world/bounties/{bid}/review/hold",
+                    json={"agent_id": poster, "reason": "gated on another bounty"},
+                    headers=_auth(poster))
+    assert r.status_code == 200, r.text
+    assert wa.bounties[bid]["review_hold"] is True
+    wa.sweep_bounties()
+    # Past the SLA, but held: still submitted, escrow unreleased.
+    assert wa.bounties[bid]["status"] == "submitted"
+    assert _bal(hunter) == 100
+
+
+def test_review_hold_release_resumes_auto_accept():
+    poster, hunter = _uid("p"), _uid("h")
+    _make(poster); _make(hunter)
+    wa, bid = _submitted_bounty(poster, hunter)
+    client.post(f"/world/bounties/{bid}/review/hold",
+                json={"agent_id": poster, "reason": "hold"},
+                headers=_auth(poster))
+    wa.sweep_bounties()
+    assert wa.bounties[bid]["status"] == "submitted"
+    r = client.post(f"/world/bounties/{bid}/review/release-hold",
+                    json={"agent_id": poster}, headers=_auth(poster))
+    assert r.status_code == 200, r.text
+    assert wa.bounties[bid]["review_hold"] is False
+    wa.sweep_bounties()
+    assert wa.bounties[bid]["status"] == "completed"
+    assert _bal(hunter) == 120  # 100 + 20, fee waived (poster's first accepted bounty)
+
+
+def test_review_hold_is_poster_only_and_needs_submission():
+    poster, hunter = _uid("p"), _uid("h")
+    _make(poster); _make(hunter)
+    wa, bid = _submitted_bounty(poster, hunter)
+    # Hunter cannot hold their own submission's review.
+    r = client.post(f"/world/bounties/{bid}/review/hold",
+                    json={"agent_id": hunter, "reason": "x"},
+                    headers=_auth(hunter))
+    assert r.status_code == 403
+    # An open bounty with no submission cannot be held.
+    bid2 = client.post("/world/bounties", json={
+        "agent_id": poster, "title": "t2", "description": "d", "reward": 5},
+        headers=_auth(poster)).json()["id"]
+    r = client.post(f"/world/bounties/{bid2}/review/hold",
+                    json={"agent_id": poster, "reason": "x"},
+                    headers=_auth(poster))
+    assert r.status_code == 400
+    # Releasing a hold that does not exist is an error, not a no-op.
+    r = client.post(f"/world/bounties/{bid}/review/release-hold",
+                    json={"agent_id": poster}, headers=_auth(poster))
+    assert r.status_code == 400
+
+
+def test_held_bounty_still_accepts_and_reject_clears_hold():
+    poster, hunter = _uid("p"), _uid("h")
+    _make(poster); _make(hunter)
+    wa, bid = _submitted_bounty(poster, hunter)
+    client.post(f"/world/bounties/{bid}/review/hold",
+                json={"agent_id": poster, "reason": "hold"},
+                headers=_auth(poster))
+    # Manual accept still works while held.
+    r = client.post(f"/world/bounties/{bid}/accept",
+                    json={"agent_id": poster}, headers=_auth(poster))
+    assert r.status_code == 200, r.text
+    assert wa.bounties[bid]["status"] == "completed"
+    # Reject clears the hold so the reopened bounty starts clean.
+    poster2, hunter2 = _uid("p"), _uid("h")
+    _make(poster2); _make(hunter2)
+    wa, bid2 = _submitted_bounty(poster2, hunter2)
+    client.post(f"/world/bounties/{bid2}/review/hold",
+                json={"agent_id": poster2, "reason": "hold"},
+                headers=_auth(poster2))
+    r = client.post(f"/world/bounties/{bid2}/reject",
+                    json={"agent_id": poster2, "reason": "no"},
+                    headers=_auth(poster2))
+    assert r.status_code == 200, r.text
+    assert wa.bounties[bid2]["status"] == "open"
+    assert wa.bounties[bid2]["review_hold"] is False

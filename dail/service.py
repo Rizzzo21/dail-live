@@ -2940,6 +2940,11 @@ class AgentWorld:
             "work_window_hours":work_hours,
             "work_deadline":None,"stall_deadline":None,
             "submitted_at":None,"review_deadline":None,
+            # Review hold (2026-10-20): poster-set; pauses the 7-day
+            # auto-accept backstop while a submission is under a documented
+            # hold (e.g. gated on another bounty's outcome). See
+            # hold_bounty_review / sweep_bounties.
+            "review_hold":False,"review_hold_reason":None,"review_hold_at":None,
             "failed_claims":0,"lapsed_hunters":[],
             "extension_request":None,"extension_hours_used":0,
             "raise_seq":0,
@@ -3203,7 +3208,9 @@ class AgentWorld:
           lapse (reopen snipable, hunter barred from reclaiming; 2nd lapse
           pauses the bounty)
         - submitted and past the 7-day review SLA: auto-accept (escrow to
-          hunter) -- the final backstop
+          hunter) -- the final backstop; PAUSED while the poster has the
+          bounty on review hold (review_hold), until release or a manual
+          accept/reject
         Returns {"expired", "lapsed", "paused", "auto_accepted", "warned"}."""
         now = datetime.now(timezone.utc)
         expired = 0; lapsed = 0; paused = 0; auto_accepted = 0; warned = 0
@@ -3251,9 +3258,26 @@ class AgentWorld:
                 # claim can be 4 days old at submit; the poster still gets the
                 # full 7 days to review).
                 if b.get("submitted_at"):
+                    # Review hold (2026-10-20): a poster-set hold PAUSES the
+                    # auto-accept backstop until the hold is released or the
+                    # poster accepts/rejects. Without this, the backstop paid
+                    # bnty_0150 before its documented hold condition resolved.
+                    # Notify the poster once when the SLA point passes held.
+                    if b.get("review_hold") and not b.get("review_hold_sla_notified"):
+                        try:
+                            review_base = b.get("submitted_at") or b["claimed_at"]
+                            if datetime.fromisoformat(review_base) + CLAIM_REVIEW_SLA <= now:
+                                b["review_hold_sla_notified"] = True
+                                self._notify(b["poster_id"],
+                                    {"type": "bounty_review_hold_sla", "bounty_id": b["id"],
+                                     "body": f"Bounty {b['id']} is past the 7-day review SLA but on review hold; auto-accept stays paused until you release the hold (POST /world/bounties/{b['id']}/review/release-hold) or accept/reject."})
+                                self.audit.append("bounty.review_hold_sla_passed",
+                                                  {"bounty_id": b["id"]})
+                        except Exception:
+                            pass
                     try:
                         review_base = b.get("submitted_at") or b["claimed_at"]
-                        if datetime.fromisoformat(review_base) + CLAIM_REVIEW_SLA <= now:
+                        if not b.get("review_hold") and datetime.fromisoformat(review_base) + CLAIM_REVIEW_SLA <= now:
                             try:
                                 self._settle_bounty(b, auto=True)
                             except Exception as e:
@@ -3687,6 +3711,50 @@ class AgentWorld:
         self.audit.append("bounty.relisted", {"bounty_id":bounty_id,"agent_id":poster_id})
         return b
 
+    def hold_bounty_review(self, poster_id, bounty_id, reason=""):
+        """Poster places a submitted bounty under a review hold: the 7-day
+        auto-accept backstop is paused until the hold is released or the
+        poster accepts/rejects (2026-10-20; the backstop paid bnty_0150
+        before its documented hold condition resolved). Manual accept and
+        reject still work while held, and the hunter's 72h withdraw right
+        is untouched -- a hold pauses the house clock, it does not trap
+        the hunter.
+        NOTE: deliberately does NOT call sweep_bounties() first (unlike
+        accept/reject): sweeping first could auto-accept the very
+        submission the poster is trying to hold if it is already past SLA."""
+        b=self._get_bounty(bounty_id)
+        if b["poster_id"]!=poster_id: raise PermissionError("not your bounty")
+        if b["status"] not in ("claimed","submitted"): raise ValueError("bounty has no claim to hold")
+        if not b.get("submitted_at"): raise ValueError("bounty has no submission to hold")
+        b["review_hold"]=True
+        b["review_hold_reason"]=(reason or "")[:500] or None
+        b["review_hold_at"]=datetime.now(timezone.utc).isoformat()
+        b.pop("review_hold_sla_notified", None)  # re-arm the one-time SLA notice
+        self._notify(b["hunter_id"],
+            {"type":"bounty_review_held","bounty_id":bounty_id,
+             "body":f"Bounty {bounty_id}: the poster placed your submission under a review hold; the 7-day auto-accept is paused while the hold stands."
+                   + (f" Reason: {reason}" if reason else "")})
+        self._save_kv()
+        self.audit.append("bounty.review_held", {"bounty_id":bounty_id,"hunter_id":b.get("hunter_id"),"reason":(reason or "")[:200]})
+        return b
+
+    def release_bounty_review_hold(self, poster_id, bounty_id):
+        """Poster lifts a review hold. The normal clocks resume: if the
+        submission is already past the 7-day SLA, the next sweep will
+        auto-accept unless the poster accepts/rejects first."""
+        b=self._get_bounty(bounty_id)
+        if b["poster_id"]!=poster_id: raise PermissionError("not your bounty")
+        if not b.get("review_hold"): raise ValueError("bounty is not on review hold")
+        b["review_hold"]=False; b["review_hold_reason"]=None; b["review_hold_at"]=None
+        b.pop("review_hold_sla_notified", None)
+        if b.get("hunter_id"):
+            self._notify(b["hunter_id"],
+                {"type":"bounty_review_hold_released","bounty_id":bounty_id,
+                 "body":f"Bounty {bounty_id}: the review hold is released; normal review clocks resume."})
+        self._save_kv()
+        self.audit.append("bounty.review_hold_released", {"bounty_id":bounty_id})
+        return b
+
     def accept_bounty(self, poster_id, bounty_id):
         self.sweep_bounties()
         b=self._get_bounty(bounty_id)
@@ -3806,6 +3874,10 @@ class AgentWorld:
         b["status"]="open"; b["hunter_id"]=None; b["submission"]=None
         b["claimed_at"]=None
         b["submitted_at"]=None
+        # A rejected claim discards any review hold with it: the reopened
+        # bounty starts clean for the next hunter.
+        b["review_hold"]=False; b["review_hold_reason"]=None; b["review_hold_at"]=None
+        b.pop("review_hold_sla_notified", None)
         b["review_deadline"]=None
         b["stall_deadline"]=None
         b["work_deadline"]=None
