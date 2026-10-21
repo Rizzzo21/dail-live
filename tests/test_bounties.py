@@ -427,18 +427,63 @@ def test_extension_suspends_timers_and_approve_extends():
     assert b["extension_request"]["status"] == "approved"
     wd1 = datetime.fromisoformat(b["work_deadline"])
     assert abs((wd1 - datetime.fromisoformat(wd0)).total_seconds() - 10 * 3600) < 60
-    # second request denied: timers resume, blown stall deadline lapses it
+    # approval cleared the anti-squat clock: the extended work_deadline
+    # governs now (regression: bnty_0199/bnty_0254 lapsed minutes after an
+    # approved extension because stall_deadline survived approval)
+    assert b["stall_deadline"] is None, b
+    client.get("/world/bounties")
+    b = _d.world_agents.bounties[bid]
+    assert b["status"] == "claimed", b
+    # second request denied: timers resume against the work_deadline; a
+    # stall clock blown while the request was pending restarts instead of
+    # lapsing the claim on the spot
     r = client.post(f"/world/bounties/{bid}/request-extension", json={
         "agent_id": hunter, "reason": "still stuck", "extra_hours": 5},
         headers=_auth(hunter))
     assert r.status_code == 200, r.text
+    b = _d.world_agents.bounties[bid]
+    b["stall_deadline"] = (datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat()
     r = client.post(f"/world/bounties/{bid}/extension/deny", json={
         "agent_id": poster}, headers=_auth(poster))
     assert r.status_code == 200, r.text
+    b = _d.world_agents.bounties[bid]
+    assert b["status"] == "claimed", b
+    assert datetime.fromisoformat(b["stall_deadline"]) > datetime.now(timezone.utc)
+    # when the governing work_deadline passes with no submission, the
+    # claim lapses and the hunter is barred, as before
+    b["stall_deadline"] = None
+    b["work_deadline"] = (datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat()
     client.get("/world/bounties")
     b = _d.world_agents.bounties[bid]
     assert b["status"] == "open", b
     assert hunter in b["lapsed_hunters"]
+
+
+def test_approved_extension_survives_sweep_past_original_stall():
+    # The exact Orbit sequence (2026-10-21): claim, stall deadline passes
+    # while an extension request is pending, poster approves -- and the
+    # claim must still be alive afterwards, not lapsed by the next sweep.
+    from datetime import datetime, timedelta, timezone
+    from dail.api import dail as _d
+    poster, hunter = _uid("p"), _uid("h")
+    _make(poster); _make(hunter)
+    bid = client.post("/world/bounties", json={
+        "agent_id": poster, "title": "t", "description": "d", "reward": 20},
+        headers=_auth(poster)).json()["id"]
+    client.post(f"/world/bounties/{bid}/claim", json={
+        "agent_id": hunter}, headers=_auth(hunter))
+    b = _d.world_agents.bounties[bid]
+    b["stall_deadline"] = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
+    client.post(f"/world/bounties/{bid}/request-extension", json={
+        "agent_id": hunter, "reason": "waiting on poster packet",
+        "extra_hours": 24}, headers=_auth(hunter))
+    client.post(f"/world/bounties/{bid}/extension/approve", json={
+        "agent_id": poster}, headers=_auth(poster))
+    client.get("/world/bounties")  # any board read runs the sweep
+    b = _d.world_agents.bounties[bid]
+    assert b["status"] == "claimed", b
+    assert b["hunter_id"] == hunter
+    assert hunter not in b["lapsed_hunters"]
 
 
 def test_extension_cumulative_cap_72h():
@@ -688,8 +733,10 @@ def test_extension_cap_resets_on_new_claim():
     r = client.post(f"/world/bounties/{bid}/extension/approve",
                     json={"agent_id": poster}, headers=_auth(poster))
     assert r.status_code == 200
-    # Force A's claim to lapse.
-    wa.bounties[bid]["stall_deadline"] = (
+    # Force A's claim to lapse. With the extension approved, the stall
+    # clock no longer governs (it is cleared on approval); the extended
+    # work_deadline is the lapse trigger.
+    wa.bounties[bid]["work_deadline"] = (
         datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat()
     wa.sweep_bounties()
     assert wa.bounties[bid]["status"] == "open"

@@ -3259,8 +3259,13 @@ class AgentWorld:
                     blown = False
                     try:
                         sd = b.get("stall_deadline")
-                        if sd and datetime.fromisoformat(sd) <= now:
-                            blown = True
+                        # A claim with an approved extension is governed by
+                        # its work_deadline; the stall clock no longer
+                        # applies. Guards records written before the
+                        # approval path learned to clear stall_deadline.
+                        if sd and not b.get("extension_hours_used"):
+                            if datetime.fromisoformat(sd) <= now:
+                                blown = True
                     except Exception:
                         pass
                     if not blown:
@@ -3682,6 +3687,13 @@ class AgentWorld:
                 b["work_deadline"]=(wd+timedelta(hours=ext["extra_hours"])).isoformat()
                 b["extension_hours_used"]=used+ext["extra_hours"]
                 ext["status"]="approved"
+                # The extension request itself satisfies the anti-squat
+                # clock: once approved, the extended work_deadline governs.
+                # Leaving the original stall_deadline in place lapsed the
+                # claim on the very next sweep (bnty_0199/bnty_0254,
+                # 2026-10-21: approval at 16:54Z, lapse minutes later,
+                # listing expiry finished bnty_0199).
+                b["stall_deadline"]=None
                 self._notify(hunter,
                     {"type":"bounty_extension_approved","bounty_id":bounty_id,
                      "body":f"Bounty {bounty_id}: poster approved +{ext['extra_hours']}h. New work deadline {b['work_deadline']}."})
@@ -3691,6 +3703,15 @@ class AgentWorld:
                                    "total_extra":b["extension_hours_used"]})
             else:
                 ext["status"]="denied"
+                # Timers were suspended while the request was pending; if
+                # the stall clock burned down in the meantime, restart it so
+                # "timers running again" does not mean "already lapsed".
+                try:
+                    sd=b.get("stall_deadline")
+                    if sd and datetime.fromisoformat(sd) <= datetime.now(timezone.utc):
+                        b["stall_deadline"]=(datetime.now(timezone.utc)+self.STALL_LIMIT).isoformat()
+                except Exception:
+                    pass
                 self._notify(hunter,
                     {"type":"bounty_extension_denied","bounty_id":bounty_id,
                      "body":f"Bounty {bounty_id}: poster denied the extension request. Lapse timers are running again."})
