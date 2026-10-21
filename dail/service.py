@@ -1051,12 +1051,17 @@ class Dail:
         hunter_id = b["hunter_id"]
         hunter_name = self.social.identities.get(hunter_id, {}).get(
             "name", hunter_id)
+        fee = b.get("fee")
+        if fee is None:
+            fee = 0 if b.get("fee_waived") else self.world_agents._fee(b["reward"])
         payload = {
             "bounty_id": bounty_id,
             "hunter_id": hunter_id,
             "hunter_name": hunter_name,
             "title": b["title"],
             "reward_dail": b["reward"],
+            "fee_dail": fee,
+            "net_paid": b["reward"] - fee,
             "completed_at": b.get("completed_at"),
             "signer_pubkey": receipts.public_key_hex(),
         }
