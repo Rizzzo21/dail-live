@@ -939,7 +939,101 @@ class Dail:
                                 reverse=True)[:8]],
             "verify": "Every completed bounty carries a ledger receipt. "
                       "Verify the tamper-evident chain: GET /audit/verify",
+            "newcomers": self.newcomers_board(),
         }
+
+    def newcomers_board(self, now=None):
+        """Daily newcomers leaderboard (Spec 3): agents whose FIRST settled
+        escrow is within the trailing 30 days (UTC), ranked by today's
+        settled escrows. Settled = completed bounties + completed/resolved
+        orders carrying a non-null completed_at. External agents only;
+        staff and banned excluded by the same filter as the Observatory.
+        `now` is a test seam (defaults to real UTC now); production
+        always calls with no argument. Never invents rows: an empty day
+        returns rows []."""
+        wa = self.world_agents
+        staff = self.PROTECTED_AGENTS
+        ext = [a for a in self.agents.values()
+               if a.id not in staff and a.status != "banned"]
+        ext_ids = {a.id for a in ext}
+
+        def _name(aid):
+            ident = self.social.identities.get(aid, {})
+            return ident.get("name", aid)
+
+        def _ts(raw):
+            if not raw:
+                return None
+            try:
+                dt = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+            except ValueError:
+                return None
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return dt
+
+        if now is None:
+            now = datetime.now(timezone.utc)
+        elif now.tzinfo is None:
+            now = now.replace(tzinfo=timezone.utc)
+        day_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        day_end = day_start + timedelta(days=1)
+        window_start = now - timedelta(days=30)
+
+        # settlements[aid] = (ts, kind, title, bounty_id, receipt_url, net)
+        settlements = {}
+
+        def _add(aid, ts, kind, title, bounty_id, receipt_url, net):
+            if aid not in ext_ids or ts is None:
+                return
+            settlements.setdefault(aid, []).append(
+                (ts, kind, title, bounty_id, receipt_url, net))
+
+        for b in wa.bounties.values():
+            if b.get("status") != "completed":
+                continue
+            _add(b.get("hunter_id"), _ts(b.get("completed_at")), "bounty",
+                 b.get("title", ""), b.get("id"),
+                 f"/receipts/{b['id']}", self._bounty_net(b))
+        for o in wa.orders.values():
+            if o.get("status") not in ("completed", "resolved"):
+                continue
+            fee = o.get("fee")
+            if fee is None:
+                fee = wa._fee(o["amount"])
+            _add(o.get("provider_id"), _ts(o.get("completed_at")), "order",
+                 o.get("service_name", ""), None, None,
+                 o["amount"] - fee)
+
+        rows = []
+        for aid, ss in settlements.items():
+            first_ts = min(s[0] for s in ss)
+            if not (window_start <= first_ts <= now):
+                continue
+            today = [s for s in ss if day_start <= s[0] < day_end]
+            if not today:
+                continue
+            today.sort(key=lambda s: (s[0], s[1], s[3] or ""))
+            latest = today[-1]
+            rows.append({
+                "id": aid, "name": _name(aid),
+                "settled_today": len(today),
+                "net_today": sum(s[5] for s in today),
+                "first_settled_at": first_ts.isoformat(),
+                "_first_ts": first_ts,
+                "latest": {"kind": latest[1], "title": latest[2],
+                           "bounty_id": latest[3],
+                           "receipt_url": latest[4],
+                           "passport_url": f"/passport/{aid}"},
+            })
+        rows.sort(key=lambda r: (-r["settled_today"], -r["net_today"],
+                                 r["_first_ts"]))
+        for r in rows:
+            del r["_first_ts"]
+        return {"date_utc": day_start.date().isoformat(),
+                "window": "trailing 30-day first settlement; "
+                          "ranked by today's settled escrows",
+                "rows": rows[:10]}
 
     def _bounty_net(self, b):
         """Integer DAIL the hunter actually received (bnty_0217: the paid

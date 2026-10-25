@@ -132,6 +132,7 @@ _PUBLIC_GET = {
     "/world/stats",
     "/audit/verify", "/observatory",
     "/observatory/public", "/observatory/public/data",
+    "/observatory/public/newcomers",
     "/bring-your-agent", "/request-bounty", "/dashboard", "/status", "/status/data",
     "/vault/status", "/terms",
     "/toolkit",
@@ -770,6 +771,7 @@ def observatory_public():
     return (tpl.replace("<!--SSR_STATS-->", _po_stats(data))
                .replace("<!--SSR_SPOT-->", _po_spot(data))
                .replace("<!--SSR_BOARD-->", _po_board(data))
+               .replace("<!--SSR_NEWCOMERS-->", _po_newcomers(data))
                .replace("<!--SSR_ROAD-->", _po_road(data))
                .replace("<!--SSR_ACTIVITY-->", _po_activity(data))
                .replace("<!--SSR_ECON-->", _po_econ(data))
@@ -823,6 +825,38 @@ def _po_board(d):
             f'{rows}'
             f'<div style="margin-top:8px;font-size:12px;color:#7a8fa0">'
             f'Climb it: complete bounties, list services, post your own.</div></div>')
+
+
+def _po_newcomers(d):
+    nc = d.get("newcomers") or {}
+    rows = nc.get("rows") or []
+    date_utc = nc.get("date_utc") or ""
+    head = (f'<div class="card board"><h2>NEWCOMERS — TODAY (UTC)'
+            f'{(" " + _po_esc(date_utc)) if date_utc else ""}</h2>'
+            f'<div style="margin-bottom:8px;font-size:12px;color:#7a8fa0">'
+            f'First settled escrow within the last 30 days; ranked by '
+            f'today\'s settled escrows.</div>')
+    if not rows:
+        return head + '<div>No newcomer has settled an escrow today yet.</div></div>'
+    body = ""
+    for i, r in enumerate(rows, 1):
+        lat = r.get("latest") or {}
+        title = _po_esc(lat.get("title") or "")
+        if lat.get("receipt_url"):
+            title = (f'<a href="{_po_esc(lat["receipt_url"])}">{title}</a>')
+        else:
+            # No per-service page exists; the provider passport carries the
+            # provider's service list, which is the checkable evidence.
+            title = (f'<a class="pplink" data-pp="{_po_esc(r["id"])}">'
+                     f'{title}</a>')
+        body += (f'<div class="lbrow"><span class="lrank">{i}</span>'
+                 f'<a class="pplink" data-pp="{_po_esc(r["id"])}">'
+                 f'{_po_esc(r["name"])}</a>'
+                 f'<span style="flex:1;overflow:hidden;text-overflow:ellipsis;'
+                 f'white-space:nowrap;color:#7a8fa0">{title}</span>'
+                 f'<span class="lbal">{_po_esc(r["settled_today"])} settled '
+                 f'today · {_po_esc(r["net_today"])} DAIL net</span></div>')
+    return head + body + '</div>'
 
 
 def _po_road(d):
@@ -922,6 +956,13 @@ def _po_services(d):
 def observatory_public_data():
     # Public, no auth: real numbers only, external agents only.
     return dail.public_observatory()
+
+
+@app.get("/observatory/public/newcomers")
+def observatory_public_newcomers():
+    # Public, no auth: the same newcomers object carried by
+    # /observatory/public/data, standalone for reuse (e.g. MCP).
+    return dail.newcomers_board()
 
 
 @app.get("/passport/{agent_id}/data")

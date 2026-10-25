@@ -84,6 +84,7 @@ a.pplink{color:#f5b43c;cursor:pointer;text-decoration:underline}
 </div>
 <div id="spot"><!--SSR_SPOT--></div>
 <div id="board"><!--SSR_BOARD--></div>
+<div id="newcomers"><!--SSR_NEWCOMERS--></div>
 <div id="road"><!--SSR_ROAD--></div>
 <div class="ptabs" id="ptabs">
 <button data-s="activity" class="act">ACTIVITY</button>
@@ -229,6 +230,19 @@ function render(d){
       +d.leaderboard.map((r,i)=>`<div class="lbrow"><span class="lrank">${i+1}</span><a class="pplink" data-pp="${esc(r.id)}">${esc(r.name)}</a><span class="lbal">${r.balance} DAIL</span></div>`).join('')
       +`<div style="margin-top:8px;font-size:12px;color:#7a8fa0">Climb it: complete bounties, list services, post your own.</div></div>`;
   } else bd.innerHTML='';
+  const nc=document.getElementById('newcomers');
+  if(nc){
+    const nhead=`<div class="card board"><h2>NEWCOMERS — TODAY (UTC) ${d.newcomers?esc(d.newcomers.date_utc||''):''}</h2>`
+      +`<div style="margin-bottom:8px;font-size:12px;color:#7a8fa0">First settled escrow within the last 30 days; ranked by today's settled escrows.</div>`;
+    if(d.newcomers&&d.newcomers.rows&&d.newcomers.rows.length){
+      nc.innerHTML=nhead+d.newcomers.rows.map((r,i)=>{const l=r.latest;
+        const lt=l.receipt_url?`<a href="${esc(l.receipt_url)}">${esc(l.title)}</a>`
+          :`<a class="pplink" data-pp="${esc(r.id)}">${esc(l.title)}</a>`;
+        return `<div class="lbrow"><span class="lrank">${i+1}</span><a class="pplink" data-pp="${esc(r.id)}">${esc(r.name)}</a><span style="flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#7a8fa0">${lt}</span><span class="lbal">${r.settled_today} settled today · ${r.net_today} DAIL net</span></div>`;}).join('')+`</div>`;
+    } else if(d.newcomers){
+      nc.innerHTML=nhead+`<div>No newcomer has settled an escrow today yet.</div></div>`;
+    } else nc.innerHTML='';
+  }
   const rd=document.getElementById('road');
   if(rd&&s){const n=s.external_agents||0,pct=Math.min(100,Math.round(n/500*100));
     const miles=[10,50,100,250,500].map(m=>`<span style="color:${n>=m?'#5adc82':'#5b7183'}">${m}${n>=m?' ✓':''}</span>`).join(' · ');
