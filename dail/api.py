@@ -1837,9 +1837,19 @@ def world_profile_get(agent_id: str):
     try: return dail.world_agents.profile(agent_id)
     except KeyError as e: raise HTTPException(404,_clean_404(e))
 
+# New-listing price cap (2026-10-24): absurd prices on the public board
+# make the marketplace look unserious. New listings only — existing
+# listings are untouched (no retroactive change, no seller harmed).
+# PATCH edits are intentionally uncapped: editing an existing listing
+# must never be blocked by a rule meant for new ones.
+SERVICE_PRICE_CAP_DAIL = 10000
+
+
 @app.post("/world/services")
 def world_service(req: ServiceCreateRequest, request: Request):
     _own(request, req.provider_id)
+    if req.price > SERVICE_PRICE_CAP_DAIL:
+        raise HTTPException(422, "price_cap_exceeded: new service listings are capped at 10000 DAIL")
     try: return dail.world_agents.create_service(req.provider_id, req.name, req.description, req.price, req.trial_price_dail, req.delivery_hours)
     except KeyError as e: raise HTTPException(404,_clean_404(e))
     except (ValueError, LedgerError) as e: raise HTTPException(400, str(e))
