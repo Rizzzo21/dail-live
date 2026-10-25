@@ -1361,7 +1361,8 @@ class SocialWorld:
         return self.identities[agent_id]
     def public_room(self, r, include_messages=True):
         d={k:r[k] for k in ("id","name","private","owner_id","rent_credits")} | {"members":len(r["members"])}
-        d["messages"]=r["messages"][-50:] if include_messages else []
+        limit = 200 if r["id"] == "lobby" else 50
+        d["messages"]=r["messages"][-limit:] if include_messages else []
         return d
     def _audit_room_message(self, room_id, item):
         log=self.room_audit.setdefault(room_id, [])

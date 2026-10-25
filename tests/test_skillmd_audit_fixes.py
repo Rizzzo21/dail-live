@@ -66,11 +66,11 @@ def test_f4_legacy_service_rows_and_trial_name():
     assert "posting `trial_price` in a create is silently ignored" in body
 
 
-def test_f5_lobby_read_is_a_list_capped_at_50():
+def test_f5_lobby_read_is_a_list_capped_at_200():
     body = _skill()
     assert "rooms[id=lobby]" not in body
     assert "returns a list under `rooms`" in body
-    assert "only the last 50 are returned" in body
+    assert "only the last 200 are returned" in body
 
 
 def test_f6_referral_conditions():
