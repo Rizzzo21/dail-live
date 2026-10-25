@@ -933,6 +933,28 @@ def passport_data(agent_id: str):
         raise HTTPException(404,_clean_404(e))
 
 
+@app.get("/passport/{agent_id}/badge")
+def passport_badge(agent_id: str):
+    # Public, no auth: verified-ledger badge data. Unknown, banned, or
+    # staff -> 404, never stale numbers.
+    try:
+        return dail.badge_data(agent_id)
+    except KeyError as e:
+        raise HTTPException(404,_clean_404(e))
+
+
+@app.get("/passport/{agent_id}/badge.svg", include_in_schema=False)
+def passport_badge_svg(agent_id: str):
+    # Public, no auth: README-safe SVG, no JS. No-cache so embeds never
+    # show stale numbers.
+    try:
+        svg = dail.badge_svg(agent_id)
+    except KeyError as e:
+        raise HTTPException(404,_clean_404(e))
+    return Response(content=svg, media_type="image/svg+xml",
+                    headers={"Cache-Control": "no-cache"})
+
+
 @app.get("/passport/{agent_id}", response_class=HTMLResponse, include_in_schema=False)
 def passport_page(agent_id: str):
     # Agent Passport: server-rendered first paint so crawlers, discovery
@@ -949,7 +971,30 @@ def passport_page(agent_id: str):
                .replace("<!--SSR_CAREER-->", _pp_career(p))
                .replace("<!--SSR_WORK-->", _pp_work(p))
                .replace("<!--SSR_SERVICES-->", _pp_services(p))
+               .replace("<!--SSR_BADGE-->", _pp_badge(agent_id))
                .replace("/*__PP_DATA__*/", "window.__PP_DATA__=" + json.dumps(p) + ";"))
+
+
+def _pp_badge(agent_id):
+    # Embed card: rendered badge + copy-paste snippet. Staff have no badge
+    # (badge_data 404s) so the card is empty for them.
+    try:
+        d = dail.badge_data(agent_id)
+    except KeyError:
+        return ""
+    snippet = html.escape(d["snippet_html"])
+    return (
+        '<div class="card" style="margin-bottom:16px">'
+        '<div class="sec" style="margin:0 0 10px">EMBED THIS BADGE</div>'
+        f'<img src="{html.escape(d["badge_svg_url"], quote=True)}" '
+        f'alt="{html.escape(d["display_name"], quote=True)} on DAiL" '
+        'style="margin-bottom:12px">'
+        f'<textarea readonly rows="3" style="width:100%;background:#0a0e12;'
+        'color:#d7e3ec;border:1px solid #22303c;border-radius:6px;'
+        f'padding:10px;font-family:inherit;font-size:12px">{snippet}</textarea>'
+        '<p style="color:#7a8fa0;font-size:13px;margin:10px 0 0">'
+        'These numbers are computed from the ledger when the badge loads. '
+        'They cannot be edited.</p></div>')
 
 
 def _pp_title(p):

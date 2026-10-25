@@ -813,14 +813,8 @@ class Dail:
             b = _bal(a.id)
             return a.balance if b is None else b
 
-        def _bounty_net(b):
-            """Integer DAIL the hunter actually received (bnty_0217: the
-            paid wall showed phantom floats like 22.5 via round(reward*0.9,1)
-            instead of the real integer net)."""
-            fee = b.get("fee")
-            if fee is None:
-                fee = 0 if b.get("fee_waived") else self._fee(b["reward"])
-            return b["reward"] - fee
+        # Net bounty payouts use the shared Dail._bounty_net helper below
+        # (bnty_0217: integer net from the recorded fee, never a float).
 
         # Spotlight: top external earner by completed bounties.
         won = {}
@@ -855,7 +849,7 @@ class Dail:
                 # bnty_0110: show what the hunter actually received (net of the
                 # house fee), matching the paid-work wall — not the gross reward.
                 # bnty_0217: integer net from the recorded fee, not a float.
-                _net = _bounty_net(b)
+                _net = self._bounty_net(b)
                 bounty_events.append({
                     "type": "bounty_completed", "at": b["completed_at"],
                     "text": f"{_name(_hid)} completed "
@@ -937,7 +931,7 @@ class Dail:
                 {"bounty_id": b["id"], "title": b["title"],
                  "hunter": _name(b.get("hunter_id", "")),
                  "hunter_id": b.get("hunter_id", ""),
-                 "paid": _bounty_net(b),
+                 "paid": self._bounty_net(b),
                  "completed_at": b.get("completed_at"),
                  "claimed_at": b.get("claimed_at")}
                 for b in sorted(ext_completed,
@@ -946,6 +940,115 @@ class Dail:
             "verify": "Every completed bounty carries a ledger receipt. "
                       "Verify the tamper-evident chain: GET /audit/verify",
         }
+
+    def _bounty_net(self, b):
+        """Integer DAIL the hunter actually received (bnty_0217: the paid
+        wall showed phantom floats like 22.5 via round(reward*0.9,1) instead
+        of the real integer net). Recorded fee wins; a fee-waived bounty
+        nets the full reward; otherwise the house fee helper applies.
+        Shared by the Observatory paid wall and the Passport badge."""
+        fee = b.get("fee")
+        if fee is None:
+            fee = 0 if b.get("fee_waived") else self.world_agents._fee(b["reward"])
+        return b["reward"] - fee
+
+    def badge_data(self, agent_id, base_url="https://dail-3dci.onrender.com"):
+        """Verified-ledger badge data (Spec 1): numbers computed live from
+        persisted records + ledger per request, never stored, never
+        operator-editable. Starts from agent_passport(); dail_earned_net is
+        the sum of _bounty_net over completed bounties, NOT Passport's
+        gross dail_earned. completion_rate counts rejects + lapses;
+        denominator 0 -> None, never 1.0. Unknown, banned, or staff ->
+        KeyError (404), same as the Passport's unknown/banned handling."""
+        agent = self.agents.get(agent_id)
+        if agent is None or agent.status == "banned":
+            raise KeyError("no public passport for this agent")
+        if agent_id in self.PROTECTED_AGENTS:
+            raise KeyError("no public passport for this agent")
+        p = self.agent_passport(agent_id)
+        wa = self.world_agents
+        completed = [b for b in wa.bounties.values()
+                     if b["status"] == "completed"
+                     and b.get("hunter_id") == agent_id]
+        completed.sort(key=lambda b: b.get("completed_at") or "",
+                       reverse=True)
+        rejected = sum(1 for b in wa.bounties.values()
+                       if agent_id in (b.get("rejected_hunters") or []))
+        lapsed = sum(1 for b in wa.bounties.values()
+                     if agent_id in (b.get("lapsed_hunters") or []))
+        denom = len(completed) + rejected + lapsed
+        last = None
+        if completed:
+            newest = completed[0]
+            last = {"title": newest["title"], "bounty_id": newest["id"],
+                    "completed_at": newest.get("completed_at"),
+                    "receipt_url": f"/receipts/{newest['id']}"}
+        passport_url = f"{base_url}/passport/{agent_id}"
+        badge_svg_url = f"{base_url}/passport/{agent_id}/badge.svg"
+        from xml.sax.saxutils import escape as _esc
+        name_attr = _esc(p["display_name"], {'"': "&quot;"})
+        snippet_html = (
+            f'<a href="{passport_url}">'
+            f'<img src="{badge_svg_url}" alt="{name_attr} on DAiL">'
+            f"</a>")
+        return {
+            "agent_id": agent_id,
+            "display_name": p["display_name"],
+            "bounties_completed": len(completed),
+            "dail_earned_net": sum(self._bounty_net(b)
+                                   for b in completed),
+            "completion_rate": (len(completed) / denom) if denom else None,
+            "last_completed": last,
+            "passport_url": passport_url,
+            "badge_svg_url": badge_svg_url,
+            "as_of": datetime.now(timezone.utc).isoformat(),
+            "snippet_html": snippet_html,
+        }
+
+    def badge_svg(self, agent_id):
+        """Small README-safe SVG from badge_data() (no JS). Banned,
+        unknown, or staff -> KeyError (404), never stale numbers."""
+        from xml.sax.saxutils import escape as _esc
+        d = self.badge_data(agent_id)
+        name = _esc(d["display_name"])
+        rows = [
+            f'<text x="12" y="26" font-size="15" font-weight="bold" '
+            f'fill="#ffffff">{name}</text>',
+            f'<text x="12" y="48" font-size="12" fill="#7df0c0">'
+            f'{d["bounties_completed"]} bounties completed</text>',
+            f'<text x="12" y="68" font-size="12" fill="#7df0c0">'
+            f'{d["dail_earned_net"]} DAIL earned (net)</text>',
+        ]
+        y = 88
+        if d["last_completed"]:
+            receipt = _esc("https://dail-3dci.onrender.com"
+                           + d["last_completed"]["receipt_url"],
+                           {'"': "&quot;"})
+            rows.append(
+                f'<a href="{receipt}"><text x="12" y="{y}" font-size="12" '
+                f'fill="#f5b43c">Last receipt</text></a>')
+            y += 20
+        else:
+            rows.append(
+                f'<text x="12" y="{y}" font-size="12" fill="#7a8fa0">'
+                f'No completed bounties yet</text>')
+            y += 20
+        passport = _esc(d["passport_url"], {'"': "&quot;"})
+        rows.append(
+            f'<a href="{passport}"><text x="12" y="{y}" font-size="12" '
+            f'fill="#f5b43c">Verify &#8594;</text></a>')
+        y += 22
+        as_of = _esc(d["as_of"])
+        rows.append(
+            f'<text x="12" y="{y}" font-size="10" fill="#5b7183">'
+            f'Live from the DAiL ledger \u00b7 as of {as_of}</text>')
+        height = y + 14
+        body = "\n".join(rows)
+        return (
+            f'<svg xmlns="http://www.w3.org/2000/svg" width="340" '
+            f'height="{height}" role="img">'
+            f'<rect width="100%" height="100%" rx="10" fill="#11181f"/>'
+            f"{body}</svg>")
 
     def agent_passport(self, agent_id):
         """Public Agent Passport: one agent's persistent, verifiable career
