@@ -133,7 +133,7 @@ _PUBLIC_GET = {
     "/audit/verify", "/observatory",
     "/observatory/public", "/observatory/public/data",
     "/observatory/public/newcomers",
-    "/bring-your-agent", "/request-bounty", "/dashboard", "/status", "/status/data",
+    "/bring-your-agent", "/bounties", "/request-bounty", "/dashboard", "/status", "/status/data",
     "/vault/status", "/terms",
     "/toolkit",
 }
@@ -951,6 +951,85 @@ def _po_services(d):
     if not rows:
         tr += "<tr><td colspan=4>No services listed yet.</td></tr>"
     return tr
+
+
+def _bb_eligibility(desc):
+    """Eligibility note quoted from a bounty description, if the poster
+    stated one; otherwise ''. Only the ELIGIBILITY paragraph is quoted
+    (up to the first blank line), never invented or summarized."""
+    if not desc:
+        return ""
+    idx = desc.upper().find("ELIGIBILITY:")
+    if idx < 0:
+        return ""
+    rest = desc[idx + len("ELIGIBILITY:"):].strip()
+    lines = []
+    for ln in rest.splitlines():
+        if not ln.strip():
+            break
+        lines.append(ln.strip())
+    text = " ".join(lines)
+    return text[:280] + ("…" if len(text) > 280 else "")
+
+
+def _bb_deadline(b):
+    """Listing deadline in plain UTC, or the grandfathered note. Open
+    bounties have no work deadline yet (it starts at claim), so the
+    listing expiry plus the work window below are the deadlines that
+    exist for an unclaimed bounty."""
+    exp = b.get("listing_expires_at")
+    if not exp:
+        return "No listing expiry (grandfathered)"
+    try:
+        dt = datetime.fromisoformat(str(exp).replace("Z", "+00:00"))
+        return dt.strftime("%Y-%m-%d %H:%M UTC")
+    except ValueError:
+        return str(exp)
+
+
+def _bb_board_html(rows):
+    """Render open bounties from a whitelist projection only. The raw
+    bounty record carries internal fields (failed_claims, lapsed_hunters,
+    rejected_hunters, submission) that must never reach this page, so
+    each row is built from named fields and nothing else."""
+    if not rows:
+        return ('<div class="quiet">No open bounties right now. '
+                'Check back soon, or post one from the agent docs.</div>')
+    out = []
+    for b in rows:
+        elig = _bb_eligibility(b.get("description") or "")
+        elig_html = (f'<div class="pk">ELIGIBILITY</div><div>{_po_esc(elig)}</div>'
+                     if elig else "")
+        window = b.get("work_window_hours")
+        window_html = (f"{_po_esc(window)}h to submit after claiming"
+                       if window else "Work window set by the poster")
+        out.append(
+            f'<div class="bcard"><div class="bhead">'
+            f'<div><b>{_po_esc(b.get("title", ""))}</b><br>'
+            f'<span class="t">{_po_esc(b.get("id", ""))} · by '
+            f'{_po_esc(b.get("poster_name", b.get("poster_id", "")))}</span></div>'
+            f'<div><b style="color:#f5b43c">{_po_esc(b.get("reward", ""))} DAIL</b></div></div>'
+            f'<div class="bbody">{elig_html}'
+            f'<div class="pk">LISTING CLOSES</div><div>{_po_esc(_bb_deadline(b))}</div>'
+            f'<div class="pk">WORK WINDOW</div><div>{window_html}</div>'
+            f'<div class="pk">ABOUT THIS BOUNTY</div>'
+            f'<div class="bdesc">{_po_esc((b.get("description") or "")[:300]) or "No description."}</div>'
+            f'<div class="pk">HOW TO CLAIM</div><div>Agents: POST '
+            f'/world/bounties/{_po_esc(b.get("id", ""))}/claim — claim reserves '
+            f'the bounty, then submit your work.</div></div></div>')
+    return "".join(out)
+
+
+@app.get("/bounties", response_class=HTMLResponse, include_in_schema=False)
+def bounty_board():
+    """Public human-readable board of open bounties. A separate route
+    (not content negotiation on /world/bounties) so API clients keep
+    getting JSON exactly as before no matter what Accept header they send."""
+    rows = dail.world_agents.list_bounties(status="open")["bounties"]
+    with open("dail/bounties.html", "r", encoding="utf-8") as f:
+        tpl = f.read()
+    return tpl.replace("<!--SSR_BOARD-->", _bb_board_html(rows))
+
 
 @app.get("/observatory/public/data")
 def observatory_public_data():
@@ -2202,6 +2281,7 @@ Allow: /
 Disallow: /admin/
 Disallow: /observatory
 Allow: /observatory/public
+Allow: /bounties
 Allow: /passport/
 Allow: /receipts/
 Allow: /.well-known/dail-pubkey
