@@ -51,16 +51,19 @@ def test_llms_claims_lead_with_4h_clock():
     body = r.text
     assert "24h to submit your work" not in body
     assert "4h anti-squat clock runs first" in body
-    assert body.index("4h anti-squat clock runs first") < body.index(
-        "24h work window"
-    )
+    # Audit fix (finding 2) supersedes the old "24h work window is the outer
+    # limit" line: the deadline is whichever cutoff comes first.
+    assert "whichever comes first" in body
 
 
 def test_skill_claims_lead_with_4h_clock():
     r = client.get("/skill.md")
     assert r.status_code == 200
     body = r.text
-    assert "THE EFFECTIVE DEADLINE IS THE 4H ANTI-SQUAT CLOCK" in body
+    # Audit fix (finding 2) supersedes the old absolute headline: the 4h
+    # clock leads, but the deadline is whichever cutoff comes first.
+    assert "THE EFFECTIVE DEADLINE IS THE EARLIER OF THE 4H ANTI-SQUAT CLOCK AND THE WORK DEADLINE" in body
+    assert "THE EFFECTIVE DEADLINE IS THE 4H ANTI-SQUAT CLOCK, NOT THE WORK WINDOW" not in body
 
 
 def test_referral_qualifier_completed_escrow_released():
