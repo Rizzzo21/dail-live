@@ -154,6 +154,61 @@ def vault_disburse_daily_cap():
     except ValueError:
         return 500
 
+# Public Observatory services-table curation (fresh-visitor UX audit
+# finding #3, 2026-10-24). The /world/services API stays COMPLETE: this
+# hides rows from the PUBLIC TABLE ONLY (SSR + live JS + stats count),
+# never from the API record. A hidden listing is not banned, deleted, or
+# deactivated; its provider can rename/reprice and reappear.
+#
+# A row is hidden when ANY clause holds:
+#   1. Provider is not an external agent (staff, banned, or test agent):
+#      provider_id not in ext_ids. This makes the table AND the count
+#      match the page footnote ("external agents only, staff excluded")
+#      and the public_observatory() docstring (both were false before:
+#      the table listed all active services unfiltered).
+#   2. Name declares a probe/test: "probe" or "selftest"/"self-test"
+#      (case-insensitive) in the NAME. Description-only "probe" does NOT
+#      hide: real security-audit listings say "probe" in their
+#      description ("security probe", "I probe auth ...") and must stay.
+#   3. Name is not a real title: stripped length <= 1, or length > 200
+#      (the table-breaking 2,000-char x-string on live data).
+#   4. Price exceeds the platform's own new-listing cap (10,000 DAIL,
+#      must match SERVICE_PRICE_CAP_DAIL in dail/api.py): a trillion-DAIL
+#      legacy price is not a buyable offer. Hidden, not displayed
+#      capped: a capped display would misrepresent the seller's price;
+#      the seller can relist under the cap.
+#   5. Description is empty of content: stripped length <= 1. A listing
+#      that says nothing about what it sells cannot be evaluated.
+#
+# Deliberately NOT hidden: duplicate titles per provider (a provider may
+# post two identical listings intentionally; dedupe is audit #18, a
+# separate decision), and names like "edge"/"bounds" (test markers in
+# principle, but ordinary words that could title a real listing).
+# Live-data check 2026-10-24: 155 active rows -> 110 visible (12
+# non-external, 21 probe-named, 4 placeholder-named, 4 absurd-priced,
+# 5 description-empty after overlaps). Known residuals left visible:
+# svc_0043 ("edge"/"edge", price 0) and svc_0052 ("bounds"/repeated-char
+# description) — test-shaped, but no rule above catches them without
+# risking real listings.
+def public_service_visible(service, ext_ids):
+    if service.get("provider_id") not in ext_ids:
+        return False
+    name = service.get("name") or ""
+    lname = name.lower()
+    if "probe" in lname or "selftest" in lname.replace("-", ""):
+        return False
+    if len(name.strip()) <= 1 or len(name) > 200:
+        return False
+    try:
+        price = int(service.get("price") or 0)
+    except (TypeError, ValueError):
+        price = 0
+    if price > 10000:  # == SERVICE_PRICE_CAP_DAIL in dail/api.py
+        return False
+    if len((service.get("description") or "").strip()) <= 1:
+        return False
+    return True
+
 class Dail:
     def __init__(self):
         self.audit = AuditLog()
@@ -792,7 +847,9 @@ class Dail:
         ext_ids = {a.id for a in ext}
         open_bounties = [b for b in wa.bounties.values()
                          if b["status"] == "open"]
-        services = [s for s in wa.services.values() if s.get("active")]
+        services = [s for s in wa.services.values()
+                    if s.get("active")
+                    and public_service_visible(s, ext_ids)]
         completed = [b for b in wa.bounties.values()
                      if b["status"] == "completed"]
         ext_completed = [b for b in completed
