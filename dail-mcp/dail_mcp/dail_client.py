@@ -119,8 +119,55 @@ class DailClient:
     def list_bulletins(self):
         return self._request("GET", "/world/bulletins")
 
-    def list_bounties(self, status: str = "open"):
-        return self._request("GET", "/world/bounties", params={"status": status} if status else None)
+    def list_bounties(self, status: str = "open", limit: int | None = None):
+        params = {"status": status} if status else None
+        if limit is not None:
+            params = dict(params or {})
+            params["limit"] = limit
+        return self._request("GET", "/world/bounties", params=params)
+
+    def list_agents(self, limit: int = 20, sort: str = "bounties_won", newcomer_only: bool = False):
+        """Public leaderboard agents (no key). Rows come from the Observatory
+        leaderboard — the only public rows carrying bounties_won/dail_earned.
+        Earnings are GROSS reward sums (net only via individual receipts).
+        newcomer_only is NOT guessed in v1: it errors, per Spec 2."""
+        if newcomer_only:
+            raise DailError(0, "newcomer filter ships with the newcomers board (Spec 3)")
+        sort_keys = {"bounties_won": "bounties_won", "dail_earned": "dail_earned", "balance": "balance"}
+        if sort not in sort_keys:
+            raise DailError(0, "sort must be one of: bounties_won, dail_earned, balance")
+        try:
+            limit = int(limit)
+        except (TypeError, ValueError):
+            raise DailError(0, "limit must be an integer") from None
+        limit = max(1, min(limit, 100))
+        data = self._request("GET", "/observatory/public/data")
+        rows = data.get("leaderboard", []) if isinstance(data, dict) else []
+        key = sort_keys[sort]
+        shaped = [
+            {
+                "agent_id": r.get("id"),
+                "name": r.get("name"),
+                "balance": r.get("balance"),
+                "bounties_won": r.get("bounties_won"),
+                "dail_earned_gross": r.get("dail_earned"),
+                "passport_url": f"/passport/{r.get('id')}",
+            }
+            for r in rows
+        ]
+        shaped.sort(key=lambda r: r.get(key) or 0, reverse=True)
+        return shaped[:limit]
+
+    def get_receipt(self, bounty_id: str):
+        """Server-signed receipt for a completed bounty, verbatim, plus the
+        verification route. Non-completed/unknown ids surface the server's
+        404 as a DailError; a receipt is never synthesized."""
+        receipt = self._request("GET", f"/receipts/{bounty_id}")
+        if not isinstance(receipt, dict):
+            raise DailError(0, f"unexpected receipt response for {bounty_id}")
+        out = dict(receipt)
+        out["verify_via"] = "/.well-known/dail-pubkey"
+        return out
 
     def post_bounty(self, title: str, description: str, reward: int, agent_id: str | None = None):
         return self._request(

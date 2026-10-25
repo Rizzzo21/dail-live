@@ -11,8 +11,13 @@ Configuration (environment):
                     Sent as ``Authorization: Bearer <key>``.
     DAIL_AGENT_ID   Agent id owning the key; used as the default agent_id
                     for tools that act for an agent.
+    DAIL_READONLY   Set to ``1`` for read-only mode: only
+                    dail_list_bounties, dail_list_agents, and
+                    dail_get_receipt are registered, and the client is
+                    constructed without a key. Also available as the
+                    ``--readonly`` CLI flag. Default mode is unchanged.
 
-Run:  python3 server.py        (speaks JSON-RPC 2.0 over stdio)
+Run:  python3 server.py [--readonly]   (speaks JSON-RPC 2.0 over stdio)
 Test: python3 test_mcp.py      (protocol + live public-read checks)
 """
 
@@ -26,7 +31,7 @@ import uuid
 from .dail_client import DailClient, DailError
 
 PROTOCOL_VERSION = "2024-11-05"
-SERVER_INFO = {"name": "dail-marketplace", "version": "1.1.0"}
+SERVER_INFO = {"name": "dail-marketplace", "version": "1.2.0"}
 
 TOOLS = [
     {
@@ -44,7 +49,10 @@ TOOLS = [
         "description": "Find paid work: browse open bounties on the DAiL marketplace (public). Every bounty locks its reward in escrow at posting, so hunters know the money is real before they start. Claim one with dail_claim_bounty.",
         "inputSchema": {
             "type": "object",
-            "properties": {"status": {"type": "string", "description": "Filter: 'open' (default), 'claimed', 'completed', or '' for all"}},
+            "properties": {
+                "status": {"type": "string", "description": "Filter: 'open' (default), 'claimed', 'submitted', 'completed', 'cancelled', 'expired', 'paused', 'voided', or '' for all"},
+                "limit": {"type": "integer", "description": "Max bounties to return (maps to GET /world/bounties?status=&limit=)"},
+            },
             "additionalProperties": False,
         },
     },
@@ -185,19 +193,67 @@ TOOLS = [
     },
 ]
 
+# Read-only set (Spec 2): the ONLY tools registered when DAIL_READONLY=1
+# or --readonly is passed. dail_list_bounties is shared with TOOLS above;
+# dail_list_agents / dail_get_receipt are defined here and are NOT added to
+# the default TOOLS list, so default mode is unchanged.
+_TOOL_LIST_AGENTS = {
+    "name": "dail_list_agents",
+    "description": "Browse agents on the DAiL marketplace leaderboard (public, no key). Each row shows agent_id, name, balance, bounties won, and DAIL earned. Earnings are GROSS reward sums from the public Observatory, not net of fees — net pay is on each individual receipt, via dail_get_receipt. Staff and banned agents are already excluded by the Observatory's external-only filter.",
+    "inputSchema": {
+        "type": "object",
+        "properties": {
+            "limit": {"type": "integer", "description": "Max agents to return (default 20, max 100)"},
+            "sort": {"type": "string", "description": "Sort key: 'bounties_won' (default), 'dail_earned', or 'balance'", "enum": ["bounties_won", "dail_earned", "balance"]},
+            "newcomer_only": {"type": "boolean", "description": "Not available in v1: errors, rather than guessing a newcomer definition (newcomer filter ships with the newcomers board)"},
+        },
+        "additionalProperties": False,
+    },
+}
+
+_TOOL_GET_RECEIPT = {
+    "name": "dail_get_receipt",
+    "description": "Fetch the server-signed receipt for a completed bounty (public, no key). Returns the receipt verbatim — bounty, hunter, reward, fee, net paid, completion time, signer key and signature — plus verify_via for checking the signature. Unknown or non-completed bounties return the server's 404 as an error; a receipt is never synthesized.",
+    "inputSchema": {
+        "type": "object",
+        "properties": {
+            "bounty_id": {"type": "string", "description": "Bounty id of a completed bounty"},
+        },
+        "required": ["bounty_id"],
+        "additionalProperties": False,
+    },
+}
+
+_READONLY_BOUNTIES = next(t for t in TOOLS if t["name"] == "dail_list_bounties")
+READONLY_TOOLS = [_TOOL_LIST_AGENTS, _TOOL_GET_RECEIPT, _READONLY_BOUNTIES]
+READONLY_NAMES = {t["name"] for t in READONLY_TOOLS}
+
 
 def _text_result(data) -> dict:
     return {"content": [{"type": "text", "text": json.dumps(data, indent=2, default=str)}]}
 
 
-def _tool_call(client: DailClient, name: str, args: dict) -> dict:
+def _tool_call(client: DailClient, name: str, args: dict, readonly: bool = False) -> dict:
+    if readonly and name not in READONLY_NAMES:
+        raise DailError(0, f"tool not available in read-only mode: {name} (read-only mode exposes dail_list_bounties, dail_list_agents, dail_get_receipt only)")
     agent_id = args.get("agent_id") or None
     if name == "dail_list_services":
         return _text_result(client.list_services())
     if name == "dail_list_bulletins":
         return _text_result(client.list_bulletins())
     if name == "dail_list_bounties":
-        return _text_result(client.list_bounties(args.get("status") or "open"))
+        return _text_result(client.list_bounties(args.get("status") or "open", limit=args.get("limit")))
+    if name == "dail_list_agents":
+        return _text_result(client.list_agents(
+            limit=args.get("limit", 20),
+            sort=args.get("sort") or "bounties_won",
+            newcomer_only=bool(args.get("newcomer_only", False)),
+        ))
+    if name == "dail_get_receipt":
+        bounty_id = args.get("bounty_id")
+        if not bounty_id:
+            raise DailError(0, "bounty_id is required")
+        return _text_result(client.get_receipt(bounty_id))
     if name == "dail_post_bounty":
         return _text_result(client.post_bounty(args["title"], args["description"], args["reward"], agent_id))
     if name == "dail_claim_bounty":
@@ -222,7 +278,7 @@ def _tool_call(client: DailClient, name: str, args: dict) -> dict:
     raise DailError(0, f"unknown tool: {name}")
 
 
-def _handle(client: DailClient, msg: dict):
+def _handle(client: DailClient, msg: dict, readonly: bool = False):
     """Return the JSON-RPC response dict, or None for notifications."""
     method = msg.get("method")
     mid = msg.get("id")
@@ -241,10 +297,10 @@ def _handle(client: DailClient, msg: dict):
     if method == "ping":
         return {"jsonrpc": "2.0", "id": mid, "result": {}}
     if method == "tools/list":
-        return {"jsonrpc": "2.0", "id": mid, "result": {"tools": TOOLS}}
+        return {"jsonrpc": "2.0", "id": mid, "result": {"tools": READONLY_TOOLS if readonly else TOOLS}}
     if method == "tools/call":
         try:
-            result = _tool_call(client, params.get("name", ""), params.get("arguments") or {})
+            result = _tool_call(client, params.get("name", ""), params.get("arguments") or {}, readonly)
             return {"jsonrpc": "2.0", "id": mid, "result": result}
         except DailError as e:
             return {
@@ -281,14 +337,17 @@ def _read_message(buf) -> dict | None:
 
 
 def main() -> None:
-    client = DailClient()
+    readonly = "--readonly" in sys.argv[1:] or os.getenv("DAIL_READONLY", "") == "1"
+    # Read-only mode: keyless client (explicit empty key/ id, so no env key
+    # can leak in) and only the three read-only tools are registered.
+    client = DailClient(agent_key="", agent_id="") if readonly else DailClient()
     stdin, stdout = sys.stdin.buffer, sys.stdout.buffer
     while True:
         msg = _read_message(stdin)
         if msg is None:
             break
         try:
-            resp = _handle(client, msg)
+            resp = _handle(client, msg, readonly)
         except Exception as e:  # absolute last resort
             mid = msg.get("id")
             resp = {"jsonrpc": "2.0", "id": mid, "error": {"code": -32603, "message": f"internal: {e}"}}

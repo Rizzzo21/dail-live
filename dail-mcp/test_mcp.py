@@ -13,10 +13,17 @@ import json
 import os
 import subprocess
 import sys
+import urllib.request
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 
 PASSED, FAILED = 0, 0
+
+
+def urllib_request_url(url: str) -> str:
+    """GET a live public endpoint for cross-checking tool output."""
+    with urllib.request.urlopen(url, timeout=30) as resp:
+        return resp.read().decode("utf-8", "replace")
 
 
 def check(name: str, cond: bool, extra: str = ""):
@@ -30,11 +37,13 @@ def check(name: str, cond: bool, extra: str = ""):
 
 
 class Mcp:
-    def __init__(self):
-        env = {k: v for k, v in os.environ.items() if k != "DAIL_AGENT_KEY"}
+    def __init__(self, extra_env=None, args=None):
+        env = {k: v for k, v in os.environ.items() if k not in ("DAIL_AGENT_KEY", "DAIL_READONLY")}
         env["DAIL_AGENT_ID"] = ""
+        if extra_env:
+            env.update(extra_env)
         self.p = subprocess.Popen(
-            [sys.executable, os.path.join(HERE, "server.py")],
+            [sys.executable, os.path.join(HERE, "server.py")] + (args or []),
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env,
         )
         self._id = 0
@@ -153,6 +162,113 @@ def main():
 
     rc, err = m.close()
     check("server exits cleanly", rc == 0, f"rc={rc} stderr={err[:200]}")
+
+    # --- read-only mode (Spec 2): no key, DAIL_READONLY=1 ---
+    print("\n-- read-only mode --")
+    ro = Mcp(extra_env={"DAIL_READONLY": "1"})
+    ro.call("initialize", {"protocolVersion": "2024-11-05", "capabilities": {}, "clientInfo": {"name": "t", "version": "0"}})
+    ro.notify("notifications/initialized")
+
+    r = ro.call("tools/list")
+    ro_tools = {t["name"] for t in r.get("result", {}).get("tools", [])}
+    check(
+        "read-only tools/list shows exactly three tools",
+        ro_tools == {"dail_list_bounties", "dail_list_agents", "dail_get_receipt"},
+        f"got={sorted(ro_tools)}",
+    )
+
+    r = ro.call("tools/call", {"name": "dail_list_agents", "arguments": {}})
+    try:
+        agents = json.loads(r["result"]["content"][0]["text"])
+        keys_ok = all(
+            set(a) == {"agent_id", "name", "balance", "bounties_won", "dail_earned_gross", "passport_url"}
+            for a in agents
+        )
+        won = [a["bounties_won"] for a in agents]
+        urls_ok = all(a["passport_url"] == f"/passport/{a['agent_id']}" for a in agents)
+        check(
+            "dail_list_agents default sort: shaped rows, bounties_won desc, passport urls",
+            isinstance(agents, list) and len(agents) > 0 and keys_ok and urls_ok and won == sorted(won, reverse=True),
+            str(agents)[:200],
+        )
+        # cross-check first row against the live public endpoint
+        live = json.loads(urllib_request_url("https://dail-3dci.onrender.com/observatory/public/data"))
+        lb = live.get("leaderboard", [])
+        top = max(lb, key=lambda x: x["bounties_won"]) if lb else None
+        check(
+            "dail_list_agents top row matches live Observatory leaderboard",
+            top is not None and agents[0]["agent_id"] == top["id"] and agents[0]["dail_earned_gross"] == top["dail_earned"],
+            f"tool={agents[0] if agents else None} live={top}",
+        )
+    except Exception as e:
+        check("dail_list_agents default sort", False, f"{e} :: {str(r)[:200]}")
+
+    r = ro.call("tools/call", {"name": "dail_list_agents", "arguments": {"sort": "balance", "limit": 3}})
+    try:
+        agents = json.loads(r["result"]["content"][0]["text"])
+        check("dail_list_agents sort=balance limit=3", len(agents) == 3, str(agents)[:160])
+    except Exception as e:
+        check("dail_list_agents sort=balance limit=3", False, f"{e} :: {str(r)[:200]}")
+
+    r = ro.call("tools/call", {"name": "dail_list_agents", "arguments": {"newcomer_only": True}})
+    check(
+        "dail_list_agents newcomer_only -> newcomers-board error, no guessed filter",
+        "error" in r and "newcomers board" in r["error"]["message"],
+        str(r)[:200],
+    )
+
+    r = ro.call("tools/call", {"name": "dail_get_receipt", "arguments": {"bounty_id": "bnty_0244"}})
+    try:
+        rcpt = json.loads(r["result"]["content"][0]["text"])
+        live_rcpt = json.loads(urllib_request_url("https://dail-3dci.onrender.com/receipts/bnty_0244"))
+        verbatim = all(rcpt.get(k) == v for k, v in live_rcpt.items())
+        check(
+            "dail_get_receipt returns live receipt verbatim + verify_via",
+            verbatim and rcpt.get("verify_via") == "/.well-known/dail-pubkey"
+            and rcpt.get("hunter_id") == "ozma-audit-161030" and rcpt.get("net_paid") == 14,
+            str(rcpt)[:200],
+        )
+    except Exception as e:
+        check("dail_get_receipt returns live receipt verbatim + verify_via", False, f"{e} :: {str(r)[:200]}")
+
+    r = ro.call("tools/call", {"name": "dail_get_receipt", "arguments": {"bounty_id": "bnty_nope"}})
+    check("dail_get_receipt unknown id -> error, never synthesized", "error" in r, str(r)[:160])
+
+    r = ro.call("tools/call", {"name": "dail_list_bounties", "arguments": {"status": "open", "limit": 2}})
+    try:
+        bnts = json.loads(r["result"]["content"][0]["text"])
+        blist = bnts.get("bounties", bnts if isinstance(bnts, list) else [])
+        check("dail_list_bounties limit=2 in read-only mode", len(blist) == 2, str(bnts)[:160])
+    except Exception as e:
+        check("dail_list_bounties limit=2 in read-only mode", False, f"{e} :: {str(r)[:200]}")
+
+    # write-tool refusal must not move anything: bounty count unchanged
+    before = json.loads(urllib_request_url("https://dail-3dci.onrender.com/world/bounties?status=open"))
+    before_n = before.get("count") if isinstance(before, dict) else len(before)
+    r = ro.call("tools/call", {"name": "dail_post_bounty", "arguments": {"title": "t", "description": "d", "reward": 5}})
+    after = json.loads(urllib_request_url("https://dail-3dci.onrender.com/world/bounties?status=open"))
+    after_n = after.get("count") if isinstance(after, dict) else len(after)
+    check(
+        "dail_post_bounty in read-only mode -> error, open bounty count unchanged",
+        "error" in r and "read-only" in r["error"]["message"] and before_n == after_n,
+        f"error={str(r)[:120]} before={before_n} after={after_n}",
+    )
+
+    rc, err = ro.close()
+    check("read-only server exits cleanly", rc == 0, f"rc={rc} stderr={err[:200]}")
+
+    # --- --readonly CLI flag alone must also expose exactly three tools ---
+    flag = Mcp(args=["--readonly"])
+    flag.call("initialize", {"protocolVersion": "2024-11-05", "capabilities": {}, "clientInfo": {"name": "t", "version": "0"}})
+    r = flag.call("tools/list")
+    flag_tools = {t["name"] for t in r.get("result", {}).get("tools", [])}
+    check(
+        "--readonly flag alone exposes exactly three tools",
+        flag_tools == {"dail_list_bounties", "dail_list_agents", "dail_get_receipt"},
+        f"got={sorted(flag_tools)}",
+    )
+    rc, err = flag.close()
+    check("flag-mode server exits cleanly", rc == 0, f"rc={rc} stderr={err[:200]}")
 
     print(f"\n{PASSED} passed, {FAILED} failed")
     sys.exit(1 if FAILED else 0)

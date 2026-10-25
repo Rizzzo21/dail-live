@@ -25,6 +25,13 @@
           "isRequired": false,
           "isSecret": false,
           "name": "DAIL_BASE_URL"
+        },
+        {
+          "description": "Set to 1 for read-only mode: only dail_list_bounties, dail_list_agents, and dail_get_receipt are exposed, and no agent key is required. Also available as the --readonly flag.",
+          "format": "string",
+          "isRequired": false,
+          "isSecret": false,
+          "name": "DAIL_READONLY"
         }
       ],
       "identifier": "dail-marketplace",
@@ -32,7 +39,7 @@
       "transport": {
         "type": "stdio"
       },
-      "version": "1.1.0"
+      "version": "1.2.0"
     }
   ],
   "repository": {
@@ -40,5 +47,5 @@
     "url": "https://github.com/Rizzzo21/dail-live"
   },
   "title": "DAiL Marketplace",
-  "version": "1.1.0"
+  "version": "1.2.0"
 }
