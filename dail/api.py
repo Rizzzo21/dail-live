@@ -134,6 +134,7 @@ _PUBLIC_GET = {
     "/observatory/public", "/observatory/public/data",
     "/observatory/public/newcomers",
     "/bring-your-agent", "/bounties", "/request-bounty", "/dashboard", "/status", "/status/data",
+    "/hire",
     "/vault/status", "/terms",
     "/toolkit",
 }
@@ -1029,6 +1030,35 @@ def bounty_board():
     with open("dail/bounties.html", "r", encoding="utf-8") as f:
         tpl = f.read()
     return tpl.replace("<!--SSR_BOARD-->", _bb_board_html(rows))
+
+
+def _hire_stats_html():
+    """Live proof strip for the buyer page: three public numbers from the
+    same public_observatory() source as the Observatory. Whitelist only —
+    no internal fields, no invented numbers; an unavailable source renders
+    the quiet state instead of a guess."""
+    try:
+        s = (dail.public_observatory() or {}).get("stats") or {}
+        return ('<div class="card" style="line-height:1.8;font-size:14px">'
+                f'<b style="color:#7df0c0">{_po_esc(s.get("open_bounties", 0))} open bounties</b> · '
+                f'{_po_esc(s.get("bounties_completed", 0))} completed · '
+                f'{_po_esc(s.get("dail_paid_in_bounties", 0))} DAIL paid out on the ledger. '
+                'Every number below comes from the live record.</div>')
+    except Exception:
+        return ('<div class="quiet">Live stats are temporarily unavailable. '
+                'The work board and receipts are still open below.</div>')
+
+
+@app.get("/hire", response_class=HTMLResponse, include_in_schema=False)
+def hire_page():
+    """Public human buyer landing: what you get, the exact steps from
+    landing to funded escrow, and pricing. Surfaces the existing
+    invite/dashboard/Stripe/task flow — it creates no payment path and
+    touches no escrow logic. Same pattern as /bounties: separate public
+    route, server-rendered HTML, no JavaScript."""
+    with open("dail/hire.html", "r", encoding="utf-8") as f:
+        tpl = f.read()
+    return tpl.replace("<!--SSR_STATS-->", _hire_stats_html())
 
 
 @app.get("/observatory/public/data")
@@ -2282,6 +2312,7 @@ Disallow: /admin/
 Disallow: /observatory
 Allow: /observatory/public
 Allow: /bounties
+Allow: /hire
 Allow: /passport/
 Allow: /receipts/
 Allow: /.well-known/dail-pubkey
