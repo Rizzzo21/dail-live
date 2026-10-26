@@ -248,18 +248,27 @@ def _require_admin(request: Request):
 
 
 def _try_identity(request: Request):
-    """Resolve the caller: 'admin', 'bouncer', an agent id, or None."""
+    """Resolve the caller: ('admin', None), ('bouncer', None),
+    ('agent', agent_id), or (None, None).
+
+    SECURITY (2026-10-26): the credential kind is explicit and can never
+    collide with an agent id. Previously this returned the raw strings
+    'admin' / 'bouncer' for header credentials AND for bearer-derived
+    agent ids, so an agent registered with id 'admin' or 'bouncer'
+    inherited admin/bouncer powers at the gate (vault disbursal, fake
+    Concierge DMs, bans, private-room audit reads). Bearer-derived ids
+    are now always kind 'agent', whatever the string."""
     if _admin_ok(request.headers.get("x-dail-admin-key")):
-        return "admin"
+        return ("admin", None)
     if _bouncer_ok(request.headers.get("x-dail-bouncer-key")):
-        return "bouncer"
+        return ("bouncer", None)
     auth = request.headers.get("authorization", "")
     parts = auth.split(None, 1)
     if len(parts) == 2 and parts[0].lower() == "bearer":
         aid = dail.keystore.verify(parts[1])
         if aid:
-            return aid
-    return None
+            return ("agent", aid)
+    return (None, None)
 
 
 def _strip_head_body(response):
@@ -299,9 +308,9 @@ async def auth_gate(request: Request, call_next):
         if head_public:
             return _strip_head_body(response)
         return response
-    ident = _try_identity(request)
+    id_kind, ident = _try_identity(request)
     if kind == "admin":
-        if ident == "admin":
+        if id_kind == "admin":
             request.state.caller = None
             request.state.is_admin = True
             return await call_next(request)
@@ -310,18 +319,18 @@ async def auth_gate(request: Request, call_next):
         # Bouncer key or admin key. The bouncer key is scoped: it passes
         # this gate ONLY for /bouncer/ routes (ban/unban). It is rejected
         # on every /admin/ route above.
-        if ident in ("admin", "bouncer"):
-            request.state.caller = None if ident == "admin" else "bouncer"
-            request.state.is_admin = (ident == "admin")
+        if id_kind in ("admin", "bouncer"):
+            request.state.caller = None if id_kind == "admin" else "bouncer"
+            request.state.is_admin = (id_kind == "admin")
             return await call_next(request)
         return JSONResponse({"detail": "bouncer_key_invalid"}, status_code=403)
     # agent routes: valid agent key required; admin key is a superuser.
     # The bouncer key is NOT valid here -- it only works on /bouncer/.
-    if ident == "admin":
+    if id_kind == "admin":
         request.state.caller = None
         request.state.is_admin = True
         return await call_next(request)
-    if ident and ident != "bouncer":
+    if id_kind == "agent" and ident:
         # Banned agents are dead at the gate: their keys were revoked at
         # ban time, but this covers any cached/stale credential path.
         if dail.is_banned(ident):
@@ -359,7 +368,8 @@ class RuntimeGoalRequest(BaseModel):
 @app.get("/launch", response_class=HTMLResponse, include_in_schema=False)
 def launch():
     with open("dail/launch.html", "r", encoding="utf-8") as f:
-        return f.read()
+        tpl = f.read()
+    return tpl.replace("<!--SSR_RECENT_PAID-->", _recent_paid_html())
 
 @app.get("/payments/status")
 def payment_status():
@@ -1049,6 +1059,59 @@ def _hire_stats_html():
                 'The work board and receipts are still open below.</div>')
 
 
+def _recent_paid_html(limit=5):
+    """Recently-paid strip (competitor scan 2026-10-26 item 2): the last
+    settled bounty escrows, live from the ledger-backed paid wall — never
+    hand-written. External agents only: staff/banned hunters are already
+    excluded upstream, and probe/selftest-named hunters are filtered here
+    with the same predicate as the public-table curation. SSR, no
+    JavaScript. An empty wall or an unavailable source renders the quiet
+    state, never invented rows."""
+    try:
+        wall = (dail.public_observatory() or {}).get("paid_wall") or []
+    except Exception:
+        return ('<div style="border:1px dashed #22303c;border-radius:10px;'
+                'padding:16px;margin:16px 0;color:#5b7183;font-size:13px;'
+                'text-align:center">Recently paid is temporarily '
+                'unavailable.</div>')
+    rows = []
+    for w in wall:
+        hid = (w.get("hunter_id") or "")
+        hname = (w.get("hunter") or hid)
+        if ("probe" in hid.lower()
+                or "selftest" in hid.lower().replace("-", "")
+                or "probe" in hname.lower()
+                or "selftest" in hname.lower().replace("-", "")):
+            continue
+        rows.append(w)
+        if len(rows) >= limit:
+            break
+    if not rows:
+        return ('<div style="border:1px dashed #22303c;border-radius:10px;'
+                'padding:16px;margin:16px 0;color:#5b7183;font-size:13px;'
+                'text-align:center">No settled payments yet — the first '
+                'paid work will appear here.</div>')
+    items = "".join(
+        f'<div style="font-size:14px;line-height:1.7">'
+        f'<a href="/passport/{_po_esc(w.get("hunter_id", ""))}" '
+        f'style="color:#7df0c0">{_po_esc(w.get("hunter", ""))}</a>'
+        f' earned <b>{_po_esc(w.get("paid", ""))} DAIL</b> — '
+        f'{_po_esc((w.get("title") or "")[:70])}'
+        f' <span style="color:#5b7183">· {_po_esc((w.get("completed_at") or "")[:10])} · '
+        f'<a href="/receipts/{_po_esc(w.get("bounty_id", ""))}" '
+        f'style="color:#7df0c0">Receipt</a></span></div>'
+        for w in rows)
+    return ('<div style="border:1px solid #22303c;border-radius:10px;'
+            'padding:16px;margin:16px 0;background:#0a1218">'
+            '<div style="font-size:13px;letter-spacing:2px;color:#7a8fa0;'
+            'margin-bottom:10px">RECENTLY PAID — LIVE FROM THE LEDGER</div>'
+            f'{items}'
+            '<div style="margin-top:10px;font-size:12px;color:#5b7183">'
+            'Every payment links to its signed receipt. '
+            '<a href="/observatory/public" style="color:#7df0c0">'
+            'See all receipts →</a></div></div>')
+
+
 @app.get("/hire", response_class=HTMLResponse, include_in_schema=False)
 def hire_page():
     """Public human buyer landing: what you get, the exact steps from
@@ -1058,7 +1121,8 @@ def hire_page():
     route, server-rendered HTML, no JavaScript."""
     with open("dail/hire.html", "r", encoding="utf-8") as f:
         tpl = f.read()
-    return tpl.replace("<!--SSR_STATS-->", _hire_stats_html())
+    return (tpl.replace("<!--SSR_STATS-->", _hire_stats_html())
+               .replace("<!--SSR_RECENT_PAID-->", _recent_paid_html()))
 
 
 @app.get("/observatory/public/data")
@@ -1465,6 +1529,13 @@ def create_agent(agent: AgentCreateRequest, request: Request):
         name = (agent.name or "").strip()
         if not aid or not name:
             raise HTTPException(400, "id and name are required")
+        # SECURITY (2026-10-26): unbounded ids/names bloat KV, audit, and
+        # every public listing that renders them. 64/120 chars covers every
+        # legitimate id seen to date (longest production id ~27 chars).
+        if len(aid) > 64:
+            raise HTTPException(400, "id must be 1-64 characters")
+        if len(name) > 120:
+            raise HTTPException(400, "name must be 1-120 characters")
         # The starter grant is fixed server-side: 10 DAIL flat (cut from the
         # founding-100 step-down on 2026-10-09).
         # Never trust client-supplied balance/limits/status (sug_0002,
@@ -1600,7 +1671,10 @@ def social_message(req: RoomMessageRequest, request: Request):
     _own(request, req.agent_id)
     # Idempotency replays return the original post without re-notifying:
     # the first pass already turned @-mentions into notifications.
-    is_retry = bool(req.idempotency_key) and req.idempotency_key in dail.social.msg_idem
+    # SECURITY (2026-10-26): the key is scoped per agent. An unscoped key
+    # let any agent replay another agent's key and receive that agent's
+    # (possibly private-room) message content in the response.
+    is_retry = bool(req.idempotency_key) and f"{req.agent_id}:{req.idempotency_key}" in dail.social.msg_idem
     try: result = dail.social.communicate(req.agent_id,req.room_id,req.message,req.idempotency_key)
     except KeyError as e: raise HTTPException(404,_clean_404(e))
     except PermissionError as e: raise HTTPException(403,str(e))
@@ -1688,8 +1762,9 @@ def staff_dm_send(req: DMSendRequest, request: Request):
     bnty_0166 friction audit: the lobby was 86% house-generated (manager
     nudges + host welcomes). 1:1 nudges now go here instead of the lobby;
     public moderation stays in the lobby."""
-    caller = _try_identity(request)
-    if caller not in ("dail_host", "dail_manager") and not request.state.is_admin:
+    id_kind, caller = _try_identity(request)
+    if not ((id_kind == "agent" and caller in ("dail_host", "dail_manager"))
+            or id_kind == "admin"):
         raise HTTPException(403, "staff_dm_forbidden")
     try: return dail.social.dm_send(req.agent_id, req.message)
     except KeyError as e: raise HTTPException(404,_clean_404(e))
@@ -1697,8 +1772,8 @@ def staff_dm_send(req: DMSendRequest, request: Request):
 
 def _agent_caller(request: Request):
     """Resolve an agent identity from Bearer auth; never admin/bouncer."""
-    caller = _try_identity(request)
-    if not caller or caller in ("admin", "bouncer"):
+    id_kind, caller = _try_identity(request)
+    if id_kind != "agent" or not caller:
         raise HTTPException(403, "agent_auth_required")
     return caller
 
@@ -2165,11 +2240,15 @@ def admin_vault_mint(req: VaultMintRequest, request: Request):
 def vault_disburse(req: VaultDisburseRequest, request: Request):
     """Staff draw from the vault (welcomes, bounty funding, top-ups).
     Caller must be dail_host or dail_manager (Bearer). Daily caps apply."""
-    caller = _try_identity(request)
-    if caller not in ("dail_host", "dail_manager") and not request.state.is_admin:
+    id_kind, caller = _try_identity(request)
+    if id_kind == "admin":
+        staff_id = "dail_manager"
+    elif id_kind == "agent" and caller in ("dail_host", "dail_manager"):
+        staff_id = caller
+    else:
         raise HTTPException(403, "vault_disburse_forbidden")
     try:
-        tx = dail.vault_disburse(caller if caller in ("dail_host", "dail_manager") else "dail_manager",
+        tx = dail.vault_disburse(staff_id,
                                  req.agent_id, req.amount, req.purpose, req.idempotency_key)
         return {"tx": tx.id, "vault": dail.vault_status()}
     except KeyError as e:
