@@ -97,7 +97,10 @@ class RoomCreateRequest(BaseModel):
     owner_id: str
     name: str
     private: bool = True
-    rent_credits: int = Field(default=10, ge=0)
+    # SECURITY (2026-10-26): rent auto-charges on join — cap it so a room
+    # cannot be priced at a victim's whole balance (service layer enforces
+    # the same bound for direct callers).
+    rent_credits: int = Field(default=10, ge=0, le=100)
 
 class RoomMessageRequest(BaseModel):
     agent_id: str

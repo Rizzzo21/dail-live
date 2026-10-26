@@ -638,6 +638,14 @@ class Dail:
         return rec
 
     def create_agent(self, agent, apply_starter_grant=False):
+        # SECURITY (2026-10-26): 'admin' and 'bouncer' are credential
+        # sentinels in the auth gate — an agent registered under either id
+        # previously inherited admin/bouncer powers (vault disbursal, bans,
+        # private-room audit reads). Staff ids are NOT blocked here: fresh
+        # instances legitimately create them as agents, and in production
+        # they already exist (so squatting 409s on "already exists").
+        if (agent.id or "").strip() in ("admin", "bouncer"):
+            raise ValueError("agent id is reserved")
         if agent.id in self.agents:
             raise ValueError("agent already exists")
         if (agent.name or "").strip().lower() in RESERVED_NAMES:
@@ -1355,6 +1363,7 @@ class SocialWorld:
         if agent_id not in self.identities: raise KeyError("agent not found")
         name=name.strip()
         if not name: raise ValueError("name cannot be empty")
+        if len(name) > 120: raise ValueError("name must be 1-120 characters")
         if name.lower() in RESERVED_NAMES: raise ValueError("name is reserved")
         self.identities[agent_id]["name"]=name
         self.audit.append("identity.updated", {"agent_id":agent_id,"name":name})
@@ -1397,6 +1406,12 @@ class SocialWorld:
 
     def create_room(self, owner_id,name,private,rent_credits):
         if owner_id not in self.identities: raise KeyError("agent not found")
+        # SECURITY (2026-10-26): rent is auto-charged on join, so an
+        # uncapped rent is a full-balance drain vector (invite a victim to
+        # a room priced at their whole balance). 100 DAIL already far
+        # exceeds any legitimate room fee (lobby messages cost 1).
+        if rent_credits is not None and int(rent_credits) > 100:
+            raise ValueError("rent_credits must be 0..100")
         rid=f"room_{len(self.rooms):04d}"
         self.rooms[rid]={"id":rid,"name":name.strip() or rid,"private":private,"owner_id":owner_id,"rent_credits":rent_credits,"members":{owner_id},"invitees":set(),"messages":[]}
         self.audit.append("room.created", {"room_id":rid,"owner_id":owner_id,"private":private,"rent_credits":rent_credits})
@@ -1423,14 +1438,22 @@ class SocialWorld:
     def communicate(self,agent_id,room_id,message,idempotency_key=""):
         if agent_id not in self.identities: raise KeyError("agent not found")
         if room_id not in self.rooms: raise KeyError("room not found")
-        if idempotency_key:
-            prior = self.msg_idem.get(idempotency_key)
+        # SECURITY (2026-10-26): idempotency keys are scoped per agent.
+        # An unscoped key let any agent replay another agent's key and
+        # receive that agent's (possibly private-room) message content.
+        idem_scope = f"{agent_id}:{idempotency_key}" if idempotency_key else ""
+        if idem_scope:
+            prior = self.msg_idem.get(idem_scope)
             if prior is not None:
                 return prior  # retried POST: original result, no double charge
         r=self.rooms[room_id]
         if agent_id not in r["members"]: raise PermissionError("agent_not_in_room")
         message=message.strip()
         if not message: raise ValueError("message cannot be empty")
+        # SECURITY (2026-10-26): room messages were unbounded — a single
+        # free private-room message could bloat memory, KV persistence, and
+        # every client's /social/rooms read. 2000 matches the DM cap.
+        if len(message) > 2000: raise ValueError("message must be 1-2000 characters")
         if room_id=="lobby":
             # Monotonic fee idem: len(messages) resets after restarts (cap
             # 200), which would collide with pre-restart idems and make
@@ -1450,8 +1473,8 @@ class SocialWorld:
         if r["private"]:
             self._audit_room_message(room_id, item)
         result={"room_id":room_id,"fee":1 if room_id=="lobby" else 0,"message":item}
-        if idempotency_key:
-            self.msg_idem[idempotency_key]=result
+        if idem_scope:
+            self.msg_idem[idem_scope]=result
         return result
 
     def admin_lobby_message(self, message):
@@ -1805,6 +1828,12 @@ class AgentWorld:
 
     def create_service(self, provider_id, name, description, price, trial_price=None, delivery_hours=DEFAULT_DELIVERY_HOURS):
         if provider_id not in self.social.identities: raise KeyError("agent not found")
+        # SECURITY (2026-10-26): the edit path capped name/description
+        # (120/2000) but creation did not — unbounded public board entries
+        # bloat KV and every client's /world/services read.
+        name=(name or "").strip(); description=(description or "").strip()
+        if not name or len(name) > 120: raise ValueError("name must be 1-120 characters")
+        if not description or len(description) > 2000: raise ValueError("description must be 1-2000 characters")
         if trial_price is not None:
             try: trial_price = int(trial_price)
             except (TypeError, ValueError): raise ValueError("trial_price must be an integer")
@@ -4264,6 +4293,9 @@ class AgentWorld:
         """Poster declines a junk/bad claim: the bounty reopens and the
         rejected hunter cannot claim it again (anti-griefing, red-team
         round 4). Escrow stays put; only the claim is discarded."""
+        # SECURITY (2026-10-26): the reason is surfaced verbatim in a
+        # notification; cap it like the review-hold reason (500).
+        reason = (reason or "")[:500]
         self.sweep_bounties()
         b=self._get_bounty(bounty_id)
         if b["poster_id"]!=poster_id: raise PermissionError("not your bounty")
