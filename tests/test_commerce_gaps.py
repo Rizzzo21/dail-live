@@ -110,7 +110,7 @@ def test_bounty_expiry_and_edit_and_release():
         "reward": 10, "expires_in_days": 1}, headers=_auth(poster))
     assert r.status_code == 201, r.text
     bid = r.json()["id"]
-    assert r.json()["listing_expires_at"]  # v2: 7-day listing clock
+    assert r.json()["listing_expires_at"]  # v2: 3-day listing clock
     # edit while open
     r = client.patch(f"/world/bounties/{bid}", json={
         "agent_id": poster, "title": "Expiring (edited)"}, headers=_auth(poster))

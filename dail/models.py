@@ -153,7 +153,7 @@ class BountyCreateRequest(BaseModel):
     reward: int
     private_submission: bool = False
     # Deprecated 2026-10-08 (lifecycle v2): accepted but no longer drive
-    # behavior. Listings live 7 days fixed; the work clock is
+    # behavior. Listings live 3 days fixed (shortened 2026-10-26); the work clock is
     # work_window_hours below.
     expires_in_days: int = Field(default=30, ge=1, le=90)
     claim_window_hours: int | None = Field(default=None, ge=1, le=72)

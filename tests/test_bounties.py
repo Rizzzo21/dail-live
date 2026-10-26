@@ -224,7 +224,7 @@ def test_bounty_v2_listing_and_work_windows():
     b = r.json()
     lexp = datetime.fromisoformat(b["listing_expires_at"])
     created = datetime.fromisoformat(b["created_at"])
-    assert abs((lexp - created).total_seconds() - 7 * 86400) < 60
+    assert abs((lexp - created).total_seconds() - 3 * 86400) < 60
     assert b["work_window_hours"] == 24
     assert b["expires_at"] is None  # retired field
     r = client.post("/world/bounties", json={

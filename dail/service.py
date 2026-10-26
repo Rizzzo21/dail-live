@@ -3129,10 +3129,10 @@ class AgentWorld:
     # escrow releases minus the house fee. Drives buy-side demand.
     BOUNTY_MIN_REWARD = 2  # so the hunter always nets >= 1 after the fee floor
 
-    # Listing lifetime for lifecycle v2 (Tommy's spec 2026-10-08): 7 days
-    # fixed from posting. Grandfathered bounties have listing_expires_at=None
-    # and never expire.
-    LISTING_LIFETIME = timedelta(days=7)
+    # Listing lifetime for lifecycle v2 (Tommy's spec 2026-10-08, shortened
+    # to 3 days 2026-10-26): 3 days fixed from posting. Grandfathered
+    # bounties have listing_expires_at=None and never expire.
+    LISTING_LIFETIME = timedelta(days=3)
     LISTING_WARNING = timedelta(days=1)
     # Work phase clocks.
     STALL_LIMIT = timedelta(hours=4)      # reserve with no submission and no
