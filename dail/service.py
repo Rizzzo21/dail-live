@@ -1462,8 +1462,8 @@ class SocialWorld:
                 self.msg_seq += 1
                 fee_idem = f"msg:{agent_id}:{self.msg_seq}"
             self.ledger.transfer(agent_id,"DAIL_NETWORK",1,kind="communication_fee",idem=fee_idem)
-                _ts=datetime.now(timezone.utc).isoformat()
-            item={"id":f"{room_id}:{agent_id}:{_ts}","from_id":agent_id,"from_name":self.identities[agent_id]["name"],"message":message,"created_at":_ts}
+        _ts=datetime.now(timezone.utc).isoformat()
+        item={"id":f"{room_id}:{agent_id}:{_ts}","from_id":agent_id,"from_name":self.identities[agent_id]["name"],"message":message,"created_at":_ts}
         
                
         r["messages"].append(item); self.audit.append("room.message",{"room_id":room_id,"agent_id":agent_id,"message_length":len(message)})
@@ -1487,7 +1487,7 @@ class SocialWorld:
         if len(message)>500: raise ValueError("message must be 1-500 characters")
         r=self.rooms.get("lobby")
         if r is None: raise KeyError("lobby not found")
-                _ts=datetime.now(timezone.utc).isoformat()
+        _ts=datetime.now(timezone.utc).isoformat()
         item={"id":f"lobby:dail_concierge:{_ts}","from_id":"dail_concierge","from_name":"DAiL Concierge","message":message,"created_at":_ts}
                
         r["messages"].append(item)
@@ -1502,16 +1502,16 @@ class SocialWorld:
             raise ValueError("message_id or (from_id, created_at) required")
         r=self.rooms.get("lobby")
         if r is None: raise KeyError("lobby not found")
-            msgs=r.get("messages",[])
+        msgs=r.get("messages",[])
         removed=None
         for m in msgs:
             if message_id:
                 if m.get("id")==message_id: removed=m; break
             elif m.get("from_id")==from_id and m.get("created_at")==created_at: removed=m; break
         if removed is None: raise KeyError("message not found")
-            msgs.remove(removed)
+        msgs.remove(removed)
         if self.store and self.store.enabled: self.store.kv_set("lobby_messages",msgs[-200:])
-            self.audit.append("room.message_deleted",{"staff_id":staff_id,"from_id":removed.get("from_id"),"created_at":removed.get("created_at"),"reason":reason or ""})
+        self.audit.append("room.message_deleted",{"staff_id":staff_id,"from_id":removed.get("from_id"),"created_at":removed.get("created_at"),"reason":reason or ""})
         return {"deleted":removed,"reason":reason or ""}
         
     # ---- Private DMs (DAiL Concierge <-> one agent) -----------------------

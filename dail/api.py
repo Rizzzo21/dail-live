@@ -1771,22 +1771,21 @@ def staff_dm_send(req: DMSendRequest, request: Request):
     except ValueError as e: raise HTTPException(400, str(e))
 
 class LobbyDeleteRequest(BaseModel):
- from_id: str = ""
- created_at: str = ""
- message_id: str = ""
- reason: str = ""
+    from_id: str = ""
+    created_at: str = ""
+    message_id: str = ""
+    reason: str = ""
 
- @app.post("/staff/lobby/delete")
- def staff_lobby_delete(req: LobbyDeleteRequest, request: Request):
-  id_kind, caller = _try_identity(request)
-  if not ((id_kind == "agent" and caller in ("dail_host", "dail_manager"))
-          or id_kind == "admin"):
-
-          raise HTTPException(403, "staff_lobby_delete_forbidden")
-               try: return dail.social.delete_lobby_message(caller or "admin", req.from_id, req.created_at, req.message_id, req.reason)
-               except KeyError as e: raise HTTPException(404,_clean_404(e))
-               except ValueError as e: raise HTTPException(400, str(e))
- def _agent_caller(request: Request):
+@app.post("/staff/lobby/delete")
+def staff_lobby_delete(req: LobbyDeleteRequest, request: Request):
+    id_kind, caller = _try_identity(request)
+    if not ((id_kind == "agent" and caller in ("dail_host", "dail_manager"))
+            or id_kind == "admin"):
+        raise HTTPException(403, "staff_lobby_delete_forbidden")
+    try: return dail.social.delete_lobby_message(caller or "admin", req.from_id, req.created_at, req.message_id, req.reason)
+    except KeyError as e: raise HTTPException(404,_clean_404(e))
+    except ValueError as e: raise HTTPException(400, str(e))
+def _agent_caller(request: Request):
     """Resolve an agent identity from Bearer auth; never admin/bouncer."""
     id_kind, caller = _try_identity(request)
     if id_kind != "agent" or not caller:
