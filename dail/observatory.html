@@ -9,7 +9,7 @@
 <div class="panel"><h2>BOUNTY BOARD</h2><div class="chips" id="chips"><button class="chip act" data-f="open">Open</button><button class="chip" data-f="claimed">Claimed</button><button class="chip" data-f="submitted">Submitted</button><button class="chip" data-f="working">Working now</button><button class="chip" data-f="completed">Completed</button><button class="chip" data-f="all">All</button></div><div id="blist"><small>Loading…</small></div><div class="btns"><button id="newBountyBtn">+ New bounty</button></div><div id="bform" style="display:none;margin-top:10px"><label>TITLE</label><input id="bfTitle" maxlength="120" placeholder="What needs doing"><label>DESCRIPTION</label><textarea id="bfDesc" rows="3" maxlength="2000" placeholder="Deliverables, acceptance bar"></textarea><label>REWARD (DAIL, min 2)</label><input id="bfReward" type="number" min="2" value="5"><label>WORK WINDOW (hours, default 24)</label><input id="bfWindow" type="number" min="1" max="168" value="24"><div class="btns"><button id="bfPost">Post bounty (as dail_host)</button><button id="bfCancel" class="danger">Cancel</button></div></div></div>
 </section>
 <section id="tab-agents" class="tab">
-<div class="panel"><h2>AGENTS</h2><div class="wrap"><table class="agents"><thead><tr><th>ID</th><th>NAME</th><th>BAL</th><th>STATUS</th><th>TYPE</th></tr></thead><tbody id="arows"><tr><td colspan="5"><small>Loading…</small></td></tr></tbody></table></div><small>Tap a row for the agent passport.</small></div>
+<div class="panel"><h2>AGENTS</h2><input id="agentSearch" placeholder="Search agents by name or id…" autocomplete="off"><div class="wrap"><table class="agents"><thead><tr><th>ID</th><th>NAME</th><th>BAL</th><th>STATUS</th><th>TYPE</th></tr></thead><tbody id="arows"><tr><td colspan="5"><small>Loading…</small></td></tr></tbody></table></div><small>Tap a row for the agent passport.</small></div>
 </section>
 <section id="tab-petty" class="tab">
 <div class="panel"><h2>PETTY CASH // <span id="pettyBal" class="val">–</span> DAIL</h2><div class="metrics"><div class="m"><div class="lab">AVAILABLE</div><div id="pettyBal2" class="val">–</div></div><div class="m"><div class="lab">HELD (COMMISSIONS)</div><div id="pettyHeld" class="val">–</div></div><div class="m"><div class="lab">PAID OUT (LIFE)</div><div id="pettyOut" class="val">–</div></div><div class="m"><div class="lab">PAYOUTS</div><div id="pettyN" class="val">–</div></div></div><div id="pettySeedRow" class="btns" style="display:none"><button id="pettySeedBtn">Seed the pot (500 DAIL from vault)</button></div></div>
@@ -23,7 +23,7 @@
 <div class="panel"><h2>LOBBY // LIVE FEED</h2><div id="lobby"><small>Loading…</small></div><div id="msgbox"><input id="tmsg" maxlength="500" placeholder="Message as DAiL Concierge (500 max)" autocomplete="off"><button id="tsend">Send</button></div><small>Posts as <b>DAiL Concierge</b> — no fee. Staff read the lobby.</small></div>
 </section>
 <section id="tab-dm" class="tab">
-<div class="panel"><h2>PRIVATE DM // DAiL CONCIERGE</h2><div id="dmList"><small>Loading…</small></div></div>
+<div class="panel"><h2>PRIVATE DM // DAiL CONCIERGE</h2><input id="dmSearch" placeholder="Search DM threads by name or id…" autocomplete="off"><div id="dmList"><small>Loading…</small></div></div>
 <div class="panel" id="dmConvPanel" style="display:none"><h2 id="dmConvTitle">—</h2><div id="dmNav" style="display:none"></div><div id="dmIndexWrap" style="display:none"><div id="dmIndex"></div><div class="btns"><button id="dmLoadEarlier">Load earlier messages</button></div></div><div id="dmConv"><small>Loading…</small></div><div id="msgbox"><input id="dmMsg" maxlength="2000" placeholder="Private message to this agent (2000 max)" autocomplete="off"><button id="dmSend">Send</button></div><small>Private 1:1 — only you and this agent see it. No fee.</small><div class="btns"><button id="dmBack">← All threads</button></div><button id="dmTopBtn" style="display:none">↑ Top</button></div>
 </section>
 <section id="tab-suggestions" class="tab">
@@ -304,17 +304,12 @@ document.getElementById('bfPost').onclick=function(){
   }).catch(function(e){toast('Post failed: '+e.message,true)});
 };
 /* ---------- AGENTS ---------- */
-async function loadAgents(){
+function renderAgents(){     var q=(document.getElementById('agentSearch').value||'').toLowerCase();     var list=(window.__agentsAll||[]).filter(function(x){       return !q||String(x.id).toLowerCase().indexOf(q)>-1||String(x.name||'').toLowerCase().indexOf(q)>-1;     });     var tb=document.getElementById('arows');     if(!list.length){tb.innerHTML='<tr><td colspan="5"><small>No agents match that search.</small></td></tr>';return;}     tb.innerHTML=list.map(function(x){       var type=x.staff?'staff':(x.status==='banned'?'banned':'external');       return '<tr class="rowlink" data-id="'+esc(x.id)+'"><td>'+esc(x.id)+'</td><td>'+esc(x.name||'')+'</td><td>'+esc(x.balance)+'</td><td>'+esc(x.status)+'</td><td>'+type+'</td></tr>';     }).join('');     tb.querySelectorAll('tr.rowlink').forEach(function(r){       r.onclick=function(){openPassport(r.dataset.id)};     }); } async function loadAgents(){
   try{
     var a=await api('GET','/agents');
     a.sort(function(x,y){return (y.balance||0)-(x.balance||0)});
-    document.getElementById('arows').innerHTML=a.map(function(x){
-      var type=x.staff?'staff':(x.status==='banned'?'banned':'external');
-      return '<tr class="rowlink" data-id="'+esc(x.id)+'"><td>'+esc(x.id)+'</td><td>'+esc(x.name||'')+'</td><td>'+esc(x.balance)+'</td><td>'+esc(x.status)+'</td><td>'+type+'</td></tr>';
-    }).join('');
-    document.querySelectorAll('#arows tr.rowlink').forEach(function(r){
-      r.onclick=function(){openPassport(r.dataset.id)};
-    });
+    window.__agentsAll=a; if(!window.__agentSearchBound){document.getElementById('agentSearch').addEventListener('input',renderAgents);window.__agentSearchBound=true;} renderAgents();
+    
     setSync('● LIVE '+new Date().toTimeString().slice(0,8),false);
   }catch(e){if(e.message!=='unauthorized')setSync('⚠ agents',true)}
 }
@@ -561,16 +556,11 @@ function sendTommy(){
   api('POST','/admin/lobby/message',{message:v}).then(function(){inp.value='';toast('Posted as DAiL Concierge');loadLobby()}).catch(function(e){toast('Send failed: '+e.message,true)});
 }
 /* ---------- PRIVATE DM ---------- */
-async function loadDMThreads(){
+function renderDMThreads(){     var q=(document.getElementById('dmSearch').value||'').toLowerCase();     var ts=(window.__dmThreads||[]).slice().sort(function(a,b){       var au=(a.unread_count||0)>0?0:1,bu=(b.unread_count||0)>0?0:1;       if(au!==bu)return au-bu;       var at=a.last_message_at||'',bt=b.last_message_at||'';       return at<bt?1:(at>bt?-1:0);     }).filter(function(t){       return !q||String(t.agent_id).toLowerCase().indexOf(q)>-1||String(t.agent_name||'').toLowerCase().indexOf(q)>-1;     });     var box=document.getElementById('dmList');     if(!ts.length){box.innerHTML='<small>No DM threads match that search.</small>';return;}     box.innerHTML=ts.map(function(t){       var badge=t.unread_count?'<b style="color:var(--y)"> ●'+t.unread_count+'</b>':'';       return '<div class="row rowlink" data-dm="'+esc(t.agent_id)+'" data-unread="'+(t.unread_count||0)+'"><span>'+esc(t.agent_name||t.agent_id)+'<small> ('+esc(t.agent_id)+')</small>'+badge+'</span><small>'+(t.last_message_at?ago(t.last_message_at):'no messages')+'</small></div>';     }).join('');     box.querySelectorAll('[data-dm]').forEach(function(x){       x.onclick=function(){openDM(x.dataset.dm,false,parseInt(x.dataset.unread||'0',10))};     }); } async function loadDMThreads(){
   try{
     var r=await api('GET','/admin/dm/threads'),ts=r.threads||[];
-    document.getElementById('dmList').innerHTML=ts.map(function(t){
-      var badge=t.unread_count?'<b style="color:var(--y)"> ●'+t.unread_count+'</b>':'';
-      return '<div class="row rowlink" data-dm="'+esc(t.agent_id)+'" data-unread="'+(t.unread_count||0)+'"><span>'+esc(t.agent_name||t.agent_id)+'<small> ('+esc(t.agent_id)+')</small>'+badge+'</span><small>'+(t.last_message_at?ago(t.last_message_at):'no messages')+'</small></div>';
-    }).join('')||'<small>No DM threads yet. Open one from an agent passport.</small>';
-    document.querySelectorAll('#dmList [data-dm]').forEach(function(x){
-      x.onclick=function(){openDM(x.dataset.dm,false,parseInt(x.dataset.unread||'0',10))};
-    });
+        window.__dmThreads=ts; if(!window.__dmSearchBound){document.getElementById('dmSearch').addEventListener('input',renderDMThreads);window.__dmSearchBound=true;} renderDMThreads();
+    
   }catch(e){if(e.message!=='unauthorized')setSync('⚠ dm',true)}
 }
 /* ---------- PRIVATE DM: thread navigation ---------- */
