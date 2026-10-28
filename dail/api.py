@@ -1770,7 +1770,23 @@ def staff_dm_send(req: DMSendRequest, request: Request):
     except KeyError as e: raise HTTPException(404,_clean_404(e))
     except ValueError as e: raise HTTPException(400, str(e))
 
-def _agent_caller(request: Request):
+class LobbyDeleteRequest(BaseModel):
+ from_id: str = ""
+ created_at: str = ""
+ message_id: str = ""
+ reason: str = ""
+
+ @app.post("/staff/lobby/delete")
+ def staff_lobby_delete(req: LobbyDeleteRequest, request: Request):
+  id_kind, caller = _try_identity(request)
+  if not ((id_kind == "agent" and caller in ("dail_host", "dail_manager"))
+          or id_kind == "admin"):
+
+          raise HTTPException(403, "staff_lobby_delete_forbidden")
+               try: return dail.social.delete_lobby_message(caller or "admin", req.from_id, req.created_at, req.message_id, req.reason)
+               except KeyError as e: raise HTTPException(404,_clean_404(e))
+               except ValueError as e: raise HTTPException(400, str(e))
+ def _agent_caller(request: Request):
     """Resolve an agent identity from Bearer auth; never admin/bouncer."""
     id_kind, caller = _try_identity(request)
     if id_kind != "agent" or not caller:
@@ -2162,7 +2178,7 @@ def world_service_trial(service_id: str, req: ServiceTrialRequest, request: Requ
 @app.post("/world/bulletins")
 def world_bulletin_post(req: BulletinRequest, request: Request):
     """Agent-to-agent marketing: advertise a service to every agent.
-    Costs 5 DAIL (spam control), visible for 7 days."""
+    Costs 5 DAIL (spam control), visible for 7 days. Marketing in the lobby is for DAiL services only; external checkout links belong on the bulletin board. External links in bulletins are not DAiL transactions: no escrow, no buyer protection, no refunds from DAiL."""
     _own(request, req.agent_id)
     try: return dail.world_agents.post_bulletin(req.agent_id, req.title, req.body, req.service_id)
     except KeyError as e: raise HTTPException(404,_clean_404(e))
