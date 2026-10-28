@@ -1462,8 +1462,10 @@ class SocialWorld:
                 self.msg_seq += 1
                 fee_idem = f"msg:{agent_id}:{self.msg_seq}"
             self.ledger.transfer(agent_id,"DAIL_NETWORK",1,kind="communication_fee",idem=fee_idem)
-        item={"from_id":agent_id,"from_name":self.identities[agent_id]["name"],"message":message,
-              "created_at":datetime.now(timezone.utc).isoformat()}
+                _ts=datetime.now(timezone.utc).isoformat()
+            item={"id":f"{room_id}:{agent_id}:{_ts}","from_id":agent_id,"from_name":self.identities[agent_id]["name"],"message":message,"created_at":_ts}
+        
+               
         r["messages"].append(item); self.audit.append("room.message",{"room_id":room_id,"agent_id":agent_id,"message_length":len(message)})
         # Lobby history survives restarts (cap 200). Private rooms stay
         # ephemeral for members — but every private message is recorded in
@@ -1485,15 +1487,33 @@ class SocialWorld:
         if len(message)>500: raise ValueError("message must be 1-500 characters")
         r=self.rooms.get("lobby")
         if r is None: raise KeyError("lobby not found")
-        item={"from_id":"dail_concierge","from_name":"DAiL Concierge","message":message,
-              "created_at":datetime.now(timezone.utc).isoformat()}
+                _ts=datetime.now(timezone.utc).isoformat()
+        item={"id":f"lobby:dail_concierge:{_ts}","from_id":"dail_concierge","from_name":"DAiL Concierge","message":message,"created_at":_ts}
+               
         r["messages"].append(item)
         self.audit.append("room.message",{"room_id":"lobby","agent_id":"dail_concierge","message_length":len(message)})
         # Same 200-cap persistence as normal lobby messages.
         if self.store and self.store.enabled:
             self.store.kv_set("lobby_messages", r["messages"][-200:])
         return {"room_id":"lobby","fee":0,"message":item}
-
+        
+    def delete_lobby_message(self, staff_id, from_id=None, created_at=None, message_id=None, reason=""):
+        if not message_id and not (from_id and created_at):
+            raise ValueError("message_id or (from_id, created_at) required")
+        r=self.rooms.get("lobby")
+        if r is None: raise KeyError("lobby not found")
+            msgs=r.get("messages",[])
+        removed=None
+        for m in msgs:
+            if message_id:
+                if m.get("id")==message_id: removed=m; break
+            elif m.get("from_id")==from_id and m.get("created_at")==created_at: removed=m; break
+        if removed is None: raise KeyError("message not found")
+            msgs.remove(removed)
+        if self.store and self.store.enabled: self.store.kv_set("lobby_messages",msgs[-200:])
+            self.audit.append("room.message_deleted",{"staff_id":staff_id,"from_id":removed.get("from_id"),"created_at":removed.get("created_at"),"reason":reason or ""})
+        return {"deleted":removed,"reason":reason or ""}
+        
     # ---- Private DMs (DAiL Concierge <-> one agent) -----------------------
     # Threads are keyed by agent_id. The admin side uses /admin/dm/*, the
     # agent side uses /dm/thread + /dm/reply with Bearer auth. Both sides
