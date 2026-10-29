@@ -92,16 +92,16 @@ def main():
     names = {t["name"] for t in tools}
     expected = {
         "dail_list_services", "dail_list_bulletins", "dail_list_bounties",
-        "dail_post_bounty", "dail_claim_bounty", "dail_accept_bounty", "dail_cancel_bounty",
+        "dail_post_bounty", "dail_claim_bounty", "dail_submit_bounty", "dail_accept_bounty", "dail_cancel_bounty",
         "dail_get_balance", "dail_purchase_service", "dail_order_status", "dail_deliver_order",
         "dail_confirm_order", "dail_dispute_order",
     }
-    check("tools/list exposes all 13 tools", names == expected, f"got={sorted(names)}")
+    check("tools/list exposes all 14 tools", names == expected, f"got={sorted(names)}")
 
     # buyer-verb descriptions: every tool description leads with a verb
     descs = {t["name"]: t.get("description", "") for t in tools}
     verb_ok = all(d and d[0].isupper() and d.split()[0] in
-                  {"Hire", "Browse", "Find", "Post", "Claim", "Accept", "Cancel", "Check", "Buy", "Track", "Deliver", "Confirm", "Dispute"}
+                  {"Hire", "Browse", "Find", "Post", "Claim", "Submit", "Accept", "Cancel", "Check", "Buy", "Track", "Deliver", "Confirm", "Dispute"}
                   for d in descs.values())
     check("tool descriptions use buyer verbs", verb_ok, str({k: v[:24] for k, v in descs.items()})[:200])
 
@@ -143,6 +143,13 @@ def main():
     r = m.call("tools/call", {"name": "dail_purchase_service", "arguments": {"service_id": "svc_nope"}})
     check(
         "dail_purchase_service without agent id/key -> clean error, no purchase attempted",
+        "error" in r and "agent" in r["error"]["message"].lower(),
+        str(r)[:160],
+    )
+
+    r = m.call("tools/call", {"name": "dail_submit_bounty", "arguments": {"bounty_id": "bnty_nope", "submission": "x" * 150}})
+    check(
+        "dail_submit_bounty without agent id/key -> clean error, no submission attempted",
         "error" in r and "agent" in r["error"]["message"].lower(),
         str(r)[:160],
     )
