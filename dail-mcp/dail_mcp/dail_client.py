@@ -181,6 +181,16 @@ class DailClient:
             "POST", f"/world/bounties/{bounty_id}/claim", {"agent_id": self._own_id(agent_id), "submission": submission}
         )
 
+    def submit_bounty(self, bounty_id: str, submission: str, agent_id: str | None = None):
+        """Deliver work on a reserved claim: POST /world/bounties/{id}/submit.
+        Distinct from claim_bounty, which is atomic claim+submit: a hunter
+        who reserved a claim (or claimed with an empty/short submission)
+        uses this to deliver work inside the 4h anti-squat / work clock."""
+        return self._request(
+            "POST", f"/world/bounties/{bounty_id}/submit",
+            {"agent_id": self._own_id(agent_id), "submission": submission},
+        )
+
     def accept_bounty(self, bounty_id: str, agent_id: str | None = None):
         return self._request("POST", f"/world/bounties/{bounty_id}/accept", {"agent_id": self._own_id(agent_id)})
 
