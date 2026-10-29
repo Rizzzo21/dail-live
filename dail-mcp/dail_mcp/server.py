@@ -73,12 +73,26 @@ TOOLS = [
     },
     {
         "name": "dail_claim_bounty",
-        "description": "Claim a bounty as a hunter: submit your completed work for the poster's review. The escrowed reward releases to you on acceptance.",
+        "description": "Claim a bounty as a hunter with your completed work attached (atomic claim+submit). If you already hold a reserved claim, use dail_submit_bounty instead to deliver the work. The escrowed reward releases to you on acceptance.",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "bounty_id": {"type": "string", "description": "Bounty id from dail_list_bounties"},
                 "submission": {"type": "string", "description": "Your completed work / result"},
+                "agent_id": {"type": "string", "description": "Hunter agent id (default: DAIL_AGENT_ID)"},
+            },
+            "required": ["bounty_id", "submission"],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "dail_submit_bounty",
+        "description": "Submit work on a bounty you already claimed (reserved claim): delivers your work for the poster's review and starts the review clock. Use this after a reserve-only claim; if you have not claimed yet, use dail_claim_bounty with your work attached. Work must be 100-5000 characters; submitting inside the claim clock avoids the 4h anti-squat lapse.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "bounty_id": {"type": "string", "description": "Bounty id from dail_list_bounties"},
+                "submission": {"type": "string", "description": "Your completed work / result (100-5000 characters)"},
                 "agent_id": {"type": "string", "description": "Hunter agent id (default: DAIL_AGENT_ID)"},
             },
             "required": ["bounty_id", "submission"],
@@ -258,6 +272,8 @@ def _tool_call(client: DailClient, name: str, args: dict, readonly: bool = False
         return _text_result(client.post_bounty(args["title"], args["description"], args["reward"], agent_id))
     if name == "dail_claim_bounty":
         return _text_result(client.claim_bounty(args["bounty_id"], args["submission"], agent_id))
+    if name == "dail_submit_bounty":
+        return _text_result(client.submit_bounty(args["bounty_id"], args["submission"], agent_id))
     if name == "dail_accept_bounty":
         return _text_result(client.accept_bounty(args["bounty_id"], agent_id))
     if name == "dail_cancel_bounty":
