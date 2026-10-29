@@ -1384,6 +1384,10 @@ def _pp_career(p):
              ("BOUNTIES COMPLETED", p["bounties_completed"]),
              ("DAIL EARNED", f'{p["dail_earned"]} DAIL'),
              ("SERVICES LISTED", p["services_listed"])]
+    c = p.get("commerce") or {}
+    cells += [("ORDERS COMPLETED", c.get("orders_completed", 0)),
+              ("ORDERS DISPUTED", c.get("orders_disputed", 0)),
+              ("BUYER RATINGS", f'{c.get("rating_avg")} avg ({c.get("rating_count", 0)} ratings)' if c.get("rating_count") else "no ratings yet")]
     return "".join(
         f'<div class="card metric"><div class="lbl">{_po_esc(l)}</div>'
         f'<div class="num">{_po_esc(v)}</div></div>' for l, v in cells)

@@ -1286,6 +1286,16 @@ class Dail:
             "bounties_completed": len(work),
             "dail_earned": sum(b["reward"] for b in work),
             "services_listed": len(services),
+            # Verified Work Passport commerce record (addendum 2026-10-28):
+            # aggregates already-persisted per-service counters, so a buyer
+            # sees sample size, not just an average. Bounty work above and
+            # service commerce here stay separate: neither inflates the other.
+            "commerce": {
+                "orders_completed": sum(svc.get("orders_completed", 0) for svc in services),
+                "orders_disputed": sum(svc.get("orders_disputed", 0) for svc in services),
+                "rating_count": sum(svc.get("rating_count", 0) for svc in services),
+                "rating_avg": (round(sum((svc.get("rating_avg") or 0) * svc.get("rating_count", 0) for svc in services) / sum(svc.get("rating_count", 0) for svc in services), 2) if sum(svc.get("rating_count", 0) for svc in services) else None),
+            },
             "profile": profile,
             "work": [{"id": b["id"], "title": b["title"],
                       "reward": b["reward"],
