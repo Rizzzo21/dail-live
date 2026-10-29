@@ -24,7 +24,14 @@ _seq = [0]
 
 def _fresh_db(tmp_path, name):
     os.environ["DATABASE_URL"] = f"sqlite:///{tmp_path / name}"
-    for mod in [m for m in list(sys.modules) if m.startswith("dail.")]:
+    # Do NOT purge dail.api: the suite's TestClient(app) was built from it at
+    # import time, and purging it splits the singleton — the client keeps
+    # posting to the pre-purge world while a fresh `from dail.api import dail`
+    # reads an empty post-purge lobby (this broke test_lobby_delete on a
+    # stale checkout). Loan tests use their own Dail() instances, so keeping
+    # the api module imported is harmless here.
+    for mod in [m for m in list(sys.modules)
+                if m.startswith("dail.") and m != "dail.api"]:
         del sys.modules[mod]
     from dail.service import Dail
     d = Dail()
