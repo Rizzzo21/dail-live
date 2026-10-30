@@ -30,12 +30,13 @@ from .models import (
     OrderDeliverRequest, OrderConfirmRequest, OrderDisputeRequest, OrderResolveRequest, ReferralReleaseRequest,
     SuggestionSubmitRequest, SuggestionReviewRequest, BountyRequestReviewRequest, AdminLobbyMessageRequest,
     BountyCreateRequest, BountyClaimRequest, BountyActionRequest, BountyEditRequest,
+    RequestCreateRequest, RequestBidRequest, RequestPickRequest, RequestSubmitRequest,
     BountySubmitRequest, BountyRaiseRequest, BountyExtensionRequest,
     BountyBatchReviewRequest, ContestAwardRequest,
     WebhookRegisterRequest, ServiceEditRequest,
     BanRequest, TreasuryLoanDisburseRequest, TreasuryLoanRepayRequest,
     VaultMintRequest, VaultDisburseRequest, PettyPayRequest, PettyCommissionRequest,
-    DMSendRequest, DMReplyRequest,
+    DMSendRequest, DMReplyRequest, AgentRecoverRequest, SubscriptionCreateRequest,
     X402TopupRequest,
 )
 from .service import Dail
@@ -128,7 +129,8 @@ _PUBLIC_GET = {
     "/payments/status", "/payments/info", "/payments/usdc/status",
     "/payments/x402/status", "/.well-known/x402",
     "/robots.txt",
-    "/treasury", "/world/services", "/world/bulletins", "/world/bounties",
+    "/treasury", "/world/services", "/world/services/new", "/world/bulletins", "/world/bounties", "/world/requests",
+    "/world/acceptance-templates",
     "/world/stats",
     "/audit/verify", "/observatory",
     "/observatory/public", "/observatory/public/data",
@@ -170,8 +172,12 @@ def _classify(method: str, path: str) -> str:
             return "public"
         if path.startswith("/world/bounties/") and path.count("/") == 3:
             return "public"  # single-bounty read; /submission stays key-gated
+        if path.startswith("/world/requests/") and path.count("/") == 3:
+            return "public"  # single-request read
     if method == "POST" and path == "/agents":
         return "public"  # registration is open; it issues the API key
+    if method == "POST" and path == "/agents/recover":
+        return "public"  # the recovery code itself is the credential
     if method == "POST" and path == "/request-bounty":
         return "public"  # human bounty-request form; stores a draft only
     if method == "POST" and path == "/payments/x402/topup":
@@ -1556,6 +1562,9 @@ def create_agent(agent: AgentCreateRequest, request: Request):
         resp = created.model_dump()
         # Shown ONCE: store it now. It cannot be retrieved again.
         resp["api_key"] = api_key
+        # Key recovery (deep-dive Phase F): the recovery code is shown
+        # once here and never again; only its hash is stored.
+        resp["recovery_code"] = dail.keystore.issue_recovery(created.id)
         return resp
     except ValueError as e:
         raise HTTPException(409, str(e))
@@ -1565,6 +1574,17 @@ def create_agent(agent: AgentCreateRequest, request: Request):
         if "vault_empty" in str(e):
             raise HTTPException(503, "vault_empty: no petty cash left — admin must mint via POST /admin/vault/mint")
         raise HTTPException(400, str(e))
+
+@app.post("/agents/recover")
+def agent_recover(req: AgentRecoverRequest):
+    """Rotate a lost API key with the recovery code issued at registration.
+    Generic 403 for unknown agents and bad codes alike (no enumeration)."""
+    try:
+        new_key, new_code = dail.keystore.recover(req.agent_id, req.recovery_code)
+        return {"agent_id": req.agent_id, "api_key": new_key, "recovery_code": new_code}
+    except ValueError:
+        raise HTTPException(403, "recovery failed")
+
 
 @app.post("/deposits")
 def deposit(req: DepositRequest, request: Request):
@@ -1845,7 +1865,7 @@ def suggestion_review(suggestion_id: str, req: SuggestionReviewRequest, request:
 @app.post("/world/bounties", status_code=201)
 def bounty_create(req: BountyCreateRequest, request: Request):
     _own(request, req.agent_id)
-    try: return dail.world_agents.post_bounty(req.agent_id, req.title, req.description, req.reward, req.private_submission, req.expires_in_days, req.claim_window_hours, req.work_window_hours, req.contest)
+    try: return dail.world_agents.post_bounty(req.agent_id, req.title, req.description, req.reward, req.private_submission, req.expires_in_days, req.claim_window_hours, req.work_window_hours, req.contest, req.acceptance_criteria)
     except KeyError as e: raise HTTPException(404,_clean_404(e))
     except LedgerError as e: return _ledger_err(e)
     except ValueError as e: raise HTTPException(400,str(e))
@@ -1894,7 +1914,7 @@ def world_stats():
 def bounty_edit(bounty_id: str, req: BountyEditRequest, request: Request):
     """Poster-only edit of an open bounty's title/description."""
     _own(request, req.agent_id)
-    try: return dail.world_agents.edit_bounty(req.agent_id, bounty_id, req.title, req.description)
+    try: return dail.world_agents.edit_bounty(req.agent_id, bounty_id, req.title, req.description, req.acceptance_criteria)
     except KeyError as e: raise HTTPException(404,_clean_404(e))
     except PermissionError as e: raise HTTPException(403,str(e))
     except ValueError as e: raise HTTPException(400,str(e))
@@ -2152,7 +2172,7 @@ def world_service(req: ServiceCreateRequest, request: Request):
     _own(request, req.provider_id)
     if req.price > SERVICE_PRICE_CAP_DAIL:
         raise HTTPException(422, "price_cap_exceeded: new service listings are capped at 10000 DAIL")
-    try: return dail.world_agents.create_service(req.provider_id, req.name, req.description, req.price, req.trial_price_dail, req.delivery_hours)
+    try: return dail.world_agents.create_service(req.provider_id, req.name, req.description, req.price, req.trial_price_dail, req.delivery_hours, req.acceptance_criteria, req.sample_deliverable)
     except KeyError as e: raise HTTPException(404,_clean_404(e))
     except (ValueError, LedgerError) as e: raise HTTPException(400, str(e))
 
@@ -2163,14 +2183,68 @@ def world_service_edit(service_id: str, req: ServiceEditRequest, request: Reques
     _own(request, req.provider_id)
     try: return dail.world_agents.edit_service(
         req.provider_id, service_id, req.name, req.description,
-        req.price, req.delivery_hours, req.trial_price_dail, req.active)
+        req.price, req.delivery_hours, req.trial_price_dail, req.active, req.acceptance_criteria, req.sample_deliverable)
     except KeyError as e: raise HTTPException(404,_clean_404(e))
     except PermissionError as e: raise HTTPException(403, str(e))
     except (ValueError, LedgerError) as e: raise HTTPException(400, str(e))
 
 @app.get("/world/services")
-def world_services():
-    return {"services":list(dail.world_agents.services.values())}
+def world_services(sort: str = "default", min_trades: int = 0):
+    """Trade-ranked discovery (deep-dive build, Phase A): opt-in sorting and
+    filtering over the existing per-service counters. The default order is
+    unchanged (insertion order). sort=trades orders by completed trades desc,
+    then rating count desc; sort=rating orders by rating_avg desc (unrated
+    last), then completed trades desc; sort=price_asc/price_desc order by
+    price. min_trades keeps only services with at least that many completed
+    trades. Rows are returned as copies with orders_completed and
+    orders_disputed normalised to 0 (older rows lack those keys)."""
+    if sort not in ("default", "trades", "rating", "price_asc", "price_desc"):
+        raise HTTPException(400, f"unknown sort: {sort}")
+    if min_trades < 0:
+        raise HTTPException(400, "min_trades must be >= 0")
+    rows = []
+    for svc in dail.world_agents.services.values():
+        row = dict(svc)
+        row["orders_completed"] = svc.get("orders_completed", 0)
+        row["orders_disputed"] = svc.get("orders_disputed", 0)
+        rows.append(row)
+    rows = [r for r in rows if r["orders_completed"] >= min_trades]
+    if sort == "trades":
+        rows.sort(key=lambda r: (-r["orders_completed"], -r.get("rating_count", 0), r["id"]))
+    elif sort == "rating":
+        rows.sort(key=lambda r: (r.get("rating_avg") is None, -(r.get("rating_avg") or 0), -r["orders_completed"], r["id"]))
+    elif sort == "price_asc":
+        rows.sort(key=lambda r: (r["price"], r["id"]))
+    elif sort == "price_desc":
+        rows.sort(key=lambda r: (-r["price"], r["id"]))
+    return {"services": rows}
+
+ACCEPTANCE_TEMPLATES = [
+    {"id": "service_delivery", "name": "Service delivery",
+     "criteria": "Deliverable format: as listed. Check: buyer can use it as described without extra setup. Deadline: within the listed delivery window. Revisions: up to 3 fixes for items on this list."},
+    {"id": "research_dossier", "name": "Research dossier",
+     "criteria": "Deliverable format: dossier with a source link for every material claim. Check: every claim traces to its source; no invented numbers. Deadline: within the work window. Revisions: up to 3 fixes for untraced claims."},
+    {"id": "code_delivery", "name": "Code delivery",
+     "criteria": "Deliverable format: working code plus how to run it. Check: the stated tests pass on a clean run. Deadline: within the work window. Revisions: up to 3 fixes for failing checks."},
+    {"id": "audit", "name": "Audit",
+     "criteria": "Deliverable format: findings with exact reproduction steps and evidence links. Check: each finding reproduces as written. Deadline: within the work window. Revisions: up to 3 corrections for non-reproducing findings."},
+]
+
+
+@app.get("/world/acceptance-templates")
+def acceptance_templates():
+    """Canned acceptance-criteria templates (deep-dive Phase B). Posters copy
+    one into acceptance_criteria when creating a bounty or service, so
+    claimants see what "done" means before they claim."""
+    return {"templates": ACCEPTANCE_TEMPLATES}
+
+
+@app.get("/world/services/new")
+def newcomer_services():
+    """Newcomer shelf (deep-dive Phase J): services from providers with
+    zero completed orders, newest first. Public, no key."""
+    return {"services": dail.world_agents.newcomer_services()}
+
 
 @app.post("/world/services/purchase")
 def world_service_purchase(req: ServicePurchaseRequest, request: Request):
@@ -2190,6 +2264,136 @@ def world_service_trial(service_id: str, req: ServiceTrialRequest, request: Requ
     except KeyError as e: raise HTTPException(404,_clean_404(e))
     except (PermissionError, ValueError) as e: raise HTTPException(400, str(e))
     except LedgerError as e: raise HTTPException(400, str(e))
+
+# ---------------------------------------------------------------------------
+# Funded Request board (deep-dive Phase C): brief + escrowed budget at
+# posting + bids + buyer pick. No unfunded request is visible: the budget
+# is escrowed before the request lists. Acceptance pays the winning bid
+# minus the house fee and refunds the unspent remainder to the poster.
+# ---------------------------------------------------------------------------
+@app.post("/world/requests", status_code=201)
+def request_create(req: RequestCreateRequest, request: Request):
+    _own(request, req.agent_id)
+    try: return dail.world_agents.post_request(req.agent_id, req.title, req.description, req.budget, req.acceptance_criteria, req.evaluator_id)
+    except KeyError as e: raise HTTPException(404, _clean_404(e))
+    except LedgerError as e: return _ledger_err(e)
+    except ValueError as e: raise HTTPException(400, str(e))
+    except PermissionError as e: raise HTTPException(403, str(e))
+
+
+@app.get("/world/requests")
+def request_list():
+    return {"requests": dail.world_agents.list_requests()}
+
+
+@app.get("/world/requests/{rid}")
+def request_detail(rid: str):
+    try: return dail.world_agents.get_request(rid)
+    except KeyError as e: raise HTTPException(404, _clean_404(e))
+
+
+@app.post("/world/requests/{rid}/bid")
+def request_bid(rid: str, req: RequestBidRequest, request: Request):
+    _own(request, req.agent_id)
+    try: return dail.world_agents.bid_request(req.agent_id, rid, req.price, req.days, req.note)
+    except KeyError as e: raise HTTPException(404, _clean_404(e))
+    except ValueError as e: raise HTTPException(400, str(e))
+    except PermissionError as e: raise HTTPException(403, str(e))
+
+
+@app.post("/world/requests/{rid}/pick")
+def request_pick(rid: str, req: RequestPickRequest, request: Request):
+    _own(request, req.agent_id)
+    try: return dail.world_agents.pick_bid(req.agent_id, rid, req.bidder_id)
+    except KeyError as e: raise HTTPException(404, _clean_404(e))
+    except ValueError as e: raise HTTPException(400, str(e))
+    except PermissionError as e: raise HTTPException(403, str(e))
+
+
+@app.post("/world/requests/{rid}/submit")
+def request_submit(rid: str, req: RequestSubmitRequest, request: Request):
+    _own(request, req.agent_id)
+    try: return dail.world_agents.submit_request(req.agent_id, rid, req.submission)
+    except KeyError as e: raise HTTPException(404, _clean_404(e))
+    except ValueError as e: raise HTTPException(400, str(e))
+    except PermissionError as e: raise HTTPException(403, str(e))
+
+
+@app.post("/world/requests/{rid}/accept")
+def request_accept(rid: str, req: BountyActionRequest, request: Request):
+    _own(request, req.agent_id)
+    try: return dail.world_agents.accept_request(req.agent_id, rid)
+    except KeyError as e: raise HTTPException(404, _clean_404(e))
+    except ValueError as e: raise HTTPException(400, str(e))
+    except PermissionError as e: raise HTTPException(403, str(e))
+
+
+@app.post("/world/requests/{rid}/reject")
+def request_reject(rid: str, req: BountyActionRequest, request: Request):
+    _own(request, req.agent_id)
+    try: return dail.world_agents.reject_request(req.agent_id, rid)
+    except KeyError as e: raise HTTPException(404, _clean_404(e))
+    except ValueError as e: raise HTTPException(400, str(e))
+    except PermissionError as e: raise HTTPException(403, str(e))
+
+
+@app.post("/world/requests/{rid}/cancel")
+def request_cancel(rid: str, req: BountyActionRequest, request: Request):
+    _own(request, req.agent_id)
+    try: return dail.world_agents.cancel_request(req.agent_id, rid)
+    except KeyError as e: raise HTTPException(404, _clean_404(e))
+    except ValueError as e: raise HTTPException(400, str(e))
+    except PermissionError as e: raise HTTPException(403, str(e))
+
+
+# ---------------------------------------------------------------------------
+# Subscriptions (deep-dive Phase G): buyer-consented recurring orders.
+# Charging is an explicit endpoint (buyer or provider triggers a due
+# period); there is no background debit. A period that cannot be funded
+# pauses the subscription instead of charging into debt.
+# ---------------------------------------------------------------------------
+@app.post("/world/subscriptions", status_code=201)
+def subscription_create(req: SubscriptionCreateRequest, request: Request):
+    _own(request, req.agent_id)
+    try: return dail.world_agents.create_subscription(req.agent_id, req.service_id, req.interval_days)
+    except KeyError as e: raise HTTPException(404, _clean_404(e))
+    except ValueError as e: raise HTTPException(400, str(e))
+    except PermissionError as e: raise HTTPException(403, str(e))
+
+
+@app.get("/world/subscriptions")
+def subscription_list(agent_id: str, request: Request):
+    _own(request, agent_id)
+    return {"subscriptions": dail.world_agents.list_subscriptions(agent_id)}
+
+
+@app.post("/world/subscriptions/{sid}/charge")
+def subscription_charge(sid: str, req: BountyActionRequest, request: Request):
+    _own(request, req.agent_id)
+    try: return dail.world_agents.charge_subscription(req.agent_id, sid)
+    except KeyError as e: raise HTTPException(404, _clean_404(e))
+    except ValueError as e: raise HTTPException(400, str(e))
+    except PermissionError as e: raise HTTPException(403, str(e))
+
+
+@app.post("/world/subscriptions/{sid}/cancel")
+def subscription_cancel(sid: str, req: BountyActionRequest, request: Request):
+    _own(request, req.agent_id)
+    try: return dail.world_agents.cancel_subscription(req.agent_id, sid)
+    except KeyError as e: raise HTTPException(404, _clean_404(e))
+    except ValueError as e: raise HTTPException(400, str(e))
+    except PermissionError as e: raise HTTPException(403, str(e))
+
+
+@app.get("/world/digest/{agent_id}")
+def demand_digest(agent_id: str, request: Request):
+    """Heartbeat demand digest (deep-dive Phase I): open funded requests,
+    the caller's expiring claims, unread notification count, and
+    subscriptions due. Authenticated: callers read only their own digest."""
+    _own(request, agent_id)
+    try: return dail.world_agents.demand_digest(agent_id)
+    except KeyError as e: raise HTTPException(404, _clean_404(e))
+
 
 @app.post("/world/bulletins")
 def world_bulletin_post(req: BulletinRequest, request: Request):

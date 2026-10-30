@@ -307,6 +307,10 @@ class Dail:
         self.world_agents.suggestions = kv.get("suggestions", {})
         self.world_agents.suggestion_seq = kv.get("suggestion_seq", 0)
         self.world_agents.bounties = kv.get("bounties", {})
+        self.world_agents.requests = kv.get("requests", {})
+        self.world_agents.request_seq = kv.get("request_seq", 0)
+        self.world_agents.subscriptions = kv.get("subscriptions", {})
+        self.world_agents.subscription_seq = kv.get("subscription_seq", 0)
         self.world_agents.banned_ids = set(kv.get("banned_ids", []) or [])
         self.ban_seq = kv.get("ban_seq", 0) or 0
         self.world_agents.bounty_seq = kv.get("bounty_seq", 0)
@@ -1680,6 +1684,17 @@ class AgentWorld:
         self.suggestion_seq=0
         self.bounties={}
         self.bounty_seq=0
+        # Funded Request board (deep-dive Phase C): brief + escrowed budget
+        # at posting + bids + buyer pick. Escrow uses the bounty pattern
+        # (ledger transfer with idempotency keys); no new money primitive.
+        self.requests={}
+        self.request_seq=0
+        # Subscriptions (deep-dive Phase G): buyer-consented recurring
+        # orders. Each period is a normal escrow order (deliver/confirm/
+        # dispute unchanged); charging is an explicit endpoint, never a
+        # background debit, and the price is snapshotted at creation.
+        self.subscriptions={}
+        self.subscription_seq=0
         # Service trials: "buyer_id:service_id" -> ISO timestamp of the trial
         # purchase. One trial per agent per service, enforced here. Persisted
         # in dail_kv so a redeploy can't reset anyone's trial (anti-farming).
@@ -1729,6 +1744,10 @@ class AgentWorld:
             self.store.kv_set("suggestion_seq", self.suggestion_seq)
             self.store.kv_set("bounties", self.bounties)
             self.store.kv_set("bounty_seq", self.bounty_seq)
+            self.store.kv_set("requests", self.requests)
+            self.store.kv_set("request_seq", self.request_seq)
+            self.store.kv_set("subscriptions", self.subscriptions)
+            self.store.kv_set("subscription_seq", self.subscription_seq)
             self.store.kv_set("banned_ids", sorted(self.banned_ids))
             self.store.kv_set("service_trials", self.service_trials)
             self.store.kv_set("bounty_requests", self.bounty_requests)
@@ -1822,12 +1841,22 @@ class AgentWorld:
         return self.profile(agent_id)
 
     def edit_service(self, provider_id, service_id, name=None, description=None,
-                     price=None, delivery_hours=None, trial_price=None, active=None):
+                     price=None, delivery_hours=None, trial_price=None, active=None, acceptance_criteria=None, sample_deliverable=None):
         """Provider-only edit: price, copy, delivery window, trial, or pause
         (active=false stops new orders; in-flight orders are unaffected)."""
         svc = self.services.get(service_id)
         if not svc: raise KeyError("service not found")
         if svc["provider_id"] != provider_id: raise PermissionError("not your service")
+        # Versioned card (deep-dive Phase H): snapshot the pre-edit card and
+        # bump the version, so a buyer can see what changed and pin a trade
+        # to the version it was bought at. Snapshot is taken once per edit
+        # call, before any field changes.
+        svc.setdefault("versions", [])
+        svc["versions"].append({"version": svc.get("version", 1),
+            "name": svc.get("name"), "description": svc.get("description"),
+            "price": svc.get("price"), "delivery_hours": svc.get("delivery_hours"),
+            "trial_price": svc.get("trial_price")})
+        svc["version"] = svc.get("version", 1) + 1
         if name is not None:
             name = name.strip()
             if not name or len(name) > 120: raise ValueError("name must be 1-120 characters")
@@ -1850,13 +1879,21 @@ class AgentWorld:
             svc["trial_price"] = trial_price
         if active is not None:
             svc["active"] = bool(active)
+        if acceptance_criteria is not None:
+            acceptance_criteria=acceptance_criteria.strip()
+            if len(acceptance_criteria) > 1000: raise ValueError("acceptance_criteria must be <= 1000 characters")
+            svc["acceptance_criteria"]=acceptance_criteria
+        if sample_deliverable is not None:
+            sample_deliverable=sample_deliverable.strip()
+            if len(sample_deliverable) > 2000: raise ValueError("sample_deliverable must be <= 2000 characters")
+            svc["sample_deliverable"]=sample_deliverable
         if self.store:
             self.store.save_service(svc)
             self._save_kv()
         self.audit.append("service.edited", {"service_id": service_id, "provider_id": provider_id})
         return svc
 
-    def create_service(self, provider_id, name, description, price, trial_price=None, delivery_hours=DEFAULT_DELIVERY_HOURS):
+    def create_service(self, provider_id, name, description, price, trial_price=None, delivery_hours=DEFAULT_DELIVERY_HOURS, acceptance_criteria="", sample_deliverable=""):
         if provider_id not in self.social.identities: raise KeyError("agent not found")
         # SECURITY (2026-10-26): the edit path capped name/description
         # (120/2000) but creation did not — unbounded public board entries
@@ -1864,6 +1901,20 @@ class AgentWorld:
         name=(name or "").strip(); description=(description or "").strip()
         if not name or len(name) > 120: raise ValueError("name must be 1-120 characters")
         if not description or len(description) > 2000: raise ValueError("description must be 1-2000 characters")
+        acceptance_criteria=(acceptance_criteria or "").strip()
+        if len(acceptance_criteria) > 1000: raise ValueError("acceptance_criteria must be <= 1000 characters")
+        # Trade-gated probation (deep-dive Phase J): an unproven provider
+        # (zero completed orders) may hold at most 20 active listings.
+        # The cap lifts on the first completed trade and never touches
+        # existing listings or edits — it only blocks new listings past 20.
+        _trades = sum(s.get("orders_completed", 0) for s in self.services.values()
+                      if s.get("provider_id") == provider_id)
+        if _trades == 0:
+            _active = sum(1 for s in self.services.values()
+                          if s.get("provider_id") == provider_id and s.get("active"))
+            if _active >= 20: raise ValueError("probation cap: unproven providers may list at most 20 services; complete a trade to lift it")
+        sample_deliverable=(sample_deliverable or "").strip()
+        if len(sample_deliverable) > 2000: raise ValueError("sample_deliverable must be <= 2000 characters")
         if trial_price is not None:
             try: trial_price = int(trial_price)
             except (TypeError, ValueError): raise ValueError("trial_price must be an integer")
@@ -1875,6 +1926,9 @@ class AgentWorld:
         sid=f"svc_{self.service_seq:04d}"
         self.services[sid]={"id":sid,"provider_id":provider_id,"name":name,
                             "description":description,"price":price,"active":True,
+                            "acceptance_criteria":acceptance_criteria,
+                            "sample_deliverable":sample_deliverable,
+                            "version":1,"versions":[],
                             "trial_price":trial_price,"delivery_hours":delivery_hours,
                             "rating_avg":None,"rating_count":0}
         if self.store:
@@ -3218,7 +3272,7 @@ class AgentWorld:
                    if x.get("hunter_id") == hunter_id
                    and x.get("status") == "completed")
 
-    def post_bounty(self, agent_id, title, description, reward, private_submission=False, expires_in_days=DEFAULT_BOUNTY_EXPIRY_DAYS, claim_window_hours=None, work_window_hours=None, contest=False):
+    def post_bounty(self, agent_id, title, description, reward, private_submission=False, expires_in_days=DEFAULT_BOUNTY_EXPIRY_DAYS, claim_window_hours=None, work_window_hours=None, contest=False, acceptance_criteria=""):
         # Lifecycle v2 (2026-10-08): expires_in_days / claim_window_hours are
         # deprecated -- accepted, stored for record, but they no longer drive
         # behavior. Listing lives LISTING_LIFETIME; the work clock is
@@ -3239,6 +3293,8 @@ class AgentWorld:
         title=(title or "").strip(); description=(description or "").strip()
         if not title or len(title) > 120: raise ValueError("title must be 1-120 characters")
         if not description or len(description) > 2000: raise ValueError("description must be 1-2000 characters")
+        acceptance_criteria=(acceptance_criteria or "").strip()
+        if len(acceptance_criteria) > 1000: raise ValueError("acceptance_criteria must be <= 1000 characters")
         try: reward=int(reward)
         except (TypeError, ValueError): raise ValueError("reward must be an integer")
         if reward < self.BOUNTY_MIN_REWARD: raise ValueError(f"reward must be >= {self.BOUNTY_MIN_REWARD} DAIL")
@@ -3265,6 +3321,7 @@ class AgentWorld:
         self.bounties[bid]={"id":bid,"poster_id":agent_id,
             "poster_name":self.social.identities[agent_id].get("name",agent_id),
             "title":title,"description":description,"reward":reward,
+            "acceptance_criteria":acceptance_criteria,
             "private_submission":bool(private_submission),
             # Deprecated fields, stored for record only (no behavior).
             "claim_window_hours":window_hours,
@@ -3411,6 +3468,54 @@ class AgentWorld:
                     "bounty_id": bounty["id"],
                     "body": f"{bounty.get('poster_name', poster_id)} posted a bounty for you: {bounty['title']} ({bounty['reward']} DAIL)."})
 
+    def _trade_concentration(self, services):
+        """Gini of completed-order volume across service providers."""
+        per = {}
+        for svc in services.values():
+            pid = svc.get("provider_id")
+            if pid is None: continue
+            per[pid] = per.get(pid, 0) + svc.get("orders_completed", 0)
+        vals = sorted(per.values())
+        total = sum(vals)
+        if total == 0 or not vals:
+            return {"trade_volume_gini": None, "trade_share_outside_top10": None,
+                    "trade_providers_count": len(vals), "trade_completed_orders": 0}
+        n = len(vals)
+        gini = (2 * sum((i + 1) * v for i, v in enumerate(vals)) / (n * total)
+                - (n + 1) / n)
+        top10 = sum(sorted(vals, reverse=True)[:10])
+        return {"trade_volume_gini": round(gini, 3),
+                "trade_share_outside_top10": round((total - top10) / total, 3),
+                "trade_providers_count": n, "trade_completed_orders": total}
+
+
+    def _funding_split(self, completed_bounties, requests):
+        def _kind(poster_id):
+            if poster_id and poster_id.startswith("customer:"):
+                return "human"
+            if poster_id in STAFF_AGENTS:
+                return "house"
+            return "agent"
+        out = {"human_completed": 0, "human_dail_paid": 0,
+               "agent_completed": 0, "agent_dail_paid": 0,
+               "house_completed": 0, "house_dail_paid": 0,
+               "completed_requests": 0, "request_dail_paid": 0}
+        for b in completed_bounties:
+            k = _kind(b.get("poster_id"))
+            out[f"{k}_completed"] += 1
+            out[f"{k}_dail_paid"] += b.get("reward", 0)
+        for r in requests.values():
+            if r.get("status") == "completed":
+                out["completed_requests"] += 1
+                out["request_dail_paid"] += r.get("winning_price", 0) or 0
+                k = _kind(r.get("poster_id"))
+                out[f"{k}_completed"] += 1
+                out[f"{k}_dail_paid"] += r.get("winning_price", 0) or 0
+        total = out["human_dail_paid"] + out["agent_dail_paid"] + out["house_dail_paid"]
+        out["human_share_of_paid"] = round(out["human_dail_paid"] / total, 3) if total else 0.0
+        return out
+
+
     def public_stats(self):
         """Public marketplace KPI ticker data (Tommy, 2026-10-11). Real
         numbers only, derived from the bounty record + ledger. No key."""
@@ -3433,6 +3538,17 @@ class AgentWorld:
             "non_house_completions": len(completed) - house_done,
             "median_reward": rewards[len(rewards) // 2] if rewards else 0,
             "fee_waivers_granted": sum(1 for b in completed if b.get("fee_waived")),
+            # Funding split (deep-dive Phase E): who funds completed work.
+            # Human = bounty poster under a customer: shadow id (human
+            # dashboard tasks map to bounties); house = staff poster; the
+            # rest is agent-funded. Completed requests count by their poster
+            # type too (agent-only today, so human requests are 0 by
+            # construction, not by omission).
+            "funding": self._funding_split(completed, self.requests),
+            # Trade-volume concentration (deep-dive Phase J): Gini over
+            # completed orders per provider, plus the share of trades made
+            # outside the top 10 providers. None when no trades exist yet.
+            **self._trade_concentration(self.services),
         }
 
     def list_bounties(self, status="", summary=False, poster="", q="", limit=0, hunter=""):
@@ -3459,6 +3575,7 @@ class AgentWorld:
         for b in items:
             item=dict(b)
             item["poster_last_accepted"]=last_accepted.get(b["poster_id"])
+            item["claim_seconds_remaining"]=self._claim_seconds_remaining(item)
             # Security bounties: the submission stays private in public
             # listings (poster/hunter read it via the authenticated
             # /world/bounties/{id}/submission endpoint).
@@ -3475,6 +3592,27 @@ class AgentWorld:
             out=out[:int(limit)]
         return {"bounties":out,"count":total}
 
+    def _claim_seconds_remaining(self, b):
+        """Claim-lease countdown (deep-dive Phase F): seconds until the
+        earlier of the anti-squat stall deadline and the work deadline.
+        None when the bounty is not in a claimed/submitted state or carries
+        no deadlines; 0 when already past (the sweep lapses it on read)."""
+        if b.get("status") not in ("claimed", "submitted"):
+            return None
+        now = datetime.now(timezone.utc)
+        secs = None
+        for key in ("stall_deadline", "work_deadline"):
+            raw = b.get(key)
+            if not raw:
+                continue
+            try:
+                dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+            except ValueError:
+                continue
+            s = int((dt - now).total_seconds())
+            secs = s if secs is None else min(secs, s)
+        return None if secs is None else max(0, secs)
+
     def get_bounty_public(self, bounty_id):
         """Single-bounty public view for GET /world/bounties/{id}. Same
         shaping as list_bounties: poster_last_accepted liveness signal plus
@@ -3489,6 +3627,7 @@ class AgentWorld:
                 if not last or other["completed_at"]>last:
                     last=other["completed_at"]
         item["poster_last_accepted"]=last
+        item["claim_seconds_remaining"]=self._claim_seconds_remaining(item)
         if item.get("private_submission") and item.get("submission"):
             item["submission"]="[private submission — visible to poster and hunter only]"
         return item
@@ -3686,7 +3825,7 @@ class AgentWorld:
         return {"expired": expired, "lapsed": lapsed, "paused": paused,
                 "auto_accepted": auto_accepted, "warned": warned}
 
-    def edit_bounty(self, agent_id, bounty_id, title=None, description=None):
+    def edit_bounty(self, agent_id, bounty_id, title=None, description=None, acceptance_criteria=None):
         """Poster-only edit of an open bounty's title/description. No more
         cancel-and-repost for typos."""
         b=self._get_bounty(bounty_id)
@@ -3700,9 +3839,303 @@ class AgentWorld:
             description=description.strip()
             if not description or len(description)>2000: raise ValueError("description must be 1-2000 characters")
             b["description"]=description
+        if acceptance_criteria is not None:
+            acceptance_criteria=acceptance_criteria.strip()
+            if len(acceptance_criteria) > 1000: raise ValueError("acceptance_criteria must be <= 1000 characters")
+            b["acceptance_criteria"]=acceptance_criteria
         self._save_kv()
         self.audit.append("bounty.edited", {"bounty_id":bounty_id,"agent_id":agent_id})
         return b
+
+
+    # -- Funded Request board (deep-dive Phase C) --
+    def _get_request(self, rid):
+        r = self.requests.get(rid)
+        if r is None: raise KeyError("request not found")
+        return r
+
+    def _expire_request(self, r):
+        """Lazy expiry on read: an open/picked request past its listing clock
+        refunds the full escrowed budget to the poster. Submitted requests do
+        not auto-expire (the poster still owes a decision)."""
+        if r["status"] in ("open", "picked") and r.get("listing_expires_at"):
+            if datetime.now(timezone.utc).isoformat() > r["listing_expires_at"]:
+                self.ledger.transfer(f"escrow:{r['id']}", r["poster_id"], r["budget"],
+                                     kind="escrow_refund", idem=f"req-refund-exp:{r['id']}")
+                r["status"] = "expired"
+                self._sync_balance(r["poster_id"])
+                self._save_kv()
+                self.audit.append("request.expired", {"request_id": r["id"]})
+        return r
+
+    def post_request(self, agent_id, title, description, budget, acceptance_criteria="", evaluator_id=None):
+        if agent_id not in self.social.identities: raise KeyError("agent not found")
+        title = (title or "").strip(); description = (description or "").strip()
+        if not title or len(title) > 120: raise ValueError("title must be 1-120 characters")
+        if not description or len(description) > 2000: raise ValueError("description must be 1-2000 characters")
+        acceptance_criteria = (acceptance_criteria or "").strip()
+        if len(acceptance_criteria) > 1000: raise ValueError("acceptance_criteria must be <= 1000 characters")
+        try: budget = int(budget)
+        except (TypeError, ValueError): raise ValueError("budget must be an integer")
+        if budget < self.BOUNTY_MIN_REWARD: raise ValueError(f"budget must be >= {self.BOUNTY_MIN_REWARD} DAIL")
+        if evaluator_id:
+            if evaluator_id not in self.social.identities: raise KeyError("evaluator not found")
+            if evaluator_id == agent_id: raise ValueError("poster cannot be their own evaluator")
+        self._enforce_spending_cap(agent_id, budget)
+        with self._mutation_lock:
+            self.request_seq += 1
+            rid = f"req_{self.request_seq:04d}"
+        now = datetime.now(timezone.utc).isoformat()
+        self.ledger.transfer(agent_id, f"escrow:{rid}", budget,
+                             kind="escrow_hold", idem=f"req-hold:{rid}")
+        self._sync_balance(agent_id)
+        self.requests[rid] = {"id": rid, "poster_id": agent_id,
+            "poster_name": self.social.identities[agent_id].get("name", agent_id),
+            "title": title, "description": description, "budget": budget,
+            "acceptance_criteria": acceptance_criteria,
+            "evaluator_id": evaluator_id,
+            "listing_expires_at": (datetime.now(timezone.utc) + self.LISTING_LIFETIME).isoformat(),
+            "status": "open", "bids": [], "barred_bidders": [],
+            "winner_id": None, "winning_price": None, "submission": None,
+            "submitted_at": None, "completed_at": None, "created_at": now}
+        self._save_kv()
+        self.audit.append("request.posted", {"request_id": rid, "poster_id": agent_id, "budget": budget})
+        return self.requests[rid]
+
+    def list_requests(self):
+        return [self._expire_request(r) for r in self.requests.values()]
+
+    def get_request(self, rid):
+        return self._expire_request(self._get_request(rid))
+
+    def bid_request(self, agent_id, rid, price, days=7, note=""):
+        r = self._expire_request(self._get_request(rid))
+        if r["status"] != "open": raise ValueError("request is not open for bids")
+        if agent_id == r["poster_id"]: raise ValueError("poster cannot bid on own request")
+        if r.get("evaluator_id") and agent_id == r["evaluator_id"]: raise ValueError("evaluator cannot bid on a request they judge")
+        if agent_id in r["barred_bidders"]: raise ValueError("bidder is barred from this request")
+        if any(b["bidder_id"] == agent_id for b in r["bids"]): raise ValueError("one bid per agent per request")
+        if agent_id not in self.social.identities: raise KeyError("agent not found")
+        try: price = int(price)
+        except (TypeError, ValueError): raise ValueError("price must be an integer")
+        if not 1 <= price <= r["budget"]: raise ValueError("bid price must be between 1 and the budget")
+        try: days = int(days)
+        except (TypeError, ValueError): raise ValueError("days must be an integer")
+        if not 1 <= days <= 30: raise ValueError("days must be 1..30")
+        note = (note or "").strip()
+        if len(note) > 500: raise ValueError("bid note must be <= 500 characters")
+        r["bids"].append({"bidder_id": agent_id, "price": price, "days": days,
+                          "note": note, "created_at": datetime.now(timezone.utc).isoformat()})
+        self._save_kv()
+        self.audit.append("request.bid", {"request_id": rid, "bidder_id": agent_id, "price": price})
+        return r
+
+    def pick_bid(self, agent_id, rid, bidder_id):
+        r = self._expire_request(self._get_request(rid))
+        if r["poster_id"] != agent_id: raise PermissionError("not your request")
+        if r["status"] != "open": raise ValueError("request is not open")
+        bid = next((b for b in r["bids"] if b["bidder_id"] == bidder_id), None)
+        if bid is None: raise KeyError("no bid from that agent")
+        if bidder_id in r["barred_bidders"]: raise ValueError("bidder is barred from this request")
+        r["winner_id"] = bidder_id; r["winning_price"] = bid["price"]; r["status"] = "picked"
+        self._save_kv()
+        self.audit.append("request.picked", {"request_id": rid, "winner_id": bidder_id, "price": bid["price"]})
+        return r
+
+    def submit_request(self, agent_id, rid, submission):
+        r = self._expire_request(self._get_request(rid))
+        if r["winner_id"] != agent_id: raise PermissionError("only the picked winner can submit")
+        if r["status"] != "picked": raise ValueError("request is not awaiting submission")
+        submission = (submission or "").strip()
+        if not 100 <= len(submission) <= 5000: raise ValueError("submission must be 100..5000 characters")
+        r["submission"] = submission; r["status"] = "submitted"
+        r["submitted_at"] = datetime.now(timezone.utc).isoformat()
+        self._save_kv()
+        self.audit.append("request.submitted", {"request_id": rid, "winner_id": agent_id})
+        return r
+
+    def accept_request(self, agent_id, rid):
+        r = self._get_request(rid)
+        if agent_id not in (r["poster_id"], r.get("evaluator_id")): raise PermissionError("only the poster or the evaluator can accept")
+        if r["status"] != "submitted": raise ValueError("request has no submission to accept")
+        price = r["winning_price"]; escrow = f"escrow:{rid}"
+        fee = self._fee(price); net = price - fee
+        if net > 0:
+            self.ledger.transfer(escrow, r["winner_id"], net,
+                                 kind="order_release", idem=f"req-release:{rid}")
+        if fee:
+            self.ledger.transfer(escrow, "dail:treasury", fee,
+                                 kind="order_fee", idem=f"req-fee:{rid}")
+        remainder = r["budget"] - price
+        if remainder > 0:
+            self.ledger.transfer(escrow, r["poster_id"], remainder,
+                                 kind="escrow_refund", idem=f"req-remainder:{rid}")
+        r["status"] = "completed"; r["completed_at"] = datetime.now(timezone.utc).isoformat()
+        self._save_kv()
+        self._sync_balance(r["poster_id"], r["winner_id"])
+        self.audit.append("request.completed", {"request_id": rid, "winner_id": r["winner_id"], "price": price, "fee": fee})
+        return r
+
+    def reject_request(self, agent_id, rid):
+        r = self._get_request(rid)
+        if agent_id not in (r["poster_id"], r.get("evaluator_id")): raise PermissionError("only the poster or the evaluator can reject")
+        if r["status"] != "submitted": raise ValueError("request has no submission to reject")
+        winner = r["winner_id"]
+        r["barred_bidders"].append(winner)
+        for b in r["bids"]:
+            if b["bidder_id"] == winner: b["rejected"] = True
+        r["winner_id"] = None; r["winning_price"] = None
+        r["submission"] = None; r["submitted_at"] = None; r["status"] = "open"
+        self._save_kv()
+        self.audit.append("request.rejected", {"request_id": rid, "winner_id": winner})
+        return r
+
+
+    # -- Subscriptions (deep-dive Phase G) --
+    def _get_subscription(self, sid):
+        s = self.subscriptions.get(sid)
+        if s is None: raise KeyError("subscription not found")
+        return s
+
+    def create_subscription(self, buyer_id, service_id, interval_days=7):
+        if buyer_id not in self.social.identities: raise KeyError("agent not found")
+        svc = self.services.get(service_id)
+        if svc is None: raise KeyError("service not found")
+        if not svc.get("active"): raise PermissionError("service_inactive")
+        if svc["provider_id"] == buyer_id: raise ValueError("cannot subscribe to your own service")
+        try: interval_days = int(interval_days)
+        except (TypeError, ValueError): raise ValueError("interval_days must be an integer")
+        if not 1 <= interval_days <= 30: raise ValueError("interval_days must be 1..30")
+        with self._mutation_lock:
+            self.subscription_seq += 1
+            sid = f"sub_{self.subscription_seq:04d}"
+        now = datetime.now(timezone.utc).isoformat()
+        self.subscriptions[sid] = {"id": sid, "buyer_id": buyer_id,
+            "provider_id": svc["provider_id"], "service_id": service_id,
+            "service_name": svc["name"], "price": svc["price"],
+            "interval_days": interval_days, "status": "active",
+            "periods_paid": 0, "next_due_at": now, "created_at": now,
+            "cancelled_at": None}
+        self._save_kv()
+        self.audit.append("subscription.created", {"subscription_id": sid, "buyer_id": buyer_id, "price": svc["price"]})
+        return self.subscriptions[sid]
+
+    def list_subscriptions(self, agent_id):
+        return [s for s in self.subscriptions.values()
+                if s["buyer_id"] == agent_id or s["provider_id"] == agent_id]
+
+    def charge_subscription(self, agent_id, sid):
+        s = self._get_subscription(sid)
+        if agent_id not in (s["buyer_id"], s["provider_id"]):
+            raise PermissionError("only the buyer or provider can charge a subscription")
+        if s["status"] != "active": raise ValueError("subscription is not active")
+        if datetime.now(timezone.utc).isoformat() < s["next_due_at"]:
+            raise ValueError("subscription period is not due yet")
+        buyer_id = s["buyer_id"]
+        price = s["price"]
+        if self.ledger.balances.get(buyer_id, 0) < price:
+            s["status"] = "paused"
+            self._save_kv()
+            self.audit.append("subscription.paused", {"subscription_id": sid, "reason": "insufficient_balance"})
+            raise ValueError("insufficient balance — subscription paused")
+        self._enforce_spending_cap(buyer_id, price)
+        self.order_seq += 1
+        oid = f"ord_{self.order_seq:04d}"
+        now = datetime.now(timezone.utc).isoformat()
+        self.ledger.transfer(buyer_id, f"escrow:{oid}", price,
+                             kind="escrow_hold", idem=f"escrow-hold:{oid}")
+        self._sync_balance(buyer_id)
+        svc = self.services.get(s["service_id"])
+        order = {"id": oid, "service_id": s["service_id"], "service_name": s["service_name"],
+                 "provider_id": s["provider_id"], "buyer_id": buyer_id,
+                 "amount": price, "status": "awaiting_delivery",
+                 "created_at": now,
+                 "deliver_by": (datetime.now(timezone.utc) + timedelta(hours=svc.get("delivery_hours", DEFAULT_DELIVERY_HOURS) if svc else DEFAULT_DELIVERY_HOURS)).isoformat(),
+                 "overdue_notified": False,
+                 "delivery": None, "delivered_at": None,
+                 "completed_at": None, "dispute_reason": None, "resolution": None, "resolve_by": None,
+                 "rating": None, "subscription_id": sid, "subscription_period": s["periods_paid"] + 1}
+        self.orders[oid] = order
+        self._save_order(order)
+        s["periods_paid"] += 1
+        s["next_due_at"] = (datetime.now(timezone.utc) + timedelta(days=s["interval_days"])).isoformat()
+        self._save_kv()
+        self._notify(s["provider_id"],
+            {"type": "subscription_charged", "subscription_id": sid, "order_id": oid,
+             "body": f"Subscription {sid} period {s['periods_paid']} charged: order {oid} awaiting delivery."})
+        self.audit.append("subscription.charged", {"subscription_id": sid, "order_id": oid, "period": s["periods_paid"]})
+        return {"subscription": s, "order": self._public_order(order)}
+
+    def cancel_subscription(self, agent_id, sid):
+        s = self._get_subscription(sid)
+        if s["buyer_id"] != agent_id: raise PermissionError("only the buyer can cancel a subscription")
+        if s["status"] == "cancelled": raise ValueError("subscription already cancelled")
+        s["status"] = "cancelled"
+        s["cancelled_at"] = datetime.now(timezone.utc).isoformat()
+        self._save_kv()
+        self.audit.append("subscription.cancelled", {"subscription_id": sid})
+        return s
+
+
+
+    def newcomer_services(self):
+        """Feed rotation (deep-dive Phase J): the newcomer shelf — services
+        from providers with zero completed orders, newest first. The
+        trade-ranked feed puts proven sellers first by design; this lane
+        keeps new providers discoverable instead of buried."""
+        trades = {}
+        for s in self.services.values():
+            trades[s["provider_id"]] = trades.get(s["provider_id"], 0) + s.get("orders_completed", 0)
+        out = []
+        for s in reversed(list(self.services.values())):
+            if trades.get(s["provider_id"], 0) == 0:
+                row = dict(s)
+                row["orders_completed"] = s.get("orders_completed", 0)
+                row["orders_disputed"] = s.get("orders_disputed", 0)
+                out.append(row)
+        return out
+
+    def demand_digest(self, agent_id):
+        """Heartbeat demand digest (deep-dive Phase I): one read that tells
+        an agent what funded demand exists and what of theirs is expiring.
+        Skill matching is by funded demand, not by skill tags — requests
+        carry no skill field yet, so every open funded request is listed
+        (a future skill-tag slice can narrow it)."""
+        if agent_id not in self.social.identities: raise KeyError("agent not found")
+        open_requests = [{"id": r["id"], "title": r["title"], "budget": r["budget"],
+                          "bids": len(r["bids"]),
+                          "acceptance_criteria": r.get("acceptance_criteria", ""),
+                          "listing_expires_at": r.get("listing_expires_at")}
+                         for r in self.list_requests() if r["status"] == "open"]
+        expiring = []
+        for b in self.bounties.values():
+            if b.get("hunter_id") == agent_id and b.get("status") in ("claimed", "submitted"):
+                expiring.append({"bounty_id": b["id"], "title": b["title"],
+                                 "status": b["status"],
+                                 "claim_seconds_remaining": self._claim_seconds_remaining(b)})
+        ack = getattr(self, "notif_ack", {}).get(agent_id, "")
+        unread = sum(1 for n in self.notifications.get(agent_id, [])
+                     if n.get("created_at", "") > ack)
+        now = datetime.now(timezone.utc).isoformat()
+        due_subs = [{"id": s["id"], "service_name": s["service_name"], "price": s["price"]}
+                    for s in self.subscriptions.values()
+                    if s["buyer_id"] == agent_id and s["status"] == "active"
+                    and s["next_due_at"] <= now]
+        return {"agent_id": agent_id, "open_requests": open_requests,
+                "expiring_claims": expiring, "unread_notifications": unread,
+                "subscriptions_due": due_subs}
+
+    def cancel_request(self, agent_id, rid):
+        r = self._get_request(rid)
+        if r["poster_id"] != agent_id: raise PermissionError("not your request")
+        if r["status"] != "open": raise ValueError("only open requests can be cancelled")
+        self.ledger.transfer(f"escrow:{rid}", r["poster_id"], r["budget"],
+                             kind="escrow_refund", idem=f"req-refund:{rid}")
+        r["status"] = "cancelled"
+        self._save_kv()
+        self._sync_balance(agent_id)
+        self.audit.append("request.cancelled", {"request_id": rid})
+        return r
 
     def release_claim(self, agent_id, bounty_id):
         """Hunter withdraws their own unreviewed claim; the bounty reopens."""

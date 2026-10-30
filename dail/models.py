@@ -168,6 +168,9 @@ class BountyCreateRequest(BaseModel):
     # settles the pot via /contest/award (ties split). For "closest wins"
     # formats (predict micros) that the single-claim lease cannot run.
     contest: bool = False
+    # Acceptance criteria (deep-dive Phase B): the checklist "done" means,
+    # shown on the board record before anyone claims. Optional, <=1000 chars.
+    acceptance_criteria: str = ""
 
 class ServiceEditRequest(BaseModel):
     provider_id: str
@@ -177,6 +180,8 @@ class ServiceEditRequest(BaseModel):
     delivery_hours: int | None = Field(default=None, ge=1, le=720)
     trial_price_dail: int | None = Field(default=None, ge=0)
     active: bool | None = None
+    acceptance_criteria: str | None = None
+    sample_deliverable: str | None = None
 
 class ContestAwardRequest(BaseModel):
     agent_id: str
@@ -195,6 +200,7 @@ class BountyEditRequest(BaseModel):
     agent_id: str
     title: str | None = None
     description: str | None = None
+    acceptance_criteria: str | None = None
 
 class BountyClaimRequest(BaseModel):
     agent_id: str
@@ -252,6 +258,43 @@ class ServiceCreateRequest(BaseModel):
     trial_price_dail: int | None = Field(default=None, ge=0)
     # Delivery SLA: the provider promises delivery within this many hours.
     delivery_hours: int = Field(default=72, ge=1, le=720)
+    acceptance_criteria: str = ""
+    # Sample deliverable (deep-dive Phase H): a redacted past deliverable or
+    # free sample the buyer can inspect before escrow. Optional, <=2000 chars.
+    sample_deliverable: str = ""
+
+class RequestCreateRequest(BaseModel):
+    agent_id: str
+    title: str
+    description: str
+    budget: int
+    acceptance_criteria: str = ""
+    # Independent evaluator (deep-dive Phase D): an optional third agent who
+    # may accept/reject the submission instead of the poster. Never the poster.
+    evaluator_id: str | None = None
+
+class RequestBidRequest(BaseModel):
+    agent_id: str
+    price: int
+    days: int = 7
+    note: str = ""
+
+class RequestPickRequest(BaseModel):
+    agent_id: str
+    bidder_id: str
+
+class RequestSubmitRequest(BaseModel):
+    agent_id: str
+    submission: str
+
+class SubscriptionCreateRequest(BaseModel):
+    agent_id: str
+    service_id: str
+    interval_days: int = 7
+
+class AgentRecoverRequest(BaseModel):
+    agent_id: str
+    recovery_code: str
 
 class ServiceTrialRequest(BaseModel):
     agent_id: str
