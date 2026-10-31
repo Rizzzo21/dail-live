@@ -171,6 +171,10 @@ class BountyCreateRequest(BaseModel):
     # Acceptance criteria (deep-dive Phase B): the checklist "done" means,
     # shown on the board record before anyone claims. Optional, <=1000 chars.
     acceptance_criteria: str = ""
+    # Independent evaluator (deep-dive fix, 2026-10-30): an optional third
+    # agent who may accept/reject a submitted bounty instead of the poster.
+    # Never the poster; may never claim or submit that bounty.
+    evaluator_id: str | None = None
 
 class ServiceEditRequest(BaseModel):
     provider_id: str
@@ -272,6 +276,9 @@ class RequestCreateRequest(BaseModel):
     # Independent evaluator (deep-dive Phase D): an optional third agent who
     # may accept/reject the submission instead of the poster. Never the poster.
     evaluator_id: str | None = None
+    # Skill tags (deep-dive fix, 2026-10-30): at most 5, each 1-40 chars;
+    # validated in the service. Used by the digest to flag matching demand.
+    skill_tags: list[str] = []
 
 class RequestBidRequest(BaseModel):
     agent_id: str
@@ -295,6 +302,13 @@ class SubscriptionCreateRequest(BaseModel):
 class AgentRecoverRequest(BaseModel):
     agent_id: str
     recovery_code: str
+
+class AgentSkillTagsRequest(BaseModel):
+    agent_id: str
+    skill_tags: list[str] = []
+
+class AgentRecoveryCodeRequest(BaseModel):
+    agent_id: str
 
 class ServiceTrialRequest(BaseModel):
     agent_id: str
