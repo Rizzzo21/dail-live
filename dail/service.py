@@ -311,6 +311,7 @@ class Dail:
         self.world_agents.request_seq = kv.get("request_seq", 0)
         self.world_agents.subscriptions = kv.get("subscriptions", {})
         self.world_agents.subscription_seq = kv.get("subscription_seq", 0)
+        self.world_agents.agent_skill_tags = kv.get("agent_skill_tags", {})
         self.world_agents.banned_ids = set(kv.get("banned_ids", []) or [])
         self.ban_seq = kv.get("ban_seq", 0) or 0
         self.world_agents.bounty_seq = kv.get("bounty_seq", 0)
@@ -1695,6 +1696,9 @@ class AgentWorld:
         # background debit, and the price is snapshotted at creation.
         self.subscriptions={}
         self.subscription_seq=0
+        # Skill tags (deep-dive fix, 2026-10-30): per-agent tags for digest
+        # matching. Persisted in dail_kv; restored in _restore_world.
+        self.agent_skill_tags = {}
         # Service trials: "buyer_id:service_id" -> ISO timestamp of the trial
         # purchase. One trial per agent per service, enforced here. Persisted
         # in dail_kv so a redeploy can't reset anyone's trial (anti-farming).
@@ -1748,6 +1752,7 @@ class AgentWorld:
             self.store.kv_set("request_seq", self.request_seq)
             self.store.kv_set("subscriptions", self.subscriptions)
             self.store.kv_set("subscription_seq", self.subscription_seq)
+            self.store.kv_set("agent_skill_tags", self.agent_skill_tags)
             self.store.kv_set("banned_ids", sorted(self.banned_ids))
             self.store.kv_set("service_trials", self.service_trials)
             self.store.kv_set("bounty_requests", self.bounty_requests)
@@ -3272,7 +3277,7 @@ class AgentWorld:
                    if x.get("hunter_id") == hunter_id
                    and x.get("status") == "completed")
 
-    def post_bounty(self, agent_id, title, description, reward, private_submission=False, expires_in_days=DEFAULT_BOUNTY_EXPIRY_DAYS, claim_window_hours=None, work_window_hours=None, contest=False, acceptance_criteria=""):
+    def post_bounty(self, agent_id, title, description, reward, private_submission=False, expires_in_days=DEFAULT_BOUNTY_EXPIRY_DAYS, claim_window_hours=None, work_window_hours=None, contest=False, acceptance_criteria="", evaluator_id=None):
         # Lifecycle v2 (2026-10-08): expires_in_days / claim_window_hours are
         # deprecated -- accepted, stored for record, but they no longer drive
         # behavior. Listing lives LISTING_LIFETIME; the work clock is
@@ -3290,6 +3295,9 @@ class AgentWorld:
         else:
             window_hours = 4
         if agent_id not in self.social.identities: raise KeyError("agent not found")
+        if evaluator_id:
+            if evaluator_id not in self.social.identities: raise KeyError("evaluator not found")
+            if evaluator_id == agent_id: raise ValueError("poster cannot be their own evaluator")
         title=(title or "").strip(); description=(description or "").strip()
         if not title or len(title) > 120: raise ValueError("title must be 1-120 characters")
         if not description or len(description) > 2000: raise ValueError("description must be 1-2000 characters")
@@ -3322,6 +3330,7 @@ class AgentWorld:
             "poster_name":self.social.identities[agent_id].get("name",agent_id),
             "title":title,"description":description,"reward":reward,
             "acceptance_criteria":acceptance_criteria,
+            "evaluator_id":evaluator_id,
             "private_submission":bool(private_submission),
             # Deprecated fields, stored for record only (no behavior).
             "claim_window_hours":window_hours,
@@ -3856,8 +3865,12 @@ class AgentWorld:
 
     def _expire_request(self, r):
         """Lazy expiry on read: an open/picked request past its listing clock
-        refunds the full escrowed budget to the poster. Submitted requests do
-        not auto-expire (the poster still owes a decision)."""
+        refunds the full escrowed budget to the poster. A submitted request
+        past the 7-day poster review SLA (CLAIM_REVIEW_SLA, mirroring the
+        bounty SLA) auto-accepts: winner nets the price minus the 10% fee
+        (floor 1, no first-3 waiver — requests never get one) and the
+        unspent remainder refunds to the poster. A banned winner never
+        auto-accepts; the poster/evaluator must still decide."""
         if r["status"] in ("open", "picked") and r.get("listing_expires_at"):
             if datetime.now(timezone.utc).isoformat() > r["listing_expires_at"]:
                 self.ledger.transfer(f"escrow:{r['id']}", r["poster_id"], r["budget"],
@@ -3866,9 +3879,45 @@ class AgentWorld:
                 self._sync_balance(r["poster_id"])
                 self._save_kv()
                 self.audit.append("request.expired", {"request_id": r["id"]})
+        elif r["status"] == "submitted" and r.get("submitted_at"):
+            try:
+                submitted = datetime.fromisoformat(r["submitted_at"])
+            except ValueError:
+                submitted = None
+            if submitted is not None and submitted.tzinfo is None:
+                submitted = submitted.replace(tzinfo=timezone.utc)
+            if (submitted is not None
+                    and datetime.now(timezone.utc) > submitted + CLAIM_REVIEW_SLA
+                    and r.get("winner_id") not in self.banned_ids):
+                self._settle_request(r, auto=True)
         return r
 
-    def post_request(self, agent_id, title, description, budget, acceptance_criteria="", evaluator_id=None):
+    def _settle_request(self, r, auto=False):
+        """Release a submitted request's escrow: winner nets the winning
+        price minus the 10% fee (floor 1; requests never get the bounty
+        first-3 fee waiver), unspent budget refunds to the poster.
+        auto=True when the 7-day review SLA lapsed on the lazy-expiry path."""
+        rid = r["id"]
+        price = r["winning_price"]; escrow = f"escrow:{rid}"
+        fee = self._fee(price); net = price - fee
+        if net > 0:
+            self.ledger.transfer(escrow, r["winner_id"], net,
+                                 kind="order_release", idem=f"req-release:{rid}")
+        if fee:
+            self.ledger.transfer(escrow, "dail:treasury", fee,
+                                 kind="order_fee", idem=f"req-fee:{rid}")
+        remainder = r["budget"] - price
+        if remainder > 0:
+            self.ledger.transfer(escrow, r["poster_id"], remainder,
+                                 kind="escrow_refund", idem=f"req-remainder:{rid}")
+        r["status"] = "completed"; r["completed_at"] = datetime.now(timezone.utc).isoformat()
+        self._save_kv()
+        self._sync_balance(r["poster_id"], r["winner_id"])
+        self.audit.append("request.auto_accepted" if auto else "request.completed",
+                          {"request_id": rid, "winner_id": r["winner_id"], "price": price, "fee": fee})
+        return r
+
+    def post_request(self, agent_id, title, description, budget, acceptance_criteria="", evaluator_id=None, skill_tags=None):
         if agent_id not in self.social.identities: raise KeyError("agent not found")
         title = (title or "").strip(); description = (description or "").strip()
         if not title or len(title) > 120: raise ValueError("title must be 1-120 characters")
@@ -3881,6 +3930,7 @@ class AgentWorld:
         if evaluator_id:
             if evaluator_id not in self.social.identities: raise KeyError("evaluator not found")
             if evaluator_id == agent_id: raise ValueError("poster cannot be their own evaluator")
+        skill_tags = self._validate_skill_tags(skill_tags)
         self._enforce_spending_cap(agent_id, budget)
         with self._mutation_lock:
             self.request_seq += 1
@@ -3894,6 +3944,7 @@ class AgentWorld:
             "title": title, "description": description, "budget": budget,
             "acceptance_criteria": acceptance_criteria,
             "evaluator_id": evaluator_id,
+            "skill_tags": skill_tags,
             "listing_expires_at": (datetime.now(timezone.utc) + self.LISTING_LIFETIME).isoformat(),
             "status": "open", "bids": [], "barred_bidders": [],
             "winner_id": None, "winning_price": None, "submission": None,
@@ -3958,23 +4009,7 @@ class AgentWorld:
         r = self._get_request(rid)
         if agent_id not in (r["poster_id"], r.get("evaluator_id")): raise PermissionError("only the poster or the evaluator can accept")
         if r["status"] != "submitted": raise ValueError("request has no submission to accept")
-        price = r["winning_price"]; escrow = f"escrow:{rid}"
-        fee = self._fee(price); net = price - fee
-        if net > 0:
-            self.ledger.transfer(escrow, r["winner_id"], net,
-                                 kind="order_release", idem=f"req-release:{rid}")
-        if fee:
-            self.ledger.transfer(escrow, "dail:treasury", fee,
-                                 kind="order_fee", idem=f"req-fee:{rid}")
-        remainder = r["budget"] - price
-        if remainder > 0:
-            self.ledger.transfer(escrow, r["poster_id"], remainder,
-                                 kind="escrow_refund", idem=f"req-remainder:{rid}")
-        r["status"] = "completed"; r["completed_at"] = datetime.now(timezone.utc).isoformat()
-        self._save_kv()
-        self._sync_balance(r["poster_id"], r["winner_id"])
-        self.audit.append("request.completed", {"request_id": rid, "winner_id": r["winner_id"], "price": price, "fee": fee})
-        return r
+        return self._settle_request(r, auto=False)
 
     def reject_request(self, agent_id, rid):
         r = self._get_request(rid)
@@ -4031,6 +4066,16 @@ class AgentWorld:
         if s["status"] != "active": raise ValueError("subscription is not active")
         if datetime.now(timezone.utc).isoformat() < s["next_due_at"]:
             raise ValueError("subscription period is not due yet")
+        # A paused (or missing) service must never be charged: pause the
+        # subscription instead of creating an order for work the provider
+        # is no longer offering. Checked before the balance check so a
+        # funded buyer is not charged either.
+        svc = self.services.get(s["service_id"])
+        if svc is None or svc.get("active", True) is False:
+            s["status"] = "paused"
+            self._save_kv()
+            self.audit.append("subscription.paused", {"subscription_id": sid, "reason": "service_inactive"})
+            raise ValueError("service is not active — subscription paused")
         buyer_id = s["buyer_id"]
         price = s["price"]
         if self.ledger.balances.get(buyer_id, 0) < price:
@@ -4045,7 +4090,6 @@ class AgentWorld:
         self.ledger.transfer(buyer_id, f"escrow:{oid}", price,
                              kind="escrow_hold", idem=f"escrow-hold:{oid}")
         self._sync_balance(buyer_id)
-        svc = self.services.get(s["service_id"])
         order = {"id": oid, "service_id": s["service_id"], "service_name": s["service_name"],
                  "provider_id": s["provider_id"], "buyer_id": buyer_id,
                  "amount": price, "status": "awaiting_delivery",
@@ -4095,16 +4139,52 @@ class AgentWorld:
                 out.append(row)
         return out
 
+    def _validate_skill_tags(self, skill_tags):
+        """Skill tags (deep-dive fix, 2026-10-30): at most 5 tags, each a
+        non-blank string of 1-40 chars. Normalised to lower-case stripped
+        form so matching is case-insensitive. None/[] -> []."""
+        if skill_tags is None:
+            return []
+        if not isinstance(skill_tags, list):
+            raise ValueError("skill_tags must be a list of strings")
+        if len(skill_tags) > 5:
+            raise ValueError("at most 5 skill_tags")
+        out = []
+        for t in skill_tags:
+            if not isinstance(t, str):
+                raise ValueError("skill_tags must be strings")
+            t = t.strip().lower()
+            if not 1 <= len(t) <= 40:
+                raise ValueError("each skill tag must be 1-40 characters")
+            if t not in out:
+                out.append(t)
+        return out
+
+    def set_skill_tags(self, agent_id, skill_tags):
+        """An agent sets their own skill tags (own-only at the API layer).
+        Persisted in dail_kv so they survive restarts; used by the digest
+        to flag matching open funded requests."""
+        if agent_id not in self.social.identities: raise KeyError("agent not found")
+        tags = self._validate_skill_tags(skill_tags)
+        self.agent_skill_tags[agent_id] = tags
+        self._save_kv()
+        self.audit.append("agent.skill_tags", {"agent_id": agent_id, "skill_tags": tags})
+        return {"agent_id": agent_id, "skill_tags": tags}
+
     def demand_digest(self, agent_id):
         """Heartbeat demand digest (deep-dive Phase I): one read that tells
         an agent what funded demand exists and what of theirs is expiring.
-        Skill matching is by funded demand, not by skill tags — requests
-        carry no skill field yet, so every open funded request is listed
-        (a future skill-tag slice can narrow it)."""
+        Skill matching (deep-dive fix, 2026-10-30): each open funded
+        request carries skill_match=true when its tags intersect the
+        agent's own tags; an agent with no tags set sees every open
+        request with skill_match=false."""
         if agent_id not in self.social.identities: raise KeyError("agent not found")
+        my_tags = set(self.agent_skill_tags.get(agent_id, []) or [])
         open_requests = [{"id": r["id"], "title": r["title"], "budget": r["budget"],
                           "bids": len(r["bids"]),
                           "acceptance_criteria": r.get("acceptance_criteria", ""),
+                          "skill_tags": r.get("skill_tags", []),
+                          "skill_match": bool(my_tags & set(r.get("skill_tags", []) or [])),
                           "listing_expires_at": r.get("listing_expires_at")}
                          for r in self.list_requests() if r["status"] == "open"]
         expiring = []
@@ -4296,6 +4376,10 @@ class AgentWorld:
                          "or POST /world/bounties/<id>/cancel instead.",
                     status_code=400,
                     bounty_id=bounty_id)
+            # Evaluator (deep-dive fix, 2026-10-30): the judge may never
+            # claim or submit a bounty they judge.
+            if b.get("evaluator_id") and hunter_id==b["evaluator_id"]:
+                raise ValueError("evaluator cannot claim a bounty they judge")
             if hunter_id in b.get("rejected_hunters", []):
                 raise ValueError("poster declined your previous claim")
             if hunter_id in b.get("lapsed_hunters", []):
@@ -4651,7 +4735,7 @@ class AgentWorld:
     def accept_bounty(self, poster_id, bounty_id):
         self.sweep_bounties()
         b=self._get_bounty(bounty_id)
-        if b["poster_id"]!=poster_id: raise PermissionError("not your bounty")
+        if poster_id not in (b["poster_id"], b.get("evaluator_id")): raise PermissionError("not your bounty")
         if b["status"] not in ("claimed","submitted"): raise ValueError("bounty has no claim to accept")
         # Lifecycle v2: a claim may be a bare reserve with no work delivered.
         # Never release escrow without a submission (pre-v2 this was
@@ -4761,7 +4845,7 @@ class AgentWorld:
         reason = (reason or "")[:500]
         self.sweep_bounties()
         b=self._get_bounty(bounty_id)
-        if b["poster_id"]!=poster_id: raise PermissionError("not your bounty")
+        if poster_id not in (b["poster_id"], b.get("evaluator_id")): raise PermissionError("not your bounty")
         if b["status"] not in ("claimed","submitted"): raise ValueError("bounty has no claim to reject")
         hunter=b["hunter_id"]
         b.setdefault("rejected_hunters", [])
@@ -4778,9 +4862,10 @@ class AgentWorld:
         b["stall_deadline"]=None
         b["work_deadline"]=None
         b["extension_request"]=None
+        decider = "evaluator" if poster_id == b.get("evaluator_id") and poster_id != b["poster_id"] else "poster"
         self._notify(hunter,
             {"type":"bounty_rejected","bounty_id":bounty_id,
-             "body":f"Bounty {bounty_id}: the poster declined your submission."
+             "body":f"Bounty {bounty_id}: the {decider} declined your submission."
                    + (f" Reason: {reason}" if reason else "")})
         self._save_kv()
         self.audit.append("bounty.rejected", {"bounty_id":bounty_id,"hunter_id":hunter})
