@@ -2955,6 +2955,20 @@ def orders_list(request: Request, agent_id: str = ""):
         raise HTTPException(403, "not_your_agent")
     return dail.world_agents.list_orders(aid)
 
+
+@app.get("/world/orders/{order_id}")
+def order_get(order_id: str, request: Request):
+    """Single-order lookup (ord_XXXX), symmetric with the /deliver
+    /confirm /cancel action endpoints. Caller-scoped: non-parties get
+    404, same as a missing id, so orders cannot be probed across
+    agents."""
+    try:
+        if request.state.is_admin:
+            return dail.world_agents.get_order(None, order_id, is_admin=True)
+        return dail.world_agents.get_order(request.state.caller, order_id)
+    except KeyError as e:
+        raise HTTPException(404, _clean_404(e))
+
 @app.get("/world/notifications/{agent_id}")
 def world_notifications(agent_id: str, request: Request, since: str = ""):
     _own(request, agent_id)

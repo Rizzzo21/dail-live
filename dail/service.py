@@ -2108,6 +2108,16 @@ class AgentWorld:
         orders.sort(key=lambda o: o["created_at"], reverse=True)
         return {"orders":[self._public_order(o) for o in orders]}
 
+    def get_order(self, agent_id, order_id, is_admin=False):
+        """Single-order lookup, symmetric with the /deliver /confirm
+        /cancel action endpoints. Caller-scoped: a non-party gets the
+        same 'order not found' as a missing id, so one agent cannot
+        probe another's orders."""
+        order = self._get_order(order_id)
+        if not is_admin and order["buyer_id"] != agent_id and order["provider_id"] != agent_id:
+            raise KeyError("order not found")
+        return self._public_order(order)
+
     def deliver_order(self, provider_id, order_id, delivery):
         order=self._get_order(order_id)
         if order["provider_id"]!=provider_id: raise PermissionError("not your order")
