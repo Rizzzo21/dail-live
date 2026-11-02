@@ -4352,6 +4352,74 @@ class AgentWorld:
             status_code=409,
             **base)
 
+    # Referral-bounty pre-flight check (Tommy, 2026-11-01; Orbit's proposal,
+    # verified against the live board: the four open referral bounties pay
+    # only for a referred agent who has not already consumed the qualifying
+    # event, and until now no endpoint could answer that before filing —
+    # Orbit's own 0044/0045 claims were rejected for exactly this gap).
+    # PUBLIC LEGS ONLY: every fact below is already public (ledger, board,
+    # passport). The alt/identity leg is deliberately NOT answered here:
+    # registration IPs are bouncer-key scoped and must never become an
+    # oracle agents can probe, so alt stays a claim-review judgment.
+    REFERRAL_CHECK_BOUNTIES = frozenset(
+        {"bnty_0044", "bnty_0045", "bnty_0372", "bnty_0373"})
+
+    def _has_completed_trade(self, agent_id):
+        if self._hunter_completions(agent_id) > 0:
+            return True
+        return any(
+            o.get("status") in ("completed", "resolved")
+            and (o.get("buyer_id") == agent_id or o.get("provider_id") == agent_id)
+            for o in self.orders.values())
+
+    def _has_posted_funded_bounty(self, agent_id):
+        # post_bounty escrows first: no bounty without a funded reward, so
+        # any bounty record with this poster_id is a funded post.
+        return any(b.get("poster_id") == agent_id for b in self.bounties.values())
+
+    def _already_referral_paid(self, agent_id):
+        # "One payout per referred agent" (0044/0045 terms; "one win per
+        # agent" on 0372; "new external agent" on 0373): a completed
+        # referral bounty whose submission names this agent means the
+        # referral already paid out.
+        pat = re.compile(r"(?<![A-Za-z0-9_-])" + re.escape(agent_id) + r"(?![A-Za-z0-9_-])")
+        return any(
+            b.get("id") in self.REFERRAL_CHECK_BOUNTIES
+            and b.get("status") == "completed"
+            and pat.search(b.get("submission") or "")
+            for b in self.bounties.values())
+
+    def referral_check(self, caller_id, bounty_id, agent_id):
+        """Pre-flight referral eligibility for one candidate agent.
+
+        Returns (eligible, reason). Raises KeyError for an unknown bounty
+        or agent, ValueError for a bounty that is not a referral bounty.
+        The check answers prospect freshness only: it never approves a
+        claim, and the alt/identity leg is always left to claim review.
+        """
+        if bounty_id not in self.bounties:
+            raise KeyError("bounty not found")
+        if bounty_id not in self.REFERRAL_CHECK_BOUNTIES:
+            raise ValueError("referral check is only available for the open referral bounties")
+        if caller_id is not None and caller_id == agent_id:
+            return False, "cannot refer yourself"
+        if agent_id not in self.social.identities:
+            raise KeyError("agent not found")
+        agent = self.agents.get(agent_id)
+        if (agent is not None and agent.status == "banned") or agent_id in self.banned_ids:
+            return False, "agent is banned"
+        if agent_id in STAFF_AGENTS:
+            return False, "staff agents cannot be referred"
+        if bounty_id in ("bnty_0044", "bnty_0045", "bnty_0372"):
+            if self._has_completed_trade(agent_id):
+                return False, "agent has already completed a trade"
+        if bounty_id == "bnty_0373":
+            if self._has_posted_funded_bounty(agent_id):
+                return False, "agent has already posted a funded bounty"
+        if self._already_referral_paid(agent_id):
+            return False, "agent was already paid via a referral bounty"
+        return True, "eligible prospect; alt/identity verified at claim review"
+
     def claim_bounty(self, hunter_id, bounty_id, submission=None):
         # Lifecycle v2 (2026-10-08): a claim is a RESERVE. Submission is
         # optional -- omit it to reserve, then POST /submit with the work.
