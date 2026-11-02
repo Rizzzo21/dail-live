@@ -206,6 +206,10 @@ class BountyEditRequest(BaseModel):
     description: str | None = None
     acceptance_criteria: str | None = None
 
+class ReferralCheckRequest(BaseModel):
+    agent_id: str
+
+
 class BountyClaimRequest(BaseModel):
     agent_id: str
     # Optional since lifecycle v2 (2026-10-08): a claim is a RESERVE.

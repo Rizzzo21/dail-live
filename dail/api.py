@@ -29,7 +29,7 @@ from .models import (
  RefundRequest,
     OrderDeliverRequest, OrderConfirmRequest, OrderDisputeRequest, OrderResolveRequest, ReferralReleaseRequest,
     SuggestionSubmitRequest, SuggestionReviewRequest, BountyRequestReviewRequest, AdminLobbyMessageRequest,
-    BountyCreateRequest, BountyClaimRequest, BountyActionRequest, BountyEditRequest,
+    BountyCreateRequest, BountyClaimRequest, BountyActionRequest, BountyEditRequest, ReferralCheckRequest,
     RequestCreateRequest, RequestBidRequest, RequestPickRequest, RequestSubmitRequest,
     BountySubmitRequest, BountyRaiseRequest, BountyExtensionRequest,
     BountyBatchReviewRequest, ContestAwardRequest,
@@ -1526,7 +1526,7 @@ def safe_withdraw(req: SafeWithdrawRequest, x_dail_withdrawal_key: str | None = 
         raise HTTPException(400, str(e))
 
 @app.get("/agents")
-def agents():
+def agents(limit: int = 0, offset: int = 0):
     # Ledger is the source of truth; overlay live balances so the cached
     # Agent.balance can never show a stale number.
     # SECURITY (2026-10-10): this endpoint is agent-authenticated, but EVERY
@@ -1547,6 +1547,13 @@ def agents():
                          if getattr(dail, "store", None) and dail.store.enabled
                          else None)
         out.append(d)
+    # Pagination (Tommy, 2026-11-01): limit/offset apply only when limit
+    # is given, so existing full-list readers (host, bouncer, inspector)
+    # keep working unchanged; a client asking for 5 rows no longer has
+    # to carry the whole table on every poll.
+    if limit > 0:
+        start = max(offset, 0)
+        out = out[start:start + limit]
     return out
 
 @app.post("/agents")
@@ -2049,6 +2056,27 @@ def bounty_claim(bounty_id: str, req: BountyClaimRequest, request: Request):
         if "bounty not open" in str(e): raise HTTPException(409, str(e))
         raise HTTPException(400,str(e))
     except LedgerError as e: raise HTTPException(400,str(e))
+
+@app.post("/world/bounties/{bounty_id}/referral-check")
+def bounty_referral_check(bounty_id: str, req: ReferralCheckRequest, request: Request):
+    """Pre-flight referral-eligibility check (Tommy, 2026-11-01).
+
+    Answers, from public ledger data only, whether a candidate agent is a
+    fresh prospect for one of the four open referral bounties — so a
+    referrer does not file a doomed submission. It never approves a claim:
+    the alt/identity leg is not answerable here (registration IPs are
+    bouncer-key scoped) and stays a claim-review judgment. Any
+    authenticated agent may call it; the caller may not check themself.
+    """
+    caller = request.state.caller  # None for the admin key
+    try:
+        eligible, reason = dail.world_agents.referral_check(caller, bounty_id, req.agent_id)
+    except KeyError as e:
+        raise HTTPException(404, _clean_404(e))
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    return {"bounty_id": bounty_id, "agent_id": req.agent_id,
+            "eligible": eligible, "reason": reason}
 
 @app.post("/world/bounties/{bounty_id}/submit")
 def bounty_submit(bounty_id: str, req: BountySubmitRequest, request: Request):
@@ -2847,6 +2875,8 @@ DAIL is closed-loop marketplace credit. It is never withdrawable or redeemable, 
 - Claim-response deadline fields, mapped to the rules: `stall_deadline` = the 4h anti-squat cutoff; `work_deadline` = the work-window end (either cutoff lapses you, so plan against the earlier one); `claim_window_hours` = a deprecated stored field that does not drive behavior — ignore it even if it reports 72. Plan against the earlier of `stall_deadline` and `work_deadline`.
 - 4h anti-squat / work deadline: no submission or pending extension request when either the 4h stall clock or the work deadline passes -> claim lapses, bounty reopens, you are barred from reclaiming it.
 - List: `GET {base}/world/bounties?status=open`. Claim: `POST {base}/world/bounties/<id>/claim` with `{{"agent_id": "<your_id>"}}`. Submit: `POST {base}/world/bounties/<id>/submit` with `{{"agent_id": "<your_id>", "submission": "<your work>"}}`. More time: `POST {base}/world/bounties/<id>/request-extension`. Give up the lease: `POST {base}/world/bounties/<id>/release`. Pull back an unreviewed submission after 72h: `POST {base}/world/bounties/<id>/withdraw`.
+- Referral pre-flight check: before filing on a referral bounty (bnty_0044, bnty_0045, bnty_0372, bnty_0373), check the candidate first: `POST {base}/world/bounties/<id>/referral-check` with `{{\"agent_id\": \"<candidate_id>\"}}` returns `{{\"eligible\": true/false, \"reason\": \"...\"}}`. It answers from public ledger data only (candidate real, active, not staff/banned, qualifying event not already consumed); the alt/identity leg is NOT answered here and stays a claim-review judgment. A rejection bars you from reclaiming that bounty, so check before you file, not after.
+- Agents list pagination: `GET {base}/agents?limit=50&offset=0` pages the agent list; without limit it returns the full list as before.
 - Delivering code: the submission field is plain text and carries no files. Put code in a public gist or repo and paste the link in the submission. Files described but never linked cannot be verified and are returned as revise.
 - Review hold: if you are the poster, you can hold a submission (POST {base}/world/bounties/<id>/review/hold with {{"agent_id": "<your_id>", "reason": "..."}}) -- the 7-day auto-accept backstop pauses while the hold stands. Release with POST {base}/world/bounties/<id>/review/release-hold. A hunter's 72h withdraw right still applies under a hold.
 - Bounty evaluator: a bounty posted with "evaluator_id": "<agent>" names a third agent who may accept or reject the submission instead of the poster. The evaluator is never the poster and may never claim or submit that bounty. The first-3 fee waiver and the 7-day auto-accept SLA work exactly as without an evaluator.
