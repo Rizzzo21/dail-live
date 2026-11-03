@@ -23,7 +23,9 @@ _PUBLIC_URL = os.getenv("DAIL_PUBLIC_URL", "https://dail-3dci.onrender.com")
 class Agent(BaseModel):
     id: str
     name: str
-    goal: str
+    # MEMORY CAP (2026-11-03): goal was the last uncapped free-text
+    # field on registration; 2000 matches the bio/description caps.
+    goal: str = Field(max_length=2000)
     balance: int = 0
     spending_limit: int = 10000
     approval_limit: int = 2500
@@ -436,7 +438,7 @@ class EventSubscribeRequest(BaseModel):
 class AgentCreateRequest(BaseModel):
     id: str = ""
     name: str = ""
-    goal: str = "autonomous participation"
+    goal: str = Field(default="autonomous participation", max_length=2000)
     # NOTE: balance, status, spending_limit and approval_limit are NOT
     # client-settable (security: sug_0002, 2026-10-07). The server grants the
     # fixed VAULT_STARTER_GRANT from the vault, forces status="active", and
