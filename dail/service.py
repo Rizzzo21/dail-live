@@ -331,7 +331,15 @@ class Dail:
         self.world_agents.bounty_requests = kv.get("bounty_requests", {})
         self.world_agents.bounty_request_seq = kv.get("bounty_request_seq", 0)
         self.social.msg_idem = kv.get("msg_idem", {})
+        # MEMORY CAP: a pre-cap database may hold unbounded stores;
+        # trim on restore so a single restart cannot re-inflate them.
+        if len(self.social.msg_idem) > SocialWorld.MSG_IDEM_MAX:
+            _items = list(self.social.msg_idem.items())[-SocialWorld.MSG_IDEM_MAX:]
+            self.social.msg_idem = dict(_items)
         self.world_agents.notifications = kv.get("notifications", {})
+        for _aid, _notes in self.world_agents.notifications.items():
+            if len(_notes) > AgentWorld.NOTIFICATIONS_MAX:
+                del _notes[:-AgentWorld.NOTIFICATIONS_MAX]
         self.world_agents.notif_ack = kv.get("notif_ack", {})
         self.world_agents.webhooks = kv.get("webhooks", {})
         # Lobby history survives restarts: messages are written on every
@@ -655,6 +663,12 @@ class Dail:
             raise ValueError("agent already exists")
         if (agent.name or "").strip().lower() in RESERVED_NAMES:
             raise ValueError("name is reserved")
+        # MEMORY CAP (2026-11-03): goal was the last uncapped free-text
+        # field on registration (bio/capabilities are capped at the API
+        # layer). 2000 matches the bio/description caps; anything longer
+        # is rejected rather than stored and re-served on every read.
+        if agent.goal is not None and len(agent.goal) > 2000:
+            raise ValueError("goal must be 1-2000 characters")
         self.agents[agent.id] = agent
         # Founding-100 step-down: the public registration route passes
         # apply_starter_grant=True so the grant is 10 DAIL flat (cut from 100
@@ -1347,6 +1361,16 @@ class Dail:
 
 
 class SocialWorld:
+    # MEMORY CAPS (2026-11-03): the live room-message lists and the
+    # lobby idempotency dict were unbounded — only the KV persist slice
+    # and the API response were capped, so the in-memory lists grew
+    # forever. Trim on append; 200 matches the existing persist/API
+    # caps, so no response shape changes. 1000 idempotency entries is
+    # far above any legitimate retry window (retries arrive immediately;
+    # cron posts use fresh keys per post).
+    ROOM_MESSAGES_MAX = 200
+    MSG_IDEM_MAX = 1000
+
     def __init__(self, ledger, audit, store=None):
         self.ledger, self.audit = ledger, audit
         self.store = store  # WorldStore or None; enables lobby persistence
@@ -1383,6 +1407,12 @@ class SocialWorld:
         self.identities[agent_id]["name"]=name
         self.audit.append("identity.updated", {"agent_id":agent_id,"name":name})
         return self.identities[agent_id]
+    def _trim_room_messages(self, r):
+        # MEMORY CAP: trim the LIVE list, not just the persist/API slice.
+        msgs = r.get("messages", [])
+        if len(msgs) > self.ROOM_MESSAGES_MAX:
+            del msgs[:-self.ROOM_MESSAGES_MAX]
+
     def public_room(self, r, include_messages=True):
         d={k:r[k] for k in ("id","name","private","owner_id","rent_credits")} | {"members":len(r["members"])}
         limit = 200 if r["id"] == "lobby" else 50
@@ -1481,7 +1511,7 @@ class SocialWorld:
         item={"id":f"{room_id}:{agent_id}:{_ts}","from_id":agent_id,"from_name":self.identities[agent_id]["name"],"message":message,"created_at":_ts}
         
                
-        r["messages"].append(item); self.audit.append("room.message",{"room_id":room_id,"agent_id":agent_id,"message_length":len(message)})
+        r["messages"].append(item); self._trim_room_messages(r); self.audit.append("room.message",{"room_id":room_id,"agent_id":agent_id,"message_length":len(message)})
         # Lobby history survives restarts (cap 200). Private rooms stay
         # ephemeral for members — but every private message is recorded in
         # the hidden admin/bouncer audit log (cap 200 per room).
@@ -1491,6 +1521,13 @@ class SocialWorld:
             self._audit_room_message(room_id, item)
         result={"room_id":room_id,"fee":1 if room_id=="lobby" else 0,"message":item}
         if idem_scope:
+            # MEMORY CAP: FIFO eviction. A retried POST replays only
+            # while its key is retained; eviction after 1000 newer posts
+            # means a very late retry re-posts (and re-charges) instead
+            # of replaying — the safe failure mode, and far outside any
+            # real retry window.
+            if idem_scope not in self.msg_idem and len(self.msg_idem) >= self.MSG_IDEM_MAX:
+                self.msg_idem.pop(next(iter(self.msg_idem)))
             self.msg_idem[idem_scope]=result
         return result
 
@@ -1505,7 +1542,7 @@ class SocialWorld:
         _ts=datetime.now(timezone.utc).isoformat()
         item={"id":f"lobby:dail_concierge:{_ts}","from_id":"dail_concierge","from_name":"DAiL Concierge","message":message,"created_at":_ts}
                
-        r["messages"].append(item)
+        r["messages"].append(item); self._trim_room_messages(r)
         self.audit.append("room.message",{"room_id":"lobby","agent_id":"dail_concierge","message_length":len(message)})
         # Same 200-cap persistence as normal lobby messages.
         if self.store and self.store.enabled:
@@ -1609,6 +1646,10 @@ class SocialWorld:
 
 class AgentWorld:
     """DAiL autonomous-agent world primitives: profiles, services, discovery and trades."""
+    # MEMORY CAP (2026-11-03): notifications were appended forever and
+    # ack only stamped a timestamp, never deleting. Reads return only
+    # the last 50, so 100 newest is 2x the read window and generous.
+    NOTIFICATIONS_MAX = 100
     def _enforce_spending_cap(self, agent_id, amount):
         """SECURITY (2026-10-10): the spending_limit hard cap (default 10000)
         was only enforced on the merchant pay() path — trades, bounty
@@ -1834,6 +1875,16 @@ class AgentWorld:
     def update_profile(self, agent_id, bio, capabilities):
         if agent_id not in self.social.identities: raise KeyError("agent not found")
         self.ensure_agent(type("A",(),{"id":agent_id})())
+        # MEMORY CAP (2026-11-03): bio/capabilities were capped at the
+        # API layer (2000 chars / 20 items x 80 chars) but not here, so
+        # any direct service caller could still store an unbounded
+        # profile that is re-served on every /agents read. Enforce the
+        # same limits at the service layer: bio over 2000 is rejected
+        # (mirroring the API's 422), capabilities are truncated to the
+        # API validator's limits (mirroring its per-item truncation).
+        if bio is not None and len(bio) > 2000: raise ValueError("bio must be 1-2000 characters")
+        if capabilities is not None:
+            capabilities = [(c or "")[:80] for c in (capabilities or [])][:20]
         # FIX 2: write-through to the DB immediately; a restart right after
         # this call must see the identical profile.
         self.profiles[agent_id]["bio"]=bio
@@ -2987,11 +3038,19 @@ class AgentWorld:
                 "unread_count":unread}
 
     def ack_notifications(self, agent_id):
-        """Mark all current notifications as read."""
+        """Mark all current notifications as read, and delete them.
+
+        MEMORY CAP (2026-11-03): previously ack only stamped notif_ack
+        and the list was retained forever. The stamp is kept (unread
+        counts compare against it), but acked items are now removed, so
+        the per-agent list cannot grow through reads alone.
+        """
         items=self.notifications.get(agent_id,[])
         self.notif_ack[agent_id]=max([n.get("created_at","") for n in items]+[""])
+        acknowledged=len(items)
+        self.notifications[agent_id]=[]
         self._save_kv()
-        return {"agent_id":agent_id,"acknowledged":len(items)}
+        return {"agent_id":agent_id,"acknowledged":acknowledged}
 
     def _notify(self, agent_id, item):
         """Single choke point for all agent notifications: persists the
@@ -3005,7 +3064,10 @@ class AgentWorld:
             item = {"body": str(item)}
         item.setdefault("type", "info")
         item.setdefault("created_at", datetime.now(timezone.utc).isoformat())
-        self.notifications.setdefault(agent_id, []).append(item)
+        _notes=self.notifications.setdefault(agent_id, [])
+        _notes.append(item)
+        if len(_notes) > self.NOTIFICATIONS_MAX:
+            del _notes[:-self.NOTIFICATIONS_MAX]
         if self.webhooks.get(agent_id):
             import threading
             t = threading.Thread(target=self._dispatch_webhooks,

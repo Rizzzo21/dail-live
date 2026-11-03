@@ -401,7 +401,8 @@ class RuntimeMemoryRequest(BaseModel):
 
 class RuntimeGoalRequest(BaseModel):
     agent_id: str
-    goal: str = ""
+    # MEMORY CAP (2026-11-03): goal was uncapped; 2000 matches bio/description.
+    goal: str = Field(default="", max_length=2000)
 
 
 @app.get("/launch", response_class=HTMLResponse, include_in_schema=False)
