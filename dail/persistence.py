@@ -158,6 +158,21 @@ class WorldStore:
                 customer_id VARCHAR(64) NOT NULL,
                 data TEXT NOT NULL,
                 updated_at VARCHAR(64) NOT NULL)""",
+            # MEMORY PHASE 2: durable audit + room history. CREATE TABLE
+            # IF NOT EXISTS makes this safe on an existing live database;
+            # nothing is backfilled destructively and no table is dropped.
+            # Audit rows are append-only with the hash chain intact; room
+            # rows reuse the in-memory message id as PK (unique per room).
+            """CREATE TABLE IF NOT EXISTS dail_audit_events (
+                seq INTEGER PRIMARY KEY, event VARCHAR(128) NOT NULL,
+                payload TEXT NOT NULL DEFAULT '', prev_hash VARCHAR(64) NOT NULL DEFAULT '',
+                hash VARCHAR(64) NOT NULL DEFAULT '', created_at VARCHAR(64) NOT NULL DEFAULT '')""",
+            """CREATE TABLE IF NOT EXISTS dail_room_messages (
+                id VARCHAR(255) PRIMARY KEY, room_id VARCHAR(64) NOT NULL,
+                agent_id VARCHAR(255) NOT NULL DEFAULT '',
+                agent_name VARCHAR(255) NOT NULL DEFAULT '',
+                message TEXT NOT NULL DEFAULT '',
+                created_at VARCHAR(64) NOT NULL DEFAULT '')""",
         ]
         for s in stmts:
             try:
@@ -275,6 +290,83 @@ class WorldStore:
                 """INSERT INTO dail_kv (key, value) VALUES (:k, :v)
                    ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value"""),
                 {"k": key, "v": json.dumps(value)})
+
+    # ---- MEMORY PHASE 2: durable audit + room history ----
+    def audit_append(self, record):
+        """Insert one hash-chained audit record. No-op when disabled;
+        ON CONFLICT DO NOTHING so a restart replay can never duplicate
+        a sequence number. Never raises for a missing table: audit is
+        non-money state and must not break a trade/bounty write."""
+        if not self.enabled:
+            return
+        try:
+            with self._lock, self.engine.begin() as c:
+                c.execute(text(
+                    """INSERT INTO dail_audit_events (seq, event, payload, prev_hash, hash, created_at)
+                       VALUES (:seq, :event, :payload, :prev, :hash, :now)
+                       ON CONFLICT (seq) DO NOTHING"""),
+                    {"seq": record["seq"], "event": record["event"],
+                     "payload": json.dumps(record["payload"], sort_keys=True),
+                     "prev": record["prev_hash"], "hash": record["hash"],
+                     "now": _now()})
+        except Exception:
+            pass
+
+    def audit_all(self):
+        """All persisted audit records in chain order (oldest first)."""
+        if not self.enabled:
+            return []
+        with self._lock, self.engine.begin() as c:
+            rows = c.execute(text(
+                "SELECT seq, event, payload, prev_hash, hash FROM dail_audit_events ORDER BY seq")).fetchall()
+        out = []
+        for seq, event, payload, prev_hash, digest in rows:
+            try:
+                payload = json.loads(payload)
+            except (TypeError, ValueError):
+                payload = {}
+            out.append({"seq": seq, "event": event, "payload": payload,
+                        "prev_hash": prev_hash, "hash": digest})
+        return out
+
+    def audit_count(self):
+        if not self.enabled:
+            return 0
+        with self._lock, self.engine.begin() as c:
+            row = c.execute(text("SELECT COUNT(*) FROM dail_audit_events")).fetchone()
+        return int(row[0]) if row else 0
+
+    def room_message_append(self, room_id, item):
+        if not self.enabled:
+            return
+        try:
+            with self._lock, self.engine.begin() as c:
+                c.execute(text(
+                    """INSERT INTO dail_room_messages (id, room_id, agent_id, agent_name, message, created_at)
+                       VALUES (:id, :room, :aid, :aname, :msg, :created)
+                       ON CONFLICT (id) DO NOTHING"""),
+                    {"id": item["id"], "room": room_id,
+                     "aid": item.get("from_id", ""), "aname": item.get("from_name", ""),
+                     "msg": item.get("message", ""), "created": item.get("created_at", "")})
+        except Exception:
+            pass
+
+    def room_messages(self, room_id, limit=200, offset=0):
+        """Most-recent slice of a room's persisted history, returned in
+        chronological order. offset pages backwards into older history:
+        offset=0 is the newest `limit` messages. Empty when disabled."""
+        if not self.enabled:
+            return []
+        with self._lock, self.engine.begin() as c:
+            rows = c.execute(text(
+                """SELECT id, agent_id, agent_name, message, created_at
+                   FROM dail_room_messages WHERE room_id=:room
+                   ORDER BY created_at DESC, id DESC LIMIT :lim OFFSET :off"""),
+                {"room": room_id, "lim": int(limit), "off": int(offset)}).fetchall()
+        out = [{"id": r[0], "from_id": r[1], "from_name": r[2],
+                "message": r[3], "created_at": r[4]} for r in rows]
+        out.reverse()
+        return out
 
     # ---- agent API keys (hashes only; raw keys are never stored) ----
     def save_agent_key(self, agent_id, key_hash):

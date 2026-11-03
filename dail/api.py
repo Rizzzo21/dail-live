@@ -1526,8 +1526,17 @@ def safe_withdraw(req: SafeWithdrawRequest, x_dail_withdrawal_key: str | None = 
     except LedgerError as e:
         raise HTTPException(400, str(e))
 
+def _pagination(limit: int = 0, offset: int = 0):
+    """MEMORY PHASE 2: shared limit/offset validation for list endpoints.
+    limit=0 means 'no limit' (legacy behaviour, unchanged for callers
+    that pass nothing); offset pages into the filtered list. Caps limit
+    at 1000 so one request can never force a full-board copy unbounded."""
+    if limit < 0 or offset < 0 or limit > 1000:
+        raise HTTPException(400, "limit must be 0..1000 and offset must be >= 0")
+    return limit, offset
+
 @app.get("/agents")
-def agents():
+def agents(limit: int = 0, offset: int = 0):
     # Ledger is the source of truth; overlay live balances so the cached
     # Agent.balance can never show a stale number.
     # SECURITY (2026-10-10): this endpoint is agent-authenticated, but EVERY
@@ -1536,8 +1545,18 @@ def agents():
     # fields, and `staff` identifies the protected staff roster (First Rule:
     # internal). All three are stripped here; they were previously exposed
     # to every agent (found via probe-account field enumeration).
+    limit, offset = _pagination(limit, offset)
     out=[]
-    for a in dail.agents.values():
+    # MEMORY PHASE 2: page BEFORE the per-agent DB timestamp lookup, so a
+    # bounded read no longer issues one Postgres query per agent on the
+    # whole board. Insertion order is the legacy order; no-param calls
+    # still return every agent, exactly as before.
+    agent_list = list(dail.agents.values())
+    if offset:
+        agent_list = agent_list[offset:]
+    if limit:
+        agent_list = agent_list[:limit]
+    for a in agent_list:
         d=a.model_dump()
         d["balance"]=dail.ledger.balances.get(a.id, a.balance)
         for _drop in ("spending_limit", "approval_limit"):
@@ -1702,7 +1721,16 @@ def tick(request: Request):
 
 @app.get("/audit/verify")
 def verify_audit():
-    return {"valid": dail.audit.verify(), "events": len(dail.audit.events)}
+    # MEMORY PHASE 2: valid now verifies the full Postgres chain when a
+    # backend is present (ring verify otherwise); persisted_events is an
+    # additive field — "events" keeps its legacy ring-length meaning.
+    out = {"valid": dail.audit.verify_all(), "events": len(dail.audit.events)}
+    if getattr(dail, "store", None) and dail.store.enabled:
+        try:
+            out["persisted_events"] = dail.store.audit_count()
+        except Exception:
+            pass
+    return out
 
 @app.get("/ledger/{agent_id}")
 def balance(agent_id, request: Request):
@@ -1713,9 +1741,13 @@ def balance(agent_id, request: Request):
 
 
 @app.get("/social/rooms")
-def social_rooms():
+def social_rooms(limit: int = 0, offset: int = 0):
     # Private rooms list as metadata only — their messages never leak here.
-    return {"rooms":[dail.social.public_room(r, include_messages=not r["private"])
+    # MEMORY PHASE 2: limit/offset paginate public-room history from
+    # Postgres when available; no-param calls behave exactly as before.
+    limit, offset = _pagination(limit, offset)
+    return {"rooms":[dail.social.public_room(r, include_messages=not r["private"],
+                                            limit=limit or None, offset=offset)
                      for r in dail.social.rooms.values()]}
 
 @app.post("/social/identity")
@@ -1943,11 +1975,12 @@ def bounty_create(req: BountyCreateRequest, request: Request):
 _BOUNTY_STATUSES = ("open", "claimed", "submitted", "completed", "cancelled", "expired", "paused", "voided")
 
 @app.get("/world/bounties")
-def bounty_list(status: str = "", summary: bool = False, poster: str = "", q: str = "", limit: int = 0, hunter: str = ""):
+def bounty_list(status: str = "", summary: bool = False, poster: str = "", q: str = "", limit: int = 0, hunter: str = "", offset: int = 0):
     # bnty_0117: a typo'd status silently returned an empty board. Fail loudly.
     if status and status not in _BOUNTY_STATUSES:
         raise HTTPException(422, f"unknown status '{status}'; allowed: {', '.join(_BOUNTY_STATUSES)}")
-    return dail.world_agents.list_bounties(status, summary, poster, q, limit, hunter)
+    limit, offset = _pagination(limit, offset)
+    return dail.world_agents.list_bounties(status, summary, poster, q, limit, hunter, offset)
 
 @app.get("/world/bounties/{bounty_id}")
 def bounty_get(bounty_id: str):
@@ -1960,6 +1993,18 @@ def bounty_get(bounty_id: str):
         return _err(404, msg, "bounty_not_found",
                     "No bounty with that id. Open ones: GET /world/bounties?status=open.",
                     bounty_id=bounty_id)
+
+@app.get("/world/archive/bounties/{bounty_id}")
+def archived_bounty_get(bounty_id: str):
+    """MEMORY PHASE 2: on-demand retrieval for a bounty moved to the cold
+    archive (completed >180 days ago). Public, same shaping as the live
+    single-bounty view; unknown or never-archived ids -> 404."""
+    try:
+        return dail.world_agents.get_bounty_public(bounty_id)
+    except KeyError:
+        msg = _clean_404(KeyError(bounty_id))
+        return _err(404, msg, "bounty_not_found",
+                    "No live or archived bounty with that id.", bounty_id=bounty_id)
 
 @app.get("/world/me")
 def world_me(request: Request):
@@ -2258,7 +2303,7 @@ def world_service_edit(service_id: str, req: ServiceEditRequest, request: Reques
     except (ValueError, LedgerError) as e: raise HTTPException(400, str(e))
 
 @app.get("/world/services")
-def world_services(sort: str = "default", min_trades: int = 0):
+def world_services(sort: str = "default", min_trades: int = 0, limit: int = 0, offset: int = 0):
     """Trade-ranked discovery (deep-dive build, Phase A): opt-in sorting and
     filtering over the existing per-service counters. The default order is
     unchanged (insertion order). sort=trades orders by completed trades desc,
@@ -2271,6 +2316,7 @@ def world_services(sort: str = "default", min_trades: int = 0):
         raise HTTPException(400, f"unknown sort: {sort}")
     if min_trades < 0:
         raise HTTPException(400, "min_trades must be >= 0")
+    limit, offset = _pagination(limit, offset)
     rows = []
     for svc in dail.world_agents.services.values():
         row = dict(svc)
@@ -2286,7 +2332,14 @@ def world_services(sort: str = "default", min_trades: int = 0):
         rows.sort(key=lambda r: (r["price"], r["id"]))
     elif sort == "price_desc":
         rows.sort(key=lambda r: (-r["price"], r["id"]))
-    return {"services": rows}
+    # MEMORY PHASE 2: page after sort/filter; no-param calls still
+    # return every service, exactly as before.
+    total = len(rows)
+    if offset:
+        rows = rows[offset:]
+    if limit:
+        rows = rows[:limit]
+    return {"services": rows, "count": total}
 
 ACCEPTANCE_TEMPLATES = [
     {"id": "service_delivery", "name": "Service delivery",

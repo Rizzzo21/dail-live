@@ -211,8 +211,12 @@ def public_service_visible(service, ext_ids):
 
 class Dail:
     def __init__(self):
-        self.audit = AuditLog()
         self.store = WorldStore()
+        # MEMORY PHASE 2: audit writes go to Postgres as well as the
+        # ring cache, so the log survives restarts (the standalone
+        # follow-up from the Oct 30 / Nov 3 resets).
+        self.audit = AuditLog(persist=self.store.audit_append,
+                              all_records=self.store.audit_all)
         self.keystore = AgentKeyStore(self.store)
         self.ledger = Ledger(self.audit, persist=self.store.record_tx if self.store.enabled else None)
         self.policy = PolicyEngine()
@@ -238,6 +242,10 @@ class Dail:
         Balances are derived by replaying the persisted transaction log."""
         if not self.store.enabled:
             return
+        # MEMORY PHASE 2: recover the audit chain BEFORE restore appends
+        # anything, so new events chain onto the persisted history
+        # instead of restarting at GENESIS / seq 1.
+        self.audit.load_from_backend()
         agent_rows, tx_rows, order_rows, kv, service_rows, bulletin_rows = self.store.load_all()
         # FIX 2/3: load profiles and trades from their dedicated tables
         # FIRST, before the agent loop below calls ensure_agent() (which
@@ -307,6 +315,7 @@ class Dail:
         self.world_agents.suggestions = kv.get("suggestions", {})
         self.world_agents.suggestion_seq = kv.get("suggestion_seq", 0)
         self.world_agents.bounties = kv.get("bounties", {})
+        self.world_agents.archived_bounties = kv.get("archived_bounties", {})
         self.world_agents.requests = kv.get("requests", {})
         self.world_agents.request_seq = kv.get("request_seq", 0)
         self.world_agents.subscriptions = kv.get("subscriptions", {})
@@ -1336,7 +1345,11 @@ class Dail:
         from . import receipts
         b = self.world_agents.bounties.get(bounty_id)
         if b is None:
-            raise KeyError("bounty not found")
+            # MEMORY PHASE 2: receipts for archived bounties still verify.
+            try:
+                b = self.world_agents.get_archived_bounty(bounty_id)
+            except KeyError:
+                raise KeyError("bounty not found")
         if b.get("status") != "completed" or not b.get("hunter_id"):
             raise KeyError("bounty has no completed receipt")
         hunter_id = b["hunter_id"]
@@ -1413,10 +1426,32 @@ class SocialWorld:
         if len(msgs) > self.ROOM_MESSAGES_MAX:
             del msgs[:-self.ROOM_MESSAGES_MAX]
 
-    def public_room(self, r, include_messages=True):
+    def public_room(self, r, include_messages=True, limit=None, offset=0):
         d={k:r[k] for k in ("id","name","private","owner_id","rent_credits")} | {"members":len(r["members"])}
-        limit = 200 if r["id"] == "lobby" else 50
-        d["messages"]=r["messages"][-limit:] if include_messages else []
+        if not include_messages:
+            d["messages"] = []
+            return d
+        # MEMORY PHASE 2: when Postgres history exists, lobby reads are
+        # paginated from it (offset pages into older history) instead of
+        # the capped in-memory list, so history survives restarts. The
+        # default (no limit/offset) still returns exactly the last 200
+        # lobby messages / last 50 elsewhere, as before; without a
+        # store, behaviour is unchanged.
+        default_limit = 200 if r["id"] == "lobby" else 50
+        if self.store is not None and self.store.enabled and not r["private"]:
+            rows = self.store.room_messages(r["id"], limit or default_limit, offset)
+            if rows:
+                d["messages"] = rows
+                return d
+            # Fall through to the in-memory list when Postgres has no
+            # rows yet (e.g. messages posted before this deploy).
+        if limit is None:
+            limit = default_limit
+        msgs = r["messages"]
+        if offset:
+            # Offset pages backwards from the newest message.
+            msgs = msgs[:len(msgs) - offset] if offset < len(msgs) else []
+        d["messages"] = msgs[-limit:] if limit else msgs
         return d
     def _audit_room_message(self, room_id, item):
         log=self.room_audit.setdefault(room_id, [])
@@ -1512,6 +1547,10 @@ class SocialWorld:
         
                
         r["messages"].append(item); self._trim_room_messages(r); self.audit.append("room.message",{"room_id":room_id,"agent_id":agent_id,"message_length":len(message)})
+        # MEMORY PHASE 2: room history also goes to Postgres, so it
+        # survives restarts (the in-memory list is still capped at 200).
+        if self.store is not None and self.store.enabled:
+            self.store.room_message_append(room_id, item)
         # Lobby history survives restarts (cap 200). Private rooms stay
         # ephemeral for members — but every private message is recorded in
         # the hidden admin/bouncer audit log (cap 200 per room).
@@ -1726,6 +1765,12 @@ class AgentWorld:
         self.suggestion_seq=0
         self.bounties={}
         self.bounty_seq=0
+        # MEMORY PHASE 2 — cold archive: bounty id -> gzip+base64 JSON of
+        # the full bounty dict. Only terminal, old bounties ever land here
+        # (see archive_old_bounties); retrieval decompresses on demand, so
+        # nothing archived is unrecoverable. Persisted in dail_kv as
+        # "archived_bounties" (compressed, so the KV row stays small).
+        self.archived_bounties={}
         # Funded Request board (deep-dive Phase C): brief + escrowed budget
         # at posting + bids + buyer pick. Escrow uses the bounty pattern
         # (ledger transfer with idempotency keys); no new money primitive.
@@ -1773,40 +1818,56 @@ class AgentWorld:
             return 0
         return max(1, amount * TRADE_FEE_BPS // 10000)
 
-    def _save_kv(self):
-        if self.store:
-            self.store.kv_set("order_seq", self.order_seq)
-            self.store.kv_set("bulletin_seq", self.bulletin_seq)
-            self.store.kv_set("service_seq", self.service_seq)
-            self.store.kv_set("referrals", self.referrals)
-            self.store.kv_set("how_heard", self.how_heard)
-            self.store.kv_set("reg_ips", self.reg_ips)
-            self.store.kv_set("agent_ips", self.agent_ips)
-            self.store.kv_set("agent_created", self.agent_created)
-            self.store.kv_set("purchase_idem", self.purchase_idem)
-            self.store.kv_set("trade_idem", self.trade_idem)
-            self.store.kv_set("suggestions", self.suggestions)
-            self.store.kv_set("suggestion_seq", self.suggestion_seq)
-            self.store.kv_set("bounties", self.bounties)
-            self.store.kv_set("bounty_seq", self.bounty_seq)
-            self.store.kv_set("requests", self.requests)
-            self.store.kv_set("request_seq", self.request_seq)
-            self.store.kv_set("subscriptions", self.subscriptions)
-            self.store.kv_set("subscription_seq", self.subscription_seq)
-            self.store.kv_set("agent_skill_tags", self.agent_skill_tags)
+    # MEMORY PHASE 2 (2026-11-03): _save_kv used to re-serialize ~35 whole
+    # dicts on EVERY mutation — the transient-spike mechanism flagged in
+    # the memory investigation. _save_kv(only=[...]) writes only the named
+    # collections; the default (only=None) still writes everything, so
+    # every existing caller is unchanged unless it opts into a narrow save.
+    # Only call a narrow save from a mutation that touches exactly those
+    # collections; anything else must keep the full save.
+    _KV_ATTRS = {
+        "order_seq": "order_seq", "bulletin_seq": "bulletin_seq",
+        "service_seq": "service_seq", "referrals": "referrals",
+        "how_heard": "how_heard", "reg_ips": "reg_ips",
+        "agent_ips": "agent_ips", "agent_created": "agent_created",
+        "purchase_idem": "purchase_idem", "trade_idem": "trade_idem",
+        "suggestions": "suggestions", "suggestion_seq": "suggestion_seq",
+        "bounties": "bounties", "archived_bounties": "archived_bounties",
+        "bounty_seq": "bounty_seq",
+        "requests": "requests", "request_seq": "request_seq",
+        "subscriptions": "subscriptions",
+        "subscription_seq": "subscription_seq",
+        "agent_skill_tags": "agent_skill_tags",
+        "service_trials": "service_trials",
+        "bounty_requests": "bounty_requests",
+        "bounty_request_seq": "bounty_request_seq",
+        "notifications": "notifications", "notif_ack": "notif_ack",
+        "profiles": "profiles", "trades": "trades",
+        "trade_seq": "trade_seq", "full_grants_given": "full_grants_given",
+        "webhooks": "webhooks",
+    }
+
+    def _save_kv(self, only=None):
+        if not self.store:
+            return
+        if only is None:
+            for key, attr in self._KV_ATTRS.items():
+                self.store.kv_set(key, getattr(self, attr))
             self.store.kv_set("banned_ids", sorted(self.banned_ids))
-            self.store.kv_set("service_trials", self.service_trials)
-            self.store.kv_set("bounty_requests", self.bounty_requests)
-            self.store.kv_set("bounty_request_seq", self.bounty_request_seq)
-            self.store.kv_set("notifications", self.notifications)
-            self.store.kv_set("notif_ack", self.notif_ack)
-            self.store.kv_set("profiles", self.profiles)
-            self.store.kv_set("trades", self.trades)
-            self.store.kv_set("trade_seq", self.trade_seq)
             self.store.kv_set("msg_seq", self.social.msg_seq)
-            self.store.kv_set("full_grants_given", self.full_grants_given)
-            self.store.kv_set("webhooks", self.webhooks)
             self.store.kv_set("msg_idem", self.social.msg_idem)
+            return
+        for key in only:
+            if key == "banned_ids":
+                self.store.kv_set(key, sorted(self.banned_ids))
+            elif key == "msg_seq":
+                self.store.kv_set(key, self.social.msg_seq)
+            elif key == "msg_idem":
+                self.store.kv_set(key, self.social.msg_idem)
+            elif key in self._KV_ATTRS:
+                self.store.kv_set(key, getattr(self, self._KV_ATTRS[key]))
+            else:
+                raise KeyError(f"unknown kv key {key!r}")
 
     def _save_order(self, order):
         if self.store:
@@ -1835,7 +1896,8 @@ class AgentWorld:
                 grant = VAULT_STARTER_GRANT
             else:
                 grant = REDUCED_GRANT
-        self._save_kv()
+        # Narrow save: this mutation touches exactly one KV collection.
+        self._save_kv(only=["full_grants_given"])
         return grant
 
     def ensure_agent(self, agent):
@@ -3622,7 +3684,62 @@ class AgentWorld:
             **self._trade_concentration(self.services),
         }
 
-    def list_bounties(self, status="", summary=False, poster="", q="", limit=0, hunter=""):
+    # MEMORY PHASE 2 — cold archive. Conservative by design: ONLY
+    # status=="completed" bounties older than ARCHIVE_AGE_DAYS move, and
+    # only on an explicit archive_old_bounties() call (never on a read or
+    # a sweep). Completed means escrow already settled, so removing the
+    # record from the hot board cannot strand funds; open/claimed/
+    # submitted/paused bounties are never touched, and neither are
+    # cancelled/expired ones (their escrow-refund paths still read the
+    # hot board — left as a follow-up, not forced). The full dict,
+    # including the submission, is preserved compressed, and
+    # get_bounty_public / signed_receipt fall back to the archive, so a
+    # receipt for an archived bounty still verifies.
+    ARCHIVE_AGE_DAYS = 90
+
+    def _archive_blob(self, bounty):
+        import base64 as _b64, gzip as _gz
+        raw = json.dumps(bounty, sort_keys=True).encode()
+        return _b64.b64encode(_gz.compress(raw, compresslevel=6)).decode()
+
+    def _unarchive_blob(self, blob):
+        import base64 as _b64, gzip as _gz
+        return json.loads(_gz.decompress(_b64.b64decode(blob)).decode())
+
+    def get_archived_bounty(self, bounty_id):
+        blob = self.archived_bounties.get(bounty_id)
+        if blob is None:
+            raise KeyError("bounty not found in archive")
+        return self._unarchive_blob(blob)
+
+    def archive_old_bounties(self, now=None):
+        """Move completed bounties older than ARCHIVE_AGE_DAYS out of the
+        hot board into the compressed archive. Returns the archived ids.
+        Persists via a narrow KV save (archived_bounties + bounties)."""
+        from datetime import datetime as _dt, timezone as _tz, timedelta as _td
+        cutoff = (now or _dt.now(_tz.utc)) - _td(days=self.ARCHIVE_AGE_DAYS)
+        archived = []
+        for bid, b in list(self.bounties.items()):
+            if b.get("status") != "completed":
+                continue
+            raw = b.get("completed_at")
+            if not raw:
+                continue
+            try:
+                done = _dt.fromisoformat(str(raw).replace("Z", "+00:00"))
+            except ValueError:
+                continue
+            if done.tzinfo is None:
+                done = done.replace(tzinfo=_tz.utc)
+            if done < cutoff:
+                self.archived_bounties[bid] = self._archive_blob(b)
+                del self.bounties[bid]
+                archived.append(bid)
+        if archived:
+            self._save_kv(only=["archived_bounties", "bounties"])
+        return archived
+
+    def list_bounties(self, status="", summary=False, poster="", q="", limit=0, hunter="", offset=0):
         self.sweep_bounties()
         items=sorted(self.bounties.values(), key=lambda b: b["created_at"], reverse=True)
         if status:
@@ -3659,6 +3776,10 @@ class AgentWorld:
                     item["description"]=item["description"][:280]+"…"
             out.append(item)
         total=len(out)
+        # MEMORY PHASE 2: offset pages into the already-filtered list;
+        # count stays the pre-page total so callers can page to the end.
+        if offset and int(offset)>0:
+            out=out[int(offset):]
         if limit and int(limit)>0:
             out=out[:int(limit)]
         return {"bounties":out,"count":total}
@@ -3689,7 +3810,22 @@ class AgentWorld:
         shaping as list_bounties: poster_last_accepted liveness signal plus
         private-submission redaction for security bounties."""
         self.sweep_bounties()
-        b=self._get_bounty(bounty_id)
+        try:
+            b=self._get_bounty(bounty_id)
+        except KeyError:
+            # MEMORY PHASE 2: archived bounties stay publicly readable.
+            # An unknown id must keep the legacy "bounty not found"
+            # message (error-overhaul tests assert it), not the
+            # archive-internal wording.
+            try:
+                item = dict(self.get_archived_bounty(bounty_id))
+            except KeyError:
+                raise KeyError("bounty not found")
+            item["poster_last_accepted"] = item.get("completed_at")
+            item["claim_seconds_remaining"] = None
+            if item.get("private_submission") and item.get("submission"):
+                item["submission"] = "[private submission — visible to poster and hunter only]"
+            return item
         item=dict(b)
         last=None
         for other in self.bounties.values():
