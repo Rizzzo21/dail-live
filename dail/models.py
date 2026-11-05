@@ -321,6 +321,9 @@ class ServicePurchaseRequest(BaseModel):
     # Client-supplied idempotency key: repeating the purchase with the same
     # (buyer, key) returns the original order instead of escrowing twice.
     idempotency_key: str | None = None
+    # Buyer requirements (2026-11-04): optional plain-text message to the
+    # seller, stored on the order. Over-length is a 422, never truncated.
+    requirements: str | None = Field(default=None, max_length=2000)
 
     @field_validator("idempotency_key")
     @classmethod

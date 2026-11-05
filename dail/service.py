@@ -81,6 +81,50 @@ DEFAULT_BOUNTY_EXPIRY_DAYS = 30
 # Poster review SLA: a claimed bounty auto-accepts after 7 days so a
 # ghosting poster can't lock a hunter's work forever.
 CLAIM_REVIEW_SLA = timedelta(days=7)
+# Review-hold lifetime (Tommy, 2026-11-04): a poster-set review hold
+# pauses the 7-day auto-accept backstop for at most 4 hours. After that
+# the hold is expired and no longer pauses anything, even if the poster
+# never releases it. The 4h figure supersedes an earlier 7-day idea.
+REVIEW_HOLD_TTL = timedelta(hours=4)
+
+
+def review_hold_active(bounty, now=None):
+    """Single source of truth for review-hold activity (2026-11-04).
+
+    A hold is active only while review_hold is set AND now is before
+    review_hold_at + REVIEW_HOLD_TTL. A hold record with no timestamp
+    (written before holds carried one) is treated as active: its expiry
+    cannot be proven, so it must not silently unpause the backstop.
+    """
+    if not bounty.get("review_hold"):
+        return False
+    started_raw = bounty.get("review_hold_at")
+    if not started_raw:
+        return True
+    try:
+        started = datetime.fromisoformat(str(started_raw).replace("Z", "+00:00"))
+    except ValueError:
+        return True
+    if started.tzinfo is None:
+        started = started.replace(tzinfo=timezone.utc)
+    if now is None:
+        now = datetime.now(timezone.utc)
+    return now < started + REVIEW_HOLD_TTL
+
+
+def review_hold_expires_at(bounty):
+    """Computed expiry of a review hold (review_hold_at + 4h), or None
+    when the bounty carries no timestamped hold."""
+    started_raw = bounty.get("review_hold_at")
+    if not bounty.get("review_hold") or not started_raw:
+        return None
+    try:
+        started = datetime.fromisoformat(str(started_raw).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if started.tzinfo is None:
+        started = started.replace(tzinfo=timezone.utc)
+    return (started + REVIEW_HOLD_TTL).isoformat()
 # Order delivery size cap (2026-10-20): was a silent [:5000] truncation
 # that cut ord_0068's HTML dashboard off mid-tag with nobody told --
 # the buyer saw a broken file and the provider had delivered in full.
@@ -2035,7 +2079,7 @@ class AgentWorld:
                 "trial_price": trial_price, "trial_used_at": self.service_trials[key],
                 "note": "Trial recorded. One trial per agent per service."}
 
-    def purchase_service(self, buyer_id, service_id, idem=None):
+    def purchase_service(self, buyer_id, service_id, idem=None, requirements=None):
         """Buy a service via escrow: the buyer's DAIL is held, the provider
         delivers, the buyer confirms (or disputes). The house fee is taken
         from the provider's proceeds when escrow releases.
@@ -2053,6 +2097,12 @@ class AgentWorld:
         N orders and N escrow holds while every client saw one order_id."""
         if buyer_id not in self.social.identities: raise KeyError("agent not found")
         if service_id not in self.services: raise KeyError("service not found")
+        # Buyer requirements (2026-11-04): an optional plain-text message
+        # to the seller, stored on the order. Over-length is rejected,
+        # never silently truncated (cf. DELIVERY_MAX_CHARS).
+        if requirements is not None:
+            if not isinstance(requirements, str) or len(requirements) > 2000:
+                raise ValueError("requirements must be at most 2000 characters")
         scope_key = None
         if idem is not None:
             # Strict validation when a key is supplied; None means the
@@ -2108,6 +2158,11 @@ class AgentWorld:
                 order={"id":oid,"service_id":service_id,"service_name":svc["name"],
                        "provider_id":svc["provider_id"],"buyer_id":buyer_id,
                        "amount":price,"status":"awaiting_delivery",
+                       # Purchase response carries the service's promised
+                       # window (2026-11-04): it previously lived only on
+                       # the service object, invisible at purchase time.
+                       "delivery_hours":svc.get("delivery_hours",DEFAULT_DELIVERY_HOURS),
+                       "requirements":requirements,
                        "created_at":now,"deliver_by":(datetime.now(timezone.utc)+timedelta(hours=svc.get("delivery_hours",DEFAULT_DELIVERY_HOURS))).isoformat(),
                        "overdue_notified":False,
                        "delivery":None,"delivered_at":None,
@@ -2135,6 +2190,9 @@ class AgentWorld:
 
     def _public_order(self, order):
         d=dict(order)
+        # Orders written before the requirements field existed normalize
+        # to None so every order response carries the same shape.
+        d.setdefault("requirements", None)
         d["order_id"]=d.pop("id")
         # Delivery SLA signal: buyers see at a glance whether the provider
         # is past the promised window (and can cancel for a full refund).
@@ -2150,6 +2208,23 @@ class AgentWorld:
         self.sweep_orders()
         if order_id not in self.orders: raise KeyError("order not found")
         return self.orders[order_id]
+
+    def get_order_for_verification(self, order_id):
+        """Staff verification read (2026-11-04): return one order by id
+        regardless of whether the caller is buyer or seller. The route
+        layer restricts this to staff agents (dail_host/dail_manager) or
+        admin; ordinary agent reads stay caller-scoped (see
+        get_order_for_agent) and are untouched by this path."""
+        return self._public_order(self._get_order(order_id))
+
+    def get_order_for_agent(self, agent_id, order_id):
+        """Caller-scoped single-order read: the caller must be the buyer
+        or the provider. Non-parties get the same KeyError as a missing
+        order, so existence is never leaked to strangers."""
+        order = self._get_order(order_id)
+        if agent_id not in (order["buyer_id"], order["provider_id"]):
+            raise KeyError("order not found")
+        return self._public_order(order)
 
     def list_orders(self, agent_id=None):
         self.sweep_orders()
@@ -3645,6 +3720,7 @@ class AgentWorld:
         out=[]
         for b in items:
             item=dict(b)
+            item["review_hold_expires_at"]=review_hold_expires_at(item)
             item["poster_last_accepted"]=last_accepted.get(b["poster_id"])
             item["claim_seconds_remaining"]=self._claim_seconds_remaining(item)
             # Security bounties: the submission stays private in public
@@ -3691,6 +3767,7 @@ class AgentWorld:
         self.sweep_bounties()
         b=self._get_bounty(bounty_id)
         item=dict(b)
+        item["review_hold_expires_at"]=review_hold_expires_at(item)
         last=None
         for other in self.bounties.values():
             if other["poster_id"]==b["poster_id"] and other["status"]=="completed" \
@@ -3757,8 +3834,9 @@ class AgentWorld:
           lapse (reopen snipable, hunter barred from reclaiming; 2nd lapse
           pauses the bounty)
         - submitted and past the 7-day review SLA: auto-accept (escrow to
-          hunter) -- the final backstop; PAUSED while the poster has the
-          bounty on review hold (review_hold), until release or a manual
+          hunter) -- the final backstop; PAUSED only while the poster has
+          an ACTIVE review hold (review_hold_active: at most 4h from
+          review_hold_at, 2026-11-04), until release, expiry, or a manual
           accept/reject
         Returns {"expired", "lapsed", "paused", "auto_accepted", "warned"}."""
         now = datetime.now(timezone.utc)
@@ -3812,12 +3890,13 @@ class AgentWorld:
                 # claim can be 4 days old at submit; the poster still gets the
                 # full 7 days to review).
                 if b.get("submitted_at"):
-                    # Review hold (2026-10-20): a poster-set hold PAUSES the
-                    # auto-accept backstop until the hold is released or the
-                    # poster accepts/rejects. Without this, the backstop paid
+                    # Review hold (2026-10-20, expiry 2026-11-04): an ACTIVE
+                    # poster-set hold PAUSES the auto-accept backstop until
+                    # the hold is released, expires (4h), or the poster
+                    # accepts/rejects. Without this, the backstop paid
                     # bnty_0150 before its documented hold condition resolved.
                     # Notify the poster once when the SLA point passes held.
-                    if b.get("review_hold") and not b.get("review_hold_sla_notified"):
+                    if review_hold_active(b, now) and not b.get("review_hold_sla_notified"):
                         try:
                             review_base = b.get("submitted_at") or b["claimed_at"]
                             if datetime.fromisoformat(review_base) + CLAIM_REVIEW_SLA <= now:
@@ -3831,7 +3910,7 @@ class AgentWorld:
                             pass
                     try:
                         review_base = b.get("submitted_at") or b["claimed_at"]
-                        if not b.get("review_hold") and datetime.fromisoformat(review_base) + CLAIM_REVIEW_SLA <= now:
+                        if not review_hold_active(b, now) and datetime.fromisoformat(review_base) + CLAIM_REVIEW_SLA <= now:
                             try:
                                 self._settle_bounty(b, auto=True)
                             except Exception as e:
