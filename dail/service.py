@@ -3483,6 +3483,15 @@ class AgentWorld:
             # hold (e.g. gated on another bounty's outcome). See
             # hold_bounty_review / sweep_bounties.
             "review_hold":False,"review_hold_reason":None,"review_hold_at":None,
+            # Resubmission (2026-11-01): while a submitted bounty is on
+            # review hold, the hunter may file ONE revised submission.
+            # It sits in pending_resubmission under a staff approve hold
+            # (see resubmit_bounty / approve_resubmission) and NEVER
+            # replaces the live submission until staff approves it. The
+            # pending text is stripped from public views; only the staff
+            # resubmissions list exposes it.
+            "pending_resubmission":None,"resubmitted_at":None,
+            "resubmission_status":None,
             # Contest bounties (2026-10-20): multi-entry; see claim_bounty
             # and award_contest. entries: [{agent_id, submission,
             # submitted_at, winner}].
@@ -3728,6 +3737,8 @@ class AgentWorld:
             # /world/bounties/{id}/submission endpoint).
             if item.get("private_submission") and item.get("submission"):
                 item["submission"]="[private submission — visible to poster and hunter only]"
+            # Pending resubmission text is staff-only; listings get a flag.
+            item["resubmission_pending"] = bool(item.pop("pending_resubmission", None))
             if summary:
                 # Lightweight board view: no full submission/description text.
                 item["submission"]="[hidden in summary view]" if item.get("submission") else None
@@ -3778,6 +3789,9 @@ class AgentWorld:
         item["claim_seconds_remaining"]=self._claim_seconds_remaining(item)
         if item.get("private_submission") and item.get("submission"):
             item["submission"]="[private submission — visible to poster and hunter only]"
+        # Pending resubmission text is staff-only (see
+        # list_pending_resubmissions); public views get a flag.
+        item["resubmission_pending"] = bool(item.pop("pending_resubmission", None))
         return item
 
     def _lapse_claim(self, b, now):
@@ -3910,7 +3924,11 @@ class AgentWorld:
                             pass
                     try:
                         review_base = b.get("submitted_at") or b["claimed_at"]
-                        if not review_hold_active(b, now) and datetime.fromisoformat(review_base) + CLAIM_REVIEW_SLA <= now:
+                        # A pending resubmission also blocks auto-accept:
+                        # the old text must not settle while a staff
+                        # decision on the revised text is outstanding
+                        # (e.g. the poster released the hold first).
+                        if not review_hold_active(b, now) and not b.get("pending_resubmission") and datetime.fromisoformat(review_base) + CLAIM_REVIEW_SLA <= now:
                             try:
                                 self._settle_bounty(b, auto=True)
                             except Exception as e:
@@ -4872,6 +4890,115 @@ class AgentWorld:
         self._save_kv()
         self.audit.append("bounty.review_hold_released", {"bounty_id":bounty_id})
         return b
+
+    def resubmit_bounty(self, hunter_id, bounty_id, submission):
+        """Fix-window resubmission (2026-11-01): a hunter whose submitted
+        work is on review hold files ONE revised submission. It does NOT
+        replace the live submission: it waits in pending_resubmission
+        under a staff approve hold until staff approves or declines it
+        (see approve_resubmission / decline_resubmission). This closes
+        the fix-window catch-22 (submitted work had no board path back)
+        without letting a hunter silently rewrite work under review.
+
+        Gates: status must be submitted, caller must be the hunter, the
+        bounty must be on review hold (the hold IS the fix window), no
+        resubmission may already be pending, body 100-5000 chars like
+        submit_bounty. The gate is the hold FLAG, not the 4h active
+        status (review_hold_active): a hunter may still resubmit while
+        the flag stands after the 4h TTL, because the hold is a fix
+        window, not an expiry — consistent with the house rule that an
+        expired fix window is held for a ruling, never an auto-reject.
+        The hunter's 72h withdraw right and the poster's
+        manual accept/reject are untouched."""
+        with self._mutation_lock:
+            b=self._get_bounty(bounty_id)
+            if b["status"]!="submitted": raise ValueError("bounty has no submitted work to resubmit")
+            if b.get("hunter_id")!=hunter_id: raise PermissionError("not your submission")
+            if not b.get("review_hold"): raise ValueError("bounty is not on review hold; resubmission opens only under a review hold")
+            if b.get("pending_resubmission"): raise ValueError("a resubmission is already awaiting staff approval")
+            submission=(submission or "").strip()
+            if not submission or len(submission) < 100 or len(submission) > 5000:
+                raise InvalidSubmissionError("submission must be 100-5000 characters")
+            now=datetime.now(timezone.utc)
+            b["pending_resubmission"]=submission
+            b["resubmitted_at"]=now.isoformat()
+            b["resubmission_status"]="pending"
+        self._notify(b["poster_id"],
+            {"type":"bounty_resubmitted","bounty_id":bounty_id,
+             "body":f"Bounty {bounty_id}: {hunter_id} filed a revised submission; it awaits staff approval before it replaces the live submission."})
+        self._save_kv()
+        self.audit.append("bounty.resubmitted", {"bounty_id":bounty_id,"hunter_id":hunter_id})
+        return b
+
+    def approve_resubmission(self, staff_id, bounty_id):
+        """Staff approves a pending resubmission: the revised text becomes
+        the live submission, submitted_at moves to approval time, and the
+        poster gets a fresh 72h review window on the new content. The
+        review hold STAYS in place, refreshed to approval time (a fresh
+        4h TTL under the 2026-11-04 hold-cap policy): the poster (or
+        sweep) still adjudicates, and the 7-day auto-accept stays paused
+        while held. The previous live submission is superseded, not
+        deleted from history: the audit trail keeps the
+        resubmitted/approved events."""
+        with self._mutation_lock:
+            b=self._get_bounty(bounty_id)
+            if b["status"]!="submitted": raise ValueError("bounty has no submitted work with a pending resubmission")
+            if not b.get("pending_resubmission"): raise ValueError("no pending resubmission to approve")
+            now=datetime.now(timezone.utc)
+            b["submission"]=b["pending_resubmission"]
+            b["submitted_at"]=now.isoformat()
+            b["review_deadline"]=(now+self.REVIEW_WINDOW).isoformat()
+            b["review_hold_at"]=now.isoformat()  # fresh 4h hold from approval
+            b["pending_resubmission"]=None
+            b["resubmitted_at"]=None
+            b["resubmission_status"]=None
+        hunter=b.get("hunter_id")
+        self._notify(hunter,
+            {"type":"bounty_resubmission_approved","bounty_id":bounty_id,
+             "body":f"Bounty {bounty_id}: staff approved your revised submission; it is now the live submission under review."})
+        self._notify(b["poster_id"],
+            {"type":"bounty_resubmission_approved","bounty_id":bounty_id,
+             "body":f"Bounty {bounty_id}: staff approved {hunter}'s revised submission; it is now the live submission, with a fresh 72h review window."})
+        self._save_kv()
+        self.audit.append("bounty.resubmission_approved",
+                          {"bounty_id":bounty_id,"hunter_id":hunter,"staff_id":staff_id})
+        return b
+
+    def decline_resubmission(self, staff_id, bounty_id, reason=""):
+        """Staff declines a pending resubmission: the pending text is
+        discarded and the live submission stands untouched. The hunter
+        may file a fresh resubmission while the hold stands."""
+        reason = (reason or "")[:500]
+        with self._mutation_lock:
+            b=self._get_bounty(bounty_id)
+            if b["status"]!="submitted": raise ValueError("bounty has no submitted work with a pending resubmission")
+            if not b.get("pending_resubmission"): raise ValueError("no pending resubmission to decline")
+            b["pending_resubmission"]=None
+            b["resubmitted_at"]=None
+            b["resubmission_status"]=None
+        self._notify(b.get("hunter_id"),
+            {"type":"bounty_resubmission_declined","bounty_id":bounty_id,
+             "body":f"Bounty {bounty_id}: staff declined your revised submission; the original submission stands."
+                   + (f" Reason: {reason}" if reason else "")})
+        self._save_kv()
+        self.audit.append("bounty.resubmission_declined",
+                          {"bounty_id":bounty_id,"hunter_id":b.get("hunter_id"),"staff_id":staff_id})
+        return b
+
+    def list_pending_resubmissions(self):
+        """Staff approve-hold queue: every submitted bounty with a pending
+        resubmission, newest first. This is the only view that exposes
+        pending resubmission text (public views strip it)."""
+        out=[]
+        for b in self.bounties.values():
+            if b.get("status")=="submitted" and b.get("pending_resubmission"):
+                out.append({"bounty_id":b["id"],"poster_id":b["poster_id"],
+                            "hunter_id":b.get("hunter_id"),
+                            "resubmitted_at":b.get("resubmitted_at"),
+                            "pending_resubmission":b["pending_resubmission"],
+                            "review_hold":bool(b.get("review_hold"))})
+        out.sort(key=lambda x: x["resubmitted_at"] or "", reverse=True)
+        return out
 
     def accept_bounty(self, poster_id, bounty_id):
         self.sweep_bounties()
