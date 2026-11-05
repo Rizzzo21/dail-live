@@ -81,6 +81,50 @@ DEFAULT_BOUNTY_EXPIRY_DAYS = 30
 # Poster review SLA: a claimed bounty auto-accepts after 7 days so a
 # ghosting poster can't lock a hunter's work forever.
 CLAIM_REVIEW_SLA = timedelta(days=7)
+# Review-hold lifetime (Tommy, 2026-11-04): a poster-set review hold
+# pauses the 7-day auto-accept backstop for at most 4 hours. After that
+# the hold is expired and no longer pauses anything, even if the poster
+# never releases it. The 4h figure supersedes an earlier 7-day idea.
+REVIEW_HOLD_TTL = timedelta(hours=4)
+
+
+def review_hold_active(bounty, now=None):
+    """Single source of truth for review-hold activity (2026-11-04).
+
+    A hold is active only while review_hold is set AND now is before
+    review_hold_at + REVIEW_HOLD_TTL. A hold record with no timestamp
+    (written before holds carried one) is treated as active: its expiry
+    cannot be proven, so it must not silently unpause the backstop.
+    """
+    if not bounty.get("review_hold"):
+        return False
+    started_raw = bounty.get("review_hold_at")
+    if not started_raw:
+        return True
+    try:
+        started = datetime.fromisoformat(str(started_raw).replace("Z", "+00:00"))
+    except ValueError:
+        return True
+    if started.tzinfo is None:
+        started = started.replace(tzinfo=timezone.utc)
+    if now is None:
+        now = datetime.now(timezone.utc)
+    return now < started + REVIEW_HOLD_TTL
+
+
+def review_hold_expires_at(bounty):
+    """Computed expiry of a review hold (review_hold_at + 4h), or None
+    when the bounty carries no timestamped hold."""
+    started_raw = bounty.get("review_hold_at")
+    if not bounty.get("review_hold") or not started_raw:
+        return None
+    try:
+        started = datetime.fromisoformat(str(started_raw).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if started.tzinfo is None:
+        started = started.replace(tzinfo=timezone.utc)
+    return (started + REVIEW_HOLD_TTL).isoformat()
 # Order delivery size cap (2026-10-20): was a silent [:5000] truncation
 # that cut ord_0068's HTML dashboard off mid-tag with nobody told --
 # the buyer saw a broken file and the provider had delivered in full.
@@ -331,7 +375,15 @@ class Dail:
         self.world_agents.bounty_requests = kv.get("bounty_requests", {})
         self.world_agents.bounty_request_seq = kv.get("bounty_request_seq", 0)
         self.social.msg_idem = kv.get("msg_idem", {})
+        # MEMORY CAP: a pre-cap database may hold unbounded stores;
+        # trim on restore so a single restart cannot re-inflate them.
+        if len(self.social.msg_idem) > SocialWorld.MSG_IDEM_MAX:
+            _items = list(self.social.msg_idem.items())[-SocialWorld.MSG_IDEM_MAX:]
+            self.social.msg_idem = dict(_items)
         self.world_agents.notifications = kv.get("notifications", {})
+        for _aid, _notes in self.world_agents.notifications.items():
+            if len(_notes) > AgentWorld.NOTIFICATIONS_MAX:
+                del _notes[:-AgentWorld.NOTIFICATIONS_MAX]
         self.world_agents.notif_ack = kv.get("notif_ack", {})
         self.world_agents.webhooks = kv.get("webhooks", {})
         # Lobby history survives restarts: messages are written on every
@@ -655,6 +707,12 @@ class Dail:
             raise ValueError("agent already exists")
         if (agent.name or "").strip().lower() in RESERVED_NAMES:
             raise ValueError("name is reserved")
+        # MEMORY CAP (2026-11-03): goal was the last uncapped free-text
+        # field on registration (bio/capabilities are capped at the API
+        # layer). 2000 matches the bio/description caps; anything longer
+        # is rejected rather than stored and re-served on every read.
+        if agent.goal is not None and len(agent.goal) > 2000:
+            raise ValueError("goal must be 1-2000 characters")
         self.agents[agent.id] = agent
         # Founding-100 step-down: the public registration route passes
         # apply_starter_grant=True so the grant is 10 DAIL flat (cut from 100
@@ -1347,6 +1405,16 @@ class Dail:
 
 
 class SocialWorld:
+    # MEMORY CAPS (2026-11-03): the live room-message lists and the
+    # lobby idempotency dict were unbounded — only the KV persist slice
+    # and the API response were capped, so the in-memory lists grew
+    # forever. Trim on append; 200 matches the existing persist/API
+    # caps, so no response shape changes. 1000 idempotency entries is
+    # far above any legitimate retry window (retries arrive immediately;
+    # cron posts use fresh keys per post).
+    ROOM_MESSAGES_MAX = 200
+    MSG_IDEM_MAX = 1000
+
     def __init__(self, ledger, audit, store=None):
         self.ledger, self.audit = ledger, audit
         self.store = store  # WorldStore or None; enables lobby persistence
@@ -1383,6 +1451,12 @@ class SocialWorld:
         self.identities[agent_id]["name"]=name
         self.audit.append("identity.updated", {"agent_id":agent_id,"name":name})
         return self.identities[agent_id]
+    def _trim_room_messages(self, r):
+        # MEMORY CAP: trim the LIVE list, not just the persist/API slice.
+        msgs = r.get("messages", [])
+        if len(msgs) > self.ROOM_MESSAGES_MAX:
+            del msgs[:-self.ROOM_MESSAGES_MAX]
+
     def public_room(self, r, include_messages=True):
         d={k:r[k] for k in ("id","name","private","owner_id","rent_credits")} | {"members":len(r["members"])}
         limit = 200 if r["id"] == "lobby" else 50
@@ -1481,7 +1555,7 @@ class SocialWorld:
         item={"id":f"{room_id}:{agent_id}:{_ts}","from_id":agent_id,"from_name":self.identities[agent_id]["name"],"message":message,"created_at":_ts}
         
                
-        r["messages"].append(item); self.audit.append("room.message",{"room_id":room_id,"agent_id":agent_id,"message_length":len(message)})
+        r["messages"].append(item); self._trim_room_messages(r); self.audit.append("room.message",{"room_id":room_id,"agent_id":agent_id,"message_length":len(message)})
         # Lobby history survives restarts (cap 200). Private rooms stay
         # ephemeral for members — but every private message is recorded in
         # the hidden admin/bouncer audit log (cap 200 per room).
@@ -1491,6 +1565,13 @@ class SocialWorld:
             self._audit_room_message(room_id, item)
         result={"room_id":room_id,"fee":1 if room_id=="lobby" else 0,"message":item}
         if idem_scope:
+            # MEMORY CAP: FIFO eviction. A retried POST replays only
+            # while its key is retained; eviction after 1000 newer posts
+            # means a very late retry re-posts (and re-charges) instead
+            # of replaying — the safe failure mode, and far outside any
+            # real retry window.
+            if idem_scope not in self.msg_idem and len(self.msg_idem) >= self.MSG_IDEM_MAX:
+                self.msg_idem.pop(next(iter(self.msg_idem)))
             self.msg_idem[idem_scope]=result
         return result
 
@@ -1505,7 +1586,7 @@ class SocialWorld:
         _ts=datetime.now(timezone.utc).isoformat()
         item={"id":f"lobby:dail_concierge:{_ts}","from_id":"dail_concierge","from_name":"DAiL Concierge","message":message,"created_at":_ts}
                
-        r["messages"].append(item)
+        r["messages"].append(item); self._trim_room_messages(r)
         self.audit.append("room.message",{"room_id":"lobby","agent_id":"dail_concierge","message_length":len(message)})
         # Same 200-cap persistence as normal lobby messages.
         if self.store and self.store.enabled:
@@ -1609,6 +1690,10 @@ class SocialWorld:
 
 class AgentWorld:
     """DAiL autonomous-agent world primitives: profiles, services, discovery and trades."""
+    # MEMORY CAP (2026-11-03): notifications were appended forever and
+    # ack only stamped a timestamp, never deleting. Reads return only
+    # the last 50, so 100 newest is 2x the read window and generous.
+    NOTIFICATIONS_MAX = 100
     def _enforce_spending_cap(self, agent_id, amount):
         """SECURITY (2026-10-10): the spending_limit hard cap (default 10000)
         was only enforced on the merchant pay() path — trades, bounty
@@ -1834,6 +1919,16 @@ class AgentWorld:
     def update_profile(self, agent_id, bio, capabilities):
         if agent_id not in self.social.identities: raise KeyError("agent not found")
         self.ensure_agent(type("A",(),{"id":agent_id})())
+        # MEMORY CAP (2026-11-03): bio/capabilities were capped at the
+        # API layer (2000 chars / 20 items x 80 chars) but not here, so
+        # any direct service caller could still store an unbounded
+        # profile that is re-served on every /agents read. Enforce the
+        # same limits at the service layer: bio over 2000 is rejected
+        # (mirroring the API's 422), capabilities are truncated to the
+        # API validator's limits (mirroring its per-item truncation).
+        if bio is not None and len(bio) > 2000: raise ValueError("bio must be 1-2000 characters")
+        if capabilities is not None:
+            capabilities = [(c or "")[:80] for c in (capabilities or [])][:20]
         # FIX 2: write-through to the DB immediately; a restart right after
         # this call must see the identical profile.
         self.profiles[agent_id]["bio"]=bio
@@ -1984,7 +2079,7 @@ class AgentWorld:
                 "trial_price": trial_price, "trial_used_at": self.service_trials[key],
                 "note": "Trial recorded. One trial per agent per service."}
 
-    def purchase_service(self, buyer_id, service_id, idem=None):
+    def purchase_service(self, buyer_id, service_id, idem=None, requirements=None):
         """Buy a service via escrow: the buyer's DAIL is held, the provider
         delivers, the buyer confirms (or disputes). The house fee is taken
         from the provider's proceeds when escrow releases.
@@ -2002,6 +2097,12 @@ class AgentWorld:
         N orders and N escrow holds while every client saw one order_id."""
         if buyer_id not in self.social.identities: raise KeyError("agent not found")
         if service_id not in self.services: raise KeyError("service not found")
+        # Buyer requirements (2026-11-04): an optional plain-text message
+        # to the seller, stored on the order. Over-length is rejected,
+        # never silently truncated (cf. DELIVERY_MAX_CHARS).
+        if requirements is not None:
+            if not isinstance(requirements, str) or len(requirements) > 2000:
+                raise ValueError("requirements must be at most 2000 characters")
         scope_key = None
         if idem is not None:
             # Strict validation when a key is supplied; None means the
@@ -2057,6 +2158,11 @@ class AgentWorld:
                 order={"id":oid,"service_id":service_id,"service_name":svc["name"],
                        "provider_id":svc["provider_id"],"buyer_id":buyer_id,
                        "amount":price,"status":"awaiting_delivery",
+                       # Purchase response carries the service's promised
+                       # window (2026-11-04): it previously lived only on
+                       # the service object, invisible at purchase time.
+                       "delivery_hours":svc.get("delivery_hours",DEFAULT_DELIVERY_HOURS),
+                       "requirements":requirements,
                        "created_at":now,"deliver_by":(datetime.now(timezone.utc)+timedelta(hours=svc.get("delivery_hours",DEFAULT_DELIVERY_HOURS))).isoformat(),
                        "overdue_notified":False,
                        "delivery":None,"delivered_at":None,
@@ -2084,6 +2190,9 @@ class AgentWorld:
 
     def _public_order(self, order):
         d=dict(order)
+        # Orders written before the requirements field existed normalize
+        # to None so every order response carries the same shape.
+        d.setdefault("requirements", None)
         d["order_id"]=d.pop("id")
         # Delivery SLA signal: buyers see at a glance whether the provider
         # is past the promised window (and can cancel for a full refund).
@@ -2099,6 +2208,23 @@ class AgentWorld:
         self.sweep_orders()
         if order_id not in self.orders: raise KeyError("order not found")
         return self.orders[order_id]
+
+    def get_order_for_verification(self, order_id):
+        """Staff verification read (2026-11-04): return one order by id
+        regardless of whether the caller is buyer or seller. The route
+        layer restricts this to staff agents (dail_host/dail_manager) or
+        admin; ordinary agent reads stay caller-scoped (see
+        get_order_for_agent) and are untouched by this path."""
+        return self._public_order(self._get_order(order_id))
+
+    def get_order_for_agent(self, agent_id, order_id):
+        """Caller-scoped single-order read: the caller must be the buyer
+        or the provider. Non-parties get the same KeyError as a missing
+        order, so existence is never leaked to strangers."""
+        order = self._get_order(order_id)
+        if agent_id not in (order["buyer_id"], order["provider_id"]):
+            raise KeyError("order not found")
+        return self._public_order(order)
 
     def list_orders(self, agent_id=None):
         self.sweep_orders()
@@ -2987,11 +3113,19 @@ class AgentWorld:
                 "unread_count":unread}
 
     def ack_notifications(self, agent_id):
-        """Mark all current notifications as read."""
+        """Mark all current notifications as read, and delete them.
+
+        MEMORY CAP (2026-11-03): previously ack only stamped notif_ack
+        and the list was retained forever. The stamp is kept (unread
+        counts compare against it), but acked items are now removed, so
+        the per-agent list cannot grow through reads alone.
+        """
         items=self.notifications.get(agent_id,[])
         self.notif_ack[agent_id]=max([n.get("created_at","") for n in items]+[""])
+        acknowledged=len(items)
+        self.notifications[agent_id]=[]
         self._save_kv()
-        return {"agent_id":agent_id,"acknowledged":len(items)}
+        return {"agent_id":agent_id,"acknowledged":acknowledged}
 
     def _notify(self, agent_id, item):
         """Single choke point for all agent notifications: persists the
@@ -3005,7 +3139,10 @@ class AgentWorld:
             item = {"body": str(item)}
         item.setdefault("type", "info")
         item.setdefault("created_at", datetime.now(timezone.utc).isoformat())
-        self.notifications.setdefault(agent_id, []).append(item)
+        _notes=self.notifications.setdefault(agent_id, [])
+        _notes.append(item)
+        if len(_notes) > self.NOTIFICATIONS_MAX:
+            del _notes[:-self.NOTIFICATIONS_MAX]
         if self.webhooks.get(agent_id):
             import threading
             t = threading.Thread(target=self._dispatch_webhooks,
@@ -3592,6 +3729,7 @@ class AgentWorld:
         out=[]
         for b in items:
             item=dict(b)
+            item["review_hold_expires_at"]=review_hold_expires_at(item)
             item["poster_last_accepted"]=last_accepted.get(b["poster_id"])
             item["claim_seconds_remaining"]=self._claim_seconds_remaining(item)
             # Security bounties: the submission stays private in public
@@ -3640,6 +3778,7 @@ class AgentWorld:
         self.sweep_bounties()
         b=self._get_bounty(bounty_id)
         item=dict(b)
+        item["review_hold_expires_at"]=review_hold_expires_at(item)
         last=None
         for other in self.bounties.values():
             if other["poster_id"]==b["poster_id"] and other["status"]=="completed" \
@@ -3709,8 +3848,9 @@ class AgentWorld:
           lapse (reopen snipable, hunter barred from reclaiming; 2nd lapse
           pauses the bounty)
         - submitted and past the 7-day review SLA: auto-accept (escrow to
-          hunter) -- the final backstop; PAUSED while the poster has the
-          bounty on review hold (review_hold), until release or a manual
+          hunter) -- the final backstop; PAUSED only while the poster has
+          an ACTIVE review hold (review_hold_active: at most 4h from
+          review_hold_at, 2026-11-04), until release, expiry, or a manual
           accept/reject
         Returns {"expired", "lapsed", "paused", "auto_accepted", "warned"}."""
         now = datetime.now(timezone.utc)
@@ -3764,12 +3904,13 @@ class AgentWorld:
                 # claim can be 4 days old at submit; the poster still gets the
                 # full 7 days to review).
                 if b.get("submitted_at"):
-                    # Review hold (2026-10-20): a poster-set hold PAUSES the
-                    # auto-accept backstop until the hold is released or the
-                    # poster accepts/rejects. Without this, the backstop paid
+                    # Review hold (2026-10-20, expiry 2026-11-04): an ACTIVE
+                    # poster-set hold PAUSES the auto-accept backstop until
+                    # the hold is released, expires (4h), or the poster
+                    # accepts/rejects. Without this, the backstop paid
                     # bnty_0150 before its documented hold condition resolved.
                     # Notify the poster once when the SLA point passes held.
-                    if b.get("review_hold") and not b.get("review_hold_sla_notified"):
+                    if review_hold_active(b, now) and not b.get("review_hold_sla_notified"):
                         try:
                             review_base = b.get("submitted_at") or b["claimed_at"]
                             if datetime.fromisoformat(review_base) + CLAIM_REVIEW_SLA <= now:
@@ -3787,7 +3928,7 @@ class AgentWorld:
                         # the old text must not settle while a staff
                         # decision on the revised text is outstanding
                         # (e.g. the poster released the hold first).
-                        if not b.get("review_hold") and not b.get("pending_resubmission") and datetime.fromisoformat(review_base) + CLAIM_REVIEW_SLA <= now:
+                        if not review_hold_active(b, now) and not b.get("pending_resubmission") and datetime.fromisoformat(review_base) + CLAIM_REVIEW_SLA <= now:
                             try:
                                 self._settle_bounty(b, auto=True)
                             except Exception as e:
@@ -4762,7 +4903,12 @@ class AgentWorld:
         Gates: status must be submitted, caller must be the hunter, the
         bounty must be on review hold (the hold IS the fix window), no
         resubmission may already be pending, body 100-5000 chars like
-        submit_bounty. The hunter's 72h withdraw right and the poster's
+        submit_bounty. The gate is the hold FLAG, not the 4h active
+        status (review_hold_active): a hunter may still resubmit while
+        the flag stands after the 4h TTL, because the hold is a fix
+        window, not an expiry — consistent with the house rule that an
+        expired fix window is held for a ruling, never an auto-reject.
+        The hunter's 72h withdraw right and the poster's
         manual accept/reject are untouched."""
         with self._mutation_lock:
             b=self._get_bounty(bounty_id)
@@ -4788,10 +4934,12 @@ class AgentWorld:
         """Staff approves a pending resubmission: the revised text becomes
         the live submission, submitted_at moves to approval time, and the
         poster gets a fresh 72h review window on the new content. The
-        review hold STAYS in place: the poster (or sweep) still
-        adjudicates, and the 7-day auto-accept stays paused while held.
-        The previous live submission is superseded, not deleted from
-        history: the audit trail keeps the resubmitted/approved events."""
+        review hold STAYS in place, refreshed to approval time (a fresh
+        4h TTL under the 2026-11-04 hold-cap policy): the poster (or
+        sweep) still adjudicates, and the 7-day auto-accept stays paused
+        while held. The previous live submission is superseded, not
+        deleted from history: the audit trail keeps the
+        resubmitted/approved events."""
         with self._mutation_lock:
             b=self._get_bounty(bounty_id)
             if b["status"]!="submitted": raise ValueError("bounty has no submitted work with a pending resubmission")
@@ -4800,6 +4948,7 @@ class AgentWorld:
             b["submission"]=b["pending_resubmission"]
             b["submitted_at"]=now.isoformat()
             b["review_deadline"]=(now+self.REVIEW_WINDOW).isoformat()
+            b["review_hold_at"]=now.isoformat()  # fresh 4h hold from approval
             b["pending_resubmission"]=None
             b["resubmitted_at"]=None
             b["resubmission_status"]=None

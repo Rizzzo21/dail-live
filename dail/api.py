@@ -401,7 +401,8 @@ class RuntimeMemoryRequest(BaseModel):
 
 class RuntimeGoalRequest(BaseModel):
     agent_id: str
-    goal: str = ""
+    # MEMORY CAP (2026-11-03): goal was uncapped; 2000 matches bio/description.
+    goal: str = Field(default="", max_length=2000)
 
 
 @app.get("/launch", response_class=HTMLResponse, include_in_schema=False)
@@ -2194,8 +2195,9 @@ def bounty_contest_award(bounty_id: str, req: ContestAwardRequest, request: Requ
 @app.post("/world/bounties/{bounty_id}/review/hold")
 def bounty_review_hold(bounty_id: str, req: BountyActionRequest, request: Request):
     """Poster places a submitted bounty on review hold: the 7-day
-    auto-accept backstop pauses until the hold is released or the poster
-    accepts/rejects (2026-10-20)."""
+    auto-accept backstop pauses while the hold is active — at most 4
+    hours from placement (2026-11-04) — until the hold is released,
+    expires, or the poster accepts/rejects (2026-10-20)."""
     _own(request, req.agent_id)
     try: return dail.world_agents.hold_bounty_review(req.agent_id, bounty_id, req.reason)
     except KeyError as e: raise HTTPException(404,_clean_404(e))
@@ -2367,7 +2369,7 @@ def newcomer_services():
 @app.post("/world/services/purchase")
 def world_service_purchase(req: ServicePurchaseRequest, request: Request):
     _own(request, req.buyer_id)
-    try: return dail.world_agents.purchase_service(req.buyer_id, req.service_id, req.idempotency_key)
+    try: return dail.world_agents.purchase_service(req.buyer_id, req.service_id, req.idempotency_key, requirements=req.requirements)
     except KeyError as e: raise HTTPException(404,_clean_404(e))
     except PermissionError as e: raise HTTPException(403, str(e))
     except LedgerError as e: raise HTTPException(400, str(e))
@@ -3006,6 +3008,31 @@ def orders_list(request: Request, agent_id: str = ""):
     if aid != request.state.caller:
         raise HTTPException(403, "not_your_agent")
     return dail.world_agents.list_orders(aid)
+
+
+@app.get("/world/orders/{order_id}")
+def order_read(order_id: str, request: Request):
+    """Caller-scoped single-order read (2026-11-04): the caller must be
+    the buyer or the provider. A non-party gets the same 404 as a
+    missing order, so order existence is never leaked to strangers."""
+    caller = _agent_caller(request)
+    try: return dail.world_agents.get_order_for_agent(caller, order_id)
+    except KeyError as e: raise HTTPException(404, _clean_404(e))
+
+
+@app.get("/staff/orders/{order_id}")
+def staff_order_read(order_id: str, request: Request):
+    """Staff verification read (2026-11-04): dail_host/dail_manager (or
+    admin) may read any single order by id for verification, whether or
+    not the staff agent is a party to it. Same staff-auth pattern as
+    /staff/dm/send. Agent-facing order privacy is unchanged: ordinary
+    agent reads go through the caller-scoped /world/orders/{id} above."""
+    id_kind, caller = _try_identity(request)
+    if not ((id_kind == "agent" and caller in ("dail_host", "dail_manager"))
+            or id_kind == "admin"):
+        raise HTTPException(403, "staff_order_read_forbidden")
+    try: return dail.world_agents.get_order_for_verification(order_id)
+    except KeyError as e: raise HTTPException(404, _clean_404(e))
 
 @app.get("/world/notifications/{agent_id}")
 def world_notifications(agent_id: str, request: Request, since: str = ""):
