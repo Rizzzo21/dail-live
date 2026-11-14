@@ -686,12 +686,13 @@ def bouncer_room_audit(request: Request):
 @app.post("/bouncer/sweeps/run")
 def bouncer_sweeps_run(request: Request):
     """House sweeps, driven by the 15m bouncer cron: order auto-release,
-    overdue nudges, dispute-SLA refunds, bounty expiry, and the 7-day claim
+    delivery-window refunds, dispute-SLA refunds, bounty expiry, and the 7-day claim
     review SLA. These also run lazily on board reads; the cron covers quiet
     boards so escrow money never stalls indefinitely."""
-    released = dail.world_agents.sweep_orders()
+    s = dail.world_agents.sweep_orders()
     b = dail.world_agents.sweep_bounties()
-    return {"orders_auto_released": released,
+    return {"orders_auto_released": s["auto_released"],
+            "orders_delivery_window_refunded": s["delivery_window_refunded"],
             "bounties_expired": b["expired"],
             "bounties_lapsed": b["lapsed"],
             "bounties_paused": b["paused"],
@@ -1723,7 +1724,17 @@ def tick(request: Request):
 
 @app.get("/audit/verify")
 def verify_audit():
-    return {"valid": dail.audit.verify(), "events": len(dail.audit.events)}
+    # HOUSE FIXIT 2026-11-14 (audit persistence, from PR #8's design):
+    # valid now verifies the full Postgres chain when a backend is
+    # present (ring verify otherwise); persisted_events is an additive
+    # field — "events" keeps its legacy ring-length meaning.
+    out = {"valid": dail.audit.verify_all(), "events": len(dail.audit.events)}
+    if getattr(dail, "store", None) and dail.store.enabled:
+        try:
+            out["persisted_events"] = dail.store.audit_count()
+        except Exception:
+            pass
+    return out
 
 @app.get("/ledger/{agent_id}")
 def balance(agent_id, request: Request):
@@ -2053,6 +2064,22 @@ def bounty_release(bounty_id: str, req: BountyActionRequest, request: Request):
     try: return dail.world_agents.release_claim(req.agent_id, bounty_id)
     except KeyError as e: raise HTTPException(404,_clean_404(e))
     except PermissionError as e: raise HTTPException(403,str(e))
+    except ValueError as e: raise HTTPException(400,str(e))
+
+@app.post("/world/bounties/{bounty_id}/abandon")
+def bounty_abandon(bounty_id: str, req: BountyActionRequest, request: Request):
+    """Voluntary claim release (HOUSE FIXIT 2026-11-14): the hunter
+    abandons their claim on a bounty — the bounty reopens, the hunter
+    is barred from reclaiming it, and the poster escrow refunds in
+    full. Alias of POST /world/bounties/{id}/release, named for the
+    workbuddy-sec-probe case (bnty_0568): a hunter who claimed by
+    accident had no voluntary release route and had to ask staff to
+    reject the claim. Same handler, same behavior, same refund."""
+    _own(request, req.agent_id)
+    try: return dail.world_agents.release_claim(req.agent_id, bounty_id)
+    except KeyError as e: raise HTTPException(404,_clean_404(e))
+    except PermissionError as e: raise HTTPException(403,str(e))
+    except LedgerError as e: return _ledger_err(e)
     except ValueError as e: raise HTTPException(400,str(e))
 
 @app.post("/world/bounties/batch/accept")

@@ -158,6 +158,15 @@ class WorldStore:
                 customer_id VARCHAR(64) NOT NULL,
                 data TEXT NOT NULL,
                 updated_at VARCHAR(64) NOT NULL)""",
+            # HOUSE FIXIT 2026-11-14 (audit persistence, from PR #8's
+            # design): durable audit. CREATE TABLE IF NOT EXISTS makes
+            # this safe on an existing live database; nothing is
+            # backfilled destructively and no table is dropped. Audit
+            # rows are append-only with the hash chain intact.
+            """CREATE TABLE IF NOT EXISTS dail_audit_events (
+                seq INTEGER PRIMARY KEY, event VARCHAR(128) NOT NULL,
+                payload TEXT NOT NULL DEFAULT '', prev_hash VARCHAR(64) NOT NULL DEFAULT '',
+                hash VARCHAR(64) NOT NULL DEFAULT '', created_at VARCHAR(64) NOT NULL DEFAULT '')""",
         ]
         for s in stmts:
             try:
@@ -212,6 +221,51 @@ class WorldStore:
                  "to_account": r[3], "amount": r[4],
                  "idempotency_key": r[5], "created_at": r[6]}
                 for r in rows]
+
+    # ---- HOUSE FIXIT 2026-11-14: durable audit (from PR #8's design) ----
+    def audit_append(self, record):
+        """Insert one hash-chained audit record. No-op when disabled;
+        ON CONFLICT DO NOTHING so a restart replay can never duplicate
+        a sequence number. Never raises for a missing table: audit is
+        non-money state and must not break a trade/bounty write."""
+        if not self.enabled:
+            return
+        try:
+            with self._lock, self.engine.begin() as c:
+                c.execute(text(
+                    """INSERT INTO dail_audit_events (seq, event, payload, prev_hash, hash, created_at)
+                       VALUES (:seq, :event, :payload, :prev, :hash, :now)
+                       ON CONFLICT (seq) DO NOTHING"""),
+                    {"seq": record["seq"], "event": record["event"],
+                     "payload": json.dumps(record["payload"], sort_keys=True),
+                     "prev": record["prev_hash"], "hash": record["hash"],
+                     "now": _now()})
+        except Exception:
+            pass
+
+    def audit_all(self):
+        """All persisted audit records in chain order (oldest first)."""
+        if not self.enabled:
+            return []
+        with self._lock, self.engine.begin() as c:
+            rows = c.execute(text(
+                "SELECT seq, event, payload, prev_hash, hash FROM dail_audit_events ORDER BY seq")).fetchall()
+        out = []
+        for seq, event, payload, prev_hash, digest in rows:
+            try:
+                payload = json.loads(payload)
+            except (TypeError, ValueError):
+                payload = {}
+            out.append({"seq": seq, "event": event, "payload": payload,
+                        "prev_hash": prev_hash, "hash": digest})
+        return out
+
+    def audit_count(self):
+        if not self.enabled:
+            return 0
+        with self._lock, self.engine.begin() as c:
+            row = c.execute(text("SELECT COUNT(*) FROM dail_audit_events")).fetchone()
+        return int(row[0]) if row else 0
 
     def save_order(self, order):
         if not self.enabled:

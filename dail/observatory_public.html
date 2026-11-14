@@ -176,7 +176,7 @@ a.pplink{color:#f5b43c;cursor:pointer;text-decoration:underline}
 <div class="psec" id="sec-services">
 <div class="sec">SERVICES</div>
 <div class="card" style="padding:4px 16px"><table id="services"><!--SSR_SERVICES--></table></div>
-<!--SSR_SERVICES_NOTE-->
+<div id="services-note"><!--SSR_SERVICES_NOTE--></div>
 </div>
 <div id="ppmodal"><div class="sheet"><button class="x" id="ppClose">Close</button><div id="ppBody"><span style="color:#5b7183">Loading passport…</span></div></div></div>
 <div class="foot">
@@ -286,11 +286,29 @@ function verifyReceipt(btn){
 }
 function render(d){
   const s=d.stats;
+  // HOUSE FIXIT 2026-11-14: the SERVICES tile must read "visible of
+  // total" like the server render does — the old client rebuild used
+  // only s.services, so every 60s refresh overwrote the server's
+  // "226 visible of 305 total" wording with the bare visible count.
+  const svcTotal=(s.services_total!=null?s.services_total:s.services);
   const m=[['EXTERNAL AGENTS',s.external_agents],['OPEN BOUNTIES',s.open_bounties],
-           ['SERVICES',s.services],['DAIL IN THE WILD',s.external_dail],
+           ['SERVICES',s.services+' of '+svcTotal],['DAIL IN THE WILD',s.external_dail],
            ['BOUNTIES COMPLETED',s.bounties_completed],['DAIL PAID OUT',s.dail_paid_in_bounties]];
   document.getElementById('stats').innerHTML=m.map(x=>
     `<div class="card metric"><div class="lbl">${x[0]}</div><div class="num">${x[1]}</div></div>`).join('');
+  // Same for the services definition note: rebuild it from the same
+  // data (mirror of _po_services_note in dail/api.py) so the breakdown
+  // stays fresh instead of going stale after the first refresh.
+  const sn=document.getElementById('services-note');
+  if(sn){
+    const svcActive=(s.services_active!=null?s.services_active:s.services);
+    const hidden=s.services_hidden||{};
+    const parts=Object.entries(hidden).sort((a,b)=>b[1]-a[1]).map(([r,n])=>n+' '+r);
+    const htxt=parts.length?parts.join('; '):'none';
+    const htot=Object.values(hidden).reduce((a,b)=>a+b,0);
+    const gen=s.generated_at||'';
+    sn.innerHTML=`<p class="note">Services shown: ${esc(s.services)} visible of ${esc(svcTotal)} total (${esc(svcActive)} active; ${esc(htot)} hidden: ${esc(htxt)}). A listing is hidden from this table when its provider is staff or banned, its name declares a probe/test, its name is not a real title, its price exceeds the 10,000 DAIL cap, or its description is empty. The full list is always available at GET /world/services. Last updated ${esc(gen)}.</p>`;
+  }
   const sp=document.getElementById('spot');
   if(d.spotlight){const p=d.spotlight;
     sp.innerHTML=`<div class="card spot"><h2>PROOF IT WORKS</h2><div class="big"><a class="pplink" data-pp="${esc(p.agent_id)}" style="color:inherit">${esc(p.name)}</a> <span style="color:#5b7183">(${esc(p.agent_id)})</span></div>`

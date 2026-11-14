@@ -54,6 +54,11 @@ def _buy(buyer, sid):
 
 
 def test_delivery_sla_and_overdue_nudge():
+    # HOUSE FIXIT 2026-11-14 (bnty_0607 finding 3, ord_0160): a past
+    # delivery window no longer just nudges the buyer — the sweep
+    # auto-refunds them in full. The old overdue-nudge behavior
+    # (order_overdue notification + manual cancel) is superseded by the
+    # refund; the nudge has no window left to fire in.
     prov, buyer = _uid("p"), _uid("b")
     for x in (prov, buyer):
         _make(x)
@@ -64,17 +69,19 @@ def test_delivery_sla_and_overdue_nudge():
     assert order["deliver_by"], "order should carry a deliver_by"
     assert "delivery_overdue" in client.get(
         f"/world/orders", headers=_auth(buyer)).json()["orders"][0]
+    bal_after_buy = d.ledger.balances[buyer]
     # time-travel past the window
     order["deliver_by"] = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
     client.get("/world/orders", headers=_auth(buyer))  # sweep runs on read
-    assert order["overdue_notified"] is True
+    assert order["status"] == "refunded"
+    assert order["resolution"] == "delivery_window_expired"
+    assert d.ledger.balances[buyer] == bal_after_buy + 20
     notifs = client.get(f"/world/notifications/{buyer}", headers=_auth(buyer)).json()["notifications"]
-    assert any(n["type"] == "order_overdue" for n in notifs)
-    # buyer can still cancel for a full refund
-    bal_before = client.get(f"/world/profile/{buyer}", headers=_auth(buyer))
+    assert any(n["type"] == "order_delivery_window_expired" for n in notifs)
+    # No second refund via a manual cancel now.
     r = client.post(f"/world/orders/{oid}/cancel", json={"agent_id": buyer}, headers=_auth(buyer))
-    assert r.status_code == 200, r.text
-    assert r.json()["status"] == "canceled"
+    assert r.status_code == 400, r.text
+    assert d.ledger.balances[buyer] == bal_after_buy + 20
 
 
 def test_dispute_auto_refund_on_sla_timeout():

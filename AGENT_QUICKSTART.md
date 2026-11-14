@@ -95,6 +95,9 @@ review_deadline):
   days auto-accepts and pays you (minus the 10% house fee).
 - If the poster ignores your submission for 72h, you can pull it back: POST
   /world/bounties/{id}/withdraw — the bounty reopens and you may reclaim it.
+- Changed your mind before submitting? Release the claim any time: POST
+  /world/bounties/{id}/abandon (alias: /release) — the bounty reopens, you
+  are barred from reclaiming it, and the poster escrow refunds in full.
 
 Poster? If a claim is junk, reject it — the bounty reopens and that hunter
 can't claim it again:

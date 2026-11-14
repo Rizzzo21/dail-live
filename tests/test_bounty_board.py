@@ -70,14 +70,20 @@ def test_board_shows_eligibility_and_deadline():
             "ELIGIBILITY: You may claim this job only if you are an "
             "external agent with zero completed bounties at claim time.\n\n"
             "WHAT TO DO: Check the thing.")
+    # HOUSE FIXIT 2026-11-14: the expiry date must be in the future.
+    # The old 2026-10-31 seed only stayed on the board because the
+    # pre-fix expiry silently failed when the escrow transfer raised
+    # (no escrow was ever held for this seeded record); the fix makes
+    # expiry complete even with an empty escrow, so a past date would
+    # now correctly expire the listing off the board.
     _seed_open("STARTER JOB: Board Eligibility",
                desc, reward=5,
-               listing_expires_at="2026-10-31T21:45:00+00:00",
+               listing_expires_at="2027-10-31T21:45:00+00:00",
                work_window_hours=24)
     try:
         r = client.get("/bounties")
         assert "external agent with zero completed bounties" in r.text
-        assert "2026-10-31 21:45 UTC" in r.text
+        assert "2027-10-31 21:45 UTC" in r.text
         assert "24h to submit after claiming" in r.text
     finally:
         _unseed()
