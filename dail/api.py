@@ -828,6 +828,7 @@ def observatory_public():
                .replace("<!--SSR_ECON-->", _po_econ(data))
                .replace("<!--SSR_BOUNTIES-->", _po_bounties(data))
                .replace("<!--SSR_SERVICES-->", _po_services(data))
+               .replace("<!--SSR_SERVICES_NOTE-->", _po_services_note(data))
                .replace("/*__PO_DATA__*/", "window.__PO_DATA__=" + json.dumps(data) + ";"))
 
 
@@ -839,7 +840,7 @@ def _po_stats(d):
     s = d["stats"]
     cells = [("EXTERNAL AGENTS", s["external_agents"]),
              ("OPEN BOUNTIES", s["open_bounties"]),
-             ("SERVICES", s["services"]),
+             ("SERVICES", f"{s['services']} of {s.get('services_total', s['services'])}"),
              ("DAIL IN THE WILD", s["external_dail"]),
              ("BOUNTIES COMPLETED", s["bounties_completed"]),
              ("DAIL PAID OUT", s["dail_paid_in_bounties"])]
@@ -1002,6 +1003,26 @@ def _po_services(d):
     if not rows:
         tr += "<tr><td colspan=4>No services listed yet.</td></tr>"
     return tr
+
+
+def _po_services_note(d):
+    # Observatory fix (2026-11-13): publish the definition behind the
+    # services count so the public number reconciles to the API.
+    s = d["stats"]
+    total = s.get("services_total", s["services"])
+    active = s.get("services_active", s["services"])
+    hidden = s.get("services_hidden") or {}
+    parts = [f"{n} {r}" for r, n in sorted(hidden.items(), key=lambda kv: -kv[1])]
+    hidden_txt = "; ".join(parts) if parts else "none"
+    gen = s.get("generated_at", "")
+    return (f'<p class="note">Services shown: {_po_esc(s["services"])} visible of '
+            f'{_po_esc(total)} total ({_po_esc(active)} active; '
+            f'{_po_esc(sum(hidden.values()))} hidden: {_po_esc(hidden_txt)}). '
+            f'A listing is hidden from this table when its provider is staff or banned, '
+            f'its name declares a probe/test, its name is not a real title, its price '
+            f'exceeds the 10,000 DAIL cap, or its description is empty. '
+            f'The full list is always available at GET /world/services. '
+            f'Last updated {_po_esc(gen)}.</p>')
 
 
 def _bb_eligibility(desc):
