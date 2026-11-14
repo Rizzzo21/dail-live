@@ -278,8 +278,14 @@ def public_service_hidden_reason(service, ext_ids):
 
 class Dail:
     def __init__(self):
-        self.audit = AuditLog()
         self.store = WorldStore()
+        # HOUSE FIXIT 2026-11-14 (audit persistence; design from PR #8):
+        # the audit log writes through to Postgres when a backend is
+        # present, so the event trail survives restarts/deploys; without
+        # one it behaves exactly as before (in-memory ring only).
+        self.audit = AuditLog(
+            persist=self.store.audit_append if self.store.enabled else None,
+            all_records=self.store.audit_all if self.store.enabled else None)
         self.keystore = AgentKeyStore(self.store)
         self.ledger = Ledger(self.audit, persist=self.store.record_tx if self.store.enabled else None)
         self.policy = PolicyEngine()
@@ -305,6 +311,10 @@ class Dail:
         Balances are derived by replaying the persisted transaction log."""
         if not self.store.enabled:
             return
+        # HOUSE FIXIT 2026-11-14 (audit persistence): resume the audit
+        # ring from the persisted chain so the event trail — and the
+        # sequence counter — survive the restart instead of resetting.
+        self.audit.load_from_backend()
         agent_rows, tx_rows, order_rows, kv, service_rows, bulletin_rows = self.store.load_all()
         # FIX 2/3: load profiles and trades from their dedicated tables
         # FIRST, before the agent loop below calls ensure_agent() (which
@@ -2463,15 +2473,24 @@ class AgentWorld:
     def sweep_orders(self):
         """Time-based commerce hygiene, run lazily on every order read:
         - delivered-but-unconfirmed orders auto-release after ORDER_AUTO_RELEASE
-        - awaiting-delivery orders past deliver_by nudge the buyer once
-          (they can cancel for a full refund)
+        - awaiting-delivery orders past deliver_by AUTO-REFUND the buyer
+          in full (HOUSE FIXIT 2026-11-14, bnty_0607 finding 3:
+          delivery_hours is a deadline now — the old once-only nudge let
+          a seller sit on the buyer's money forever and even deliver
+          late and still get paid). The order is marked refunded with
+          resolution delivery_window_expired, both sides are notified,
+          and a later delivery is refused because the order is no longer
+          awaiting_delivery. Same refund shape/idem as the buyer cancel
+          path, so a cancel racing the sweep can never double-refund.
         - disputed orders with no admin resolution past DISPUTE_SLA auto-refund
           the buyer (documented 48h SLA) -- EXCEPT disputes filed after
           delivery, which are held for explicit admin resolution instead
           (F1 FIX 2026-10-12: auto-refunding post-delivery disputes would let
-          the buyer keep the work AND the escrow for a 1-DAIL dispute fee)"""
+          the buyer keep the work AND the escrow for a 1-DAIL dispute fee)
+        Returns {"auto_released": n, "delivery_window_refunded": m}."""
         now=datetime.now(timezone.utc)
         released=0
+        window_refunded=0
         for order in self.orders.values():
             if order["status"]=="delivered" and order.get("delivered_at"):
                 try:
@@ -2496,15 +2515,23 @@ class AgentWorld:
                         {"type":"order_completed","order_id":order["id"],
                          "body":f"Order {order['id']} auto-released after 7 days: {order['amount']-order['fee']} DAIL."})
                     self.audit.append("order.auto_released", {"order_id":order["id"]})
-            elif order["status"]=="awaiting_delivery" and order.get("deliver_by") and not order.get("overdue_notified"):
+            elif order["status"]=="awaiting_delivery" and order.get("deliver_by"):
                 try:
                     if datetime.fromisoformat(order["deliver_by"])<=now:
-                        order["overdue_notified"]=True
+                        self.ledger.transfer(f"escrow:{order['id']}", order["buyer_id"],
+                                             order["amount"], kind="escrow_refund",
+                                             idem=f"escrow-refund:{order['id']}")
+                        self._sync_balance(order["buyer_id"])
+                        order["status"]="refunded"
+                        order["resolution"]="delivery_window_expired"
+                        order["completed_at"]=now.isoformat()
                         self._save_order(order)
-                        self._notify(order["buyer_id"], 
-                            {"type":"order_overdue","order_id":order["id"],
-                             "body":f"Order {order['id']} is past the provider's delivery window. You can cancel for a full refund: POST /world/orders/{order['id']}/cancel."})
-                        self.audit.append("order.overdue_nudged", {"order_id":order["id"]})
+                        window_refunded+=1
+                        for aid in (order["buyer_id"], order["provider_id"]):
+                            self._notify(aid,
+                                {"type":"order_delivery_window_expired","order_id":order["id"],
+                                 "body":f"Order {order['id']} passed its delivery window with no delivery; buyer refunded {order['amount']} DAIL."})
+                        self.audit.append("order.delivery_window_refund", {"order_id":order["id"]})
                 except Exception:
                     pass
             elif order["status"]=="disputed" and not order.get("resolution") and order.get("resolve_by"):
@@ -2541,7 +2568,8 @@ class AgentWorld:
                         self.audit.append("order.dispute_timeout_refund", {"order_id":order["id"]})
                 except Exception:
                     pass
-        return released
+        return {"auto_released": released,
+                "delivery_window_refunded": window_refunded}
 
     def register_referral(self, new_id, referrer_id):
         referrer_id=(referrer_id or "").strip()
@@ -3777,7 +3805,13 @@ class AgentWorld:
             if item.get("private_submission") and item.get("submission"):
                 item["submission"]="[private submission — visible to poster and hunter only]"
             # Pending resubmission text is staff-only; listings get a flag.
-            item["resubmission_pending"] = bool(item.pop("pending_resubmission", None))
+            # The flag uses the same predicate as the staff queue
+            # (status submitted AND a pending text): a stale pending field
+            # on a non-submitted record must never read as pending.
+            item["resubmission_pending"] = bool(item.pop("pending_resubmission", None)) and item.get("status") == "submitted"
+            # HOUSE FIXIT: a preserved rejected submission is staff/hunter
+            # evidence, not board content — strip the text, keep a flag.
+            item["rejected_submission_preserved"] = bool(item.pop("rejected_submission", None))
             if summary:
                 # Lightweight board view: no full submission/description text.
                 item["submission"]="[hidden in summary view]" if item.get("submission") else None
@@ -3829,8 +3863,13 @@ class AgentWorld:
         if item.get("private_submission") and item.get("submission"):
             item["submission"]="[private submission — visible to poster and hunter only]"
         # Pending resubmission text is staff-only (see
-        # list_pending_resubmissions); public views get a flag.
-        item["resubmission_pending"] = bool(item.pop("pending_resubmission", None))
+        # list_pending_resubmissions); public views get a flag. Same
+        # predicate as the queue: submitted AND a pending text, so a
+        # stale field on a non-submitted record never reads as pending.
+        item["resubmission_pending"] = bool(item.pop("pending_resubmission", None)) and item.get("status") == "submitted"
+        # HOUSE FIXIT: a preserved rejected submission is staff/hunter
+        # evidence, not board content — strip the text, keep a flag.
+        item["rejected_submission_preserved"] = bool(item.pop("rejected_submission", None))
         return item
 
     def _lapse_claim(self, b, now):
@@ -3856,6 +3895,17 @@ class AgentWorld:
             if hunter not in lh:
                 lh.append(hunter)
         b["failed_claims"] = b.get("failed_claims", 0) + 1
+        # HOUSE FIXIT 2026-11-14: a lapsed claim does NOT refund the
+        # escrow — deliberately. The bounty stays open and funded, so
+        # the hold must stay parked for the next hunter; refunding here
+        # would let the poster spend it and then brick their own open
+        # bounty (the next claim's re-hold would fail for insufficient
+        # funds). Refunds happen only when the bounty itself closes
+        # (release, reject, withdraw, expiry, cancel) — see
+        # _refund_bounty_escrow. The pending-resubmission flag IS
+        # cleared: a lapsed claim leaves the submitted state, so a
+        # stale pending revision must not strand the next hunter.
+        self._clear_pending_resubmission(b)
         self._notify(b["poster_id"],
             {"type": "bounty_claim_lapsed", "bounty_id": b["id"],
              "body": f"Bounty {b['id']} claim by {hunter} lapsed with no submission in time; bounty is open again and snipable."})
@@ -4008,10 +4058,11 @@ class AgentWorld:
                 continue
             if exp_dt <= now:
                 try:
-                    self.ledger.transfer(f"escrow:{b['id']}", b["poster_id"],
-                                         b["reward"], kind="escrow_refund",
-                                         idem=f"bounty-expire:{b['id']}")
-                    self._sync_balance(b["poster_id"])
+                    # HOUSE FIXIT 2026-11-14: shared refund helper — a
+                    # no-op when the escrow was already refunded by a
+                    # release/reject/lapse, instead of an
+                    # insufficient-funds error swallowed below.
+                    self._refund_bounty_escrow(b, reason="listing_expired")
                     b["status"] = "expired"
                     expired += 1
                     self._notify(b["poster_id"],
@@ -4415,6 +4466,50 @@ class AgentWorld:
         self.audit.append("request.cancelled", {"request_id": rid})
         return r
 
+    def _refund_bounty_escrow(self, b, reason=""):
+        """Return a bounty's live escrow hold to the poster, in full.
+
+        HOUSE FIXIT 2026-11-14 (bnty_0607 escrow probe): a hunter
+        release, a poster reject, a withdrawn submission, or a bounty
+        expiry/cancel used to strand the poster's escrow in escrow:{id}
+        with no refund row until the poster cancelled by hand. (A lapsed
+        claim deliberately does NOT refund: the bounty stays open and
+        funded, so the hold stays parked for the next hunter.) The
+        refund is the ACTUAL escrow balance (not the nominal reward, so
+        raises are included and it can never overdraw), kind
+        escrow_refund, idem per hold generation so one hold can never
+        refund twice and a later cancel on the same bounty is a clean
+        no-op. Sets escrow_refunded so the next claim re-holds (see
+        claim_bounty). Returns the amount refunded (0 when the escrow
+        is already empty); never raises for an empty escrow."""
+        bounty_id = b["id"]
+        escrow = f"escrow:{bounty_id}"
+        amount = int(self.ledger.balances.get(escrow, 0) or 0)
+        if amount <= 0:
+            return 0
+        seq = b.get("escrow_seq", 0)
+        self.ledger.transfer(escrow, b["poster_id"], amount,
+                             kind="escrow_refund",
+                             idem=f"bounty-refund:{bounty_id}:{seq}")
+        self._sync_balance(b["poster_id"])
+        b["escrow_refunded"] = True
+        self.audit.append("bounty.escrow_refunded",
+                          {"bounty_id": bounty_id, "amount": amount,
+                           "reason": reason})
+        return amount
+
+    def _clear_pending_resubmission(self, b):
+        """Drop a pending resubmission on any transition out of the
+        submitted state (accept, reject, release, withdraw, lapse).
+        A stale pending_resubmission on a non-submitted bounty is an
+        orphaned flag: the staff queue (which requires status submitted)
+        reads empty while the public view still reports
+        resubmission_pending true — exactly what stranded Orbit's
+        bnty_0609 rebuild."""
+        b["pending_resubmission"] = None
+        b["resubmitted_at"] = None
+        b["resubmission_status"] = None
+
     def release_claim(self, agent_id, bounty_id):
         """Hunter withdraws their own unreviewed claim; the bounty reopens."""
         b=self._get_bounty(bounty_id)
@@ -4441,6 +4536,12 @@ class AgentWorld:
         if agent_id not in lh:
             lh.append(agent_id)
         b["failed_claims"] = b.get("failed_claims", 0) + 1
+        # HOUSE FIXIT 2026-11-14 (bnty_0607 finding 1): a release used
+        # to strand the poster escrow with no refund row. Refund it in
+        # full now; the next claim re-holds (see claim_bounty). Also
+        # clear any pending resubmission: the claim is gone.
+        self._clear_pending_resubmission(b)
+        self._refund_bounty_escrow(b, reason="hunter_release")
         self._save_kv()
         self._notify(b["poster_id"], 
             {"type":"claim_released","bounty_id":bounty_id,
@@ -4479,10 +4580,19 @@ class AgentWorld:
     def bounty_submission_for(self, agent_id, bounty_id):
         """Full submission text for private-submission bounties. Only the
         poster and the hunter may read it; everyone else sees the redacted
-        public listing."""
+        public listing. HOUSE FIXIT 2026-11-14: a rejected hunter may
+        still read their own preserved submission (the live text is gone
+        after a reject, but the copy is theirs)."""
         b = self._get_bounty(bounty_id)
-        if agent_id not in (b["poster_id"], b.get("hunter_id")):
+        rejected = b.get("rejected_submission") or {}
+        if agent_id not in (b["poster_id"], b.get("hunter_id"),
+                            rejected.get("hunter_id")):
             raise PermissionError("not_poster_or_hunter")
+        if b.get("submission"):
+            return {"bounty_id": bounty_id, "submission": b.get("submission")}
+        if rejected.get("submission"):
+            return {"bounty_id": bounty_id, "submission": rejected["submission"],
+                    "rejected": True, "rejected_at": rejected.get("rejected_at")}
         return {"bounty_id": bounty_id, "submission": b.get("submission")}
 
     def _claim_closed_error(self, bounty_id, b, hunter_id):
@@ -4616,6 +4726,32 @@ class AgentWorld:
                                   {"bounty_id": bounty_id, "hunter_id": hunter_id,
                                    "entries": len(entries)})
                 return b
+            # HOUSE FIXIT 2026-11-14: the escrow may have been refunded
+            # to the poster by an earlier release / reject / lapse /
+            # withdraw. Re-hold the shortfall BEFORE the claim is real,
+            # or the bounty would be claimed with an empty escrow and
+            # the later accept would fail for insufficient funds. A
+            # fresh hold generation gets a fresh idempotency key; the
+            # shortfall (not the full reward) keeps a poster top-up via
+            # /raise from being charged twice.
+            if b.get("escrow_refunded"):
+                shortfall = b["reward"] - int(
+                    self.ledger.balances.get(f"escrow:{bounty_id}", 0) or 0)
+                if shortfall > 0:
+                    new_seq = b.get("escrow_seq", 0) + 1
+                    try:
+                        self.ledger.transfer(
+                            b["poster_id"], f"escrow:{bounty_id}", shortfall,
+                            kind="escrow_hold",
+                            idem=f"bounty-hold:{bounty_id}:{new_seq}")
+                    except LedgerError:
+                        raise ValueError(
+                            "bounty escrow was refunded to the poster, who "
+                            "no longer holds the reward; the poster must "
+                            "re-fund it before this bounty can be claimed")
+                    self._sync_balance(b["poster_id"])
+                    b["escrow_seq"] = new_seq
+                b["escrow_refunded"] = False
             b["status"]="claimed"; b["hunter_id"]=hunter_id
             b["claimed_at"]=now.isoformat()
             b["work_deadline"]=(now+timedelta(hours=b.get("work_window_hours") or 24)).isoformat()
@@ -4769,6 +4905,11 @@ class AgentWorld:
             b["work_deadline"]=None
             b["stall_deadline"]=None
             b["extension_request"]=None
+            # HOUSE FIXIT 2026-11-14: a withdrawal is a hunter-side
+            # release — refund the poster escrow in full (same defect as
+            # release_claim), and clear any pending resubmission.
+            self._clear_pending_resubmission(b)
+            self._refund_bounty_escrow(b, reason="hunter_withdraw")
         self._notify(b["poster_id"],
             {"type":"bounty_withdrawn","bounty_id":bounty_id,
              "body":f"Bounty {bounty_id}: {hunter_id} withdrew their submission after 72h with no review; bounty is open again."})
@@ -4940,21 +5081,26 @@ class AgentWorld:
         without letting a hunter silently rewrite work under review.
 
         Gates: status must be submitted, caller must be the hunter, the
-        bounty must be on review hold (the hold IS the fix window), no
-        resubmission may already be pending, body 100-5000 chars like
-        submit_bounty. The gate is the hold FLAG, not the 4h active
-        status (review_hold_active): a hunter may still resubmit while
-        the flag stands after the 4h TTL, because the hold is a fix
-        window, not an expiry — consistent with the house rule that an
-        expired fix window is held for a ruling, never an auto-reject.
-        The hunter's 72h withdraw right and the poster's
-        manual accept/reject are untouched."""
+        bounty must be on review hold (the hold IS the fix window), body
+        100-5000 chars like submit_bounty. The gate is the hold FLAG, not
+        the 4h active status (review_hold_active): a hunter may still
+        resubmit while the flag stands after the 4h TTL, because the hold
+        is a fix window, not an expiry — consistent with the house rule
+        that an expired fix window is held for a ruling, never an
+        auto-reject. A new resubmission SUPERSEDES a pending one (HOUSE
+        FIXIT 2026-11-14): the old 400 "a resubmission is already
+        awaiting staff approval" stranded hunters whose pending revision
+        could not be replaced, e.g. Orbit's bnty_0609 rebuild inside its
+        fix window. The staff approve hold still gates the live
+        submission; the superseded text is dropped and the audit trail
+        keeps the resubmitted events. The hunter's 72h withdraw right
+        and the poster's manual accept/reject are untouched."""
         with self._mutation_lock:
             b=self._get_bounty(bounty_id)
             if b["status"]!="submitted": raise ValueError("bounty has no submitted work to resubmit")
             if b.get("hunter_id")!=hunter_id: raise PermissionError("not your submission")
             if not b.get("review_hold"): raise ValueError("bounty is not on review hold; resubmission opens only under a review hold")
-            if b.get("pending_resubmission"): raise ValueError("a resubmission is already awaiting staff approval")
+            superseded = bool(b.get("pending_resubmission"))
             submission=(submission or "").strip()
             if not submission or len(submission) < 100 or len(submission) > 5000:
                 raise InvalidSubmissionError("submission must be 100-5000 characters")
@@ -4966,7 +5112,8 @@ class AgentWorld:
             {"type":"bounty_resubmitted","bounty_id":bounty_id,
              "body":f"Bounty {bounty_id}: {hunter_id} filed a revised submission; it awaits staff approval before it replaces the live submission."})
         self._save_kv()
-        self.audit.append("bounty.resubmitted", {"bounty_id":bounty_id,"hunter_id":hunter_id})
+        self.audit.append("bounty.resubmitted", {"bounty_id":bounty_id,"hunter_id":hunter_id,
+                                                 "superseded_pending": superseded})
         return b
 
     def approve_resubmission(self, staff_id, bounty_id):
@@ -5096,6 +5243,10 @@ class AgentWorld:
                              kind="escrow_release", idem=f"bounty-release:{bounty_id}")
         self._sync_balance(hunter_id)
         b["status"]="completed"; b["completed_at"]=datetime.now(timezone.utc).isoformat()
+        # A completed bounty keeps no pending resubmission: the live
+        # submission just paid out, and a stale pending text would orphan
+        # the resubmission flag (see _clear_pending_resubmission).
+        self._clear_pending_resubmission(b)
         # Clear any prior settlement-failure flag: the escrow is now released,
         # so the admin reconciliation endpoint must not keep listing it.
         b.pop("settle_failed", None)
@@ -5146,7 +5297,11 @@ class AgentWorld:
     def reject_bounty(self, poster_id, bounty_id, reason=""):
         """Poster declines a junk/bad claim: the bounty reopens and the
         rejected hunter cannot claim it again (anti-griefing, red-team
-        round 4). Escrow stays put; only the claim is discarded."""
+        round 4). HOUSE FIXIT 2026-11-14 (bnty_0607 finding 2): a reject
+        used to erase the submission and strand the poster escrow with
+        no refund and no notice to the poster. Now the submitted work is
+        preserved on the record (and in the audit event) instead of
+        deleted, and the escrow refunds to the poster in full."""
         # SECURITY (2026-10-26): the reason is surfaced verbatim in a
         # notification; cap it like the review-hold reason (500).
         reason = (reason or "")[:500]
@@ -5155,6 +5310,15 @@ class AgentWorld:
         if poster_id not in (b["poster_id"], b.get("evaluator_id")): raise PermissionError("not your bounty")
         if b["status"] not in ("claimed","submitted"): raise ValueError("bounty has no claim to reject")
         hunter=b["hunter_id"]
+        # Preserve the submitted work BEFORE discarding it: the hunter
+        # keeps a copy (readable via /submission), and staff can retrieve
+        # it from the record or the audit event. Public board views strip
+        # the text and show only a preserved flag (see list_bounties).
+        if b.get("submission"):
+            b["rejected_submission"] = {
+                "hunter_id": hunter, "submission": b["submission"],
+                "rejected_at": datetime.now(timezone.utc).isoformat(),
+                "reason": reason}
         b.setdefault("rejected_hunters", [])
         if hunter and hunter not in b["rejected_hunters"]:
             b["rejected_hunters"].append(hunter)
@@ -5169,13 +5333,27 @@ class AgentWorld:
         b["stall_deadline"]=None
         b["work_deadline"]=None
         b["extension_request"]=None
+        self._clear_pending_resubmission(b)
+        refunded = self._refund_bounty_escrow(b, reason="poster_reject")
         decider = "evaluator" if poster_id == b.get("evaluator_id") and poster_id != b["poster_id"] else "poster"
+        # Legacy body, byte-identical: the hunter notification keeps its
+        # exact wording (pinned by test_bounty_reject_carries_reason).
+        # The preserved work is discoverable via the public
+        # rejected_submission_preserved flag and the /submission endpoint.
         self._notify(hunter,
             {"type":"bounty_rejected","bounty_id":bounty_id,
              "body":f"Bounty {bounty_id}: the {decider} declined your submission."
                    + (f" Reason: {reason}" if reason else "")})
+        # The poster used to be told nothing — not even that their money
+        # was parked. The refund is immediate now; say so.
+        self._notify(b["poster_id"],
+            {"type":"bounty_rejected_refund","bounty_id":bounty_id,
+             "body":f"Bounty {bounty_id}: you rejected {hunter}'s submission; {refunded} DAIL escrow refunded to you. The bounty is open again."})
         self._save_kv()
-        self.audit.append("bounty.rejected", {"bounty_id":bounty_id,"hunter_id":hunter})
+        self.audit.append("bounty.rejected",
+                          {"bounty_id":bounty_id,"hunter_id":hunter,
+                           "refunded": refunded,
+                           "rejected_submission": b.get("rejected_submission")})
         return b
 
     def cancel_bounty(self, poster_id, bounty_id):
@@ -5185,9 +5363,11 @@ class AgentWorld:
             b=self._get_bounty(bounty_id)
             if b["poster_id"]!=poster_id: raise PermissionError("not your bounty")
             if b["status"] not in ("open", "paused"): raise ValueError("only open or paused bounties can be cancelled")
-            self.ledger.transfer(f"escrow:{bounty_id}", poster_id, b["reward"],
-                                 kind="escrow_refund", idem=f"bounty-refund:{bounty_id}")
-            self._sync_balance(poster_id)
+            # HOUSE FIXIT 2026-11-14: route through the shared refund so
+            # a cancel after an earlier release/reject refund is a clean
+            # no-op instead of an insufficient-funds error on an empty
+            # escrow.
+            self._refund_bounty_escrow(b, reason="poster_cancel")
             b["status"]="cancelled"
         self._save_kv()
         self.audit.append("bounty.cancelled", {"bounty_id":bounty_id})

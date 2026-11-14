@@ -128,7 +128,11 @@ def test_resubmit_requires_hold():
     assert "review hold" in r.text
 
 
-def test_resubmit_wrong_hunter_and_twice_blocked():
+def test_resubmit_wrong_hunter_403_and_second_supersedes():
+    # HOUSE FIXIT 2026-11-14: a second resubmission by the hunter no
+    # longer 400s ("already awaiting staff approval") — it supersedes
+    # the pending revision, so a hunter can replace a pending fix
+    # inside the window instead of being stranded by it.
     poster, hunter, bid = _submitted_under_hold()
     stranger = _uid("s")
     _make(stranger)
@@ -138,8 +142,15 @@ def test_resubmit_wrong_hunter_and_twice_blocked():
     assert r.status_code == 403, r.text
     assert _resubmit(hunter, bid).status_code == 200
     r = _resubmit(hunter, bid, LONG_FIX2)
-    assert r.status_code == 400, r.text
-    assert "already awaiting" in r.text
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["pending_resubmission"] == LONG_FIX2
+    assert body["submission"] == LONG_ORIG  # live text untouched
+    assert body["resubmission_status"] == "pending"
+    q = client.get("/staff/bounties/resubmissions", headers=_host_key()).json()
+    mine = [x for x in q["resubmissions"] if x["bounty_id"] == bid]
+    assert len(mine) == 1
+    assert mine[0]["pending_resubmission"] == LONG_FIX2
 
 
 def test_resubmit_short_body_rejected():
