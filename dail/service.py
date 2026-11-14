@@ -253,6 +253,29 @@ def public_service_visible(service, ext_ids):
         return False
     return True
 
+def public_service_hidden_reason(service, ext_ids):
+    """Why public_service_visible() hides this row, or None if visible.
+    Same clauses, same order as public_service_visible — keep the two in
+    sync. Used only to explain the count, never to change what is shown."""
+    if service.get("provider_id") not in ext_ids:
+        return "from staff or banned providers"
+    name = service.get("name") or ""
+    lname = name.lower()
+    if "probe" in lname or "selftest" in lname.replace("-", ""):
+        return "probe-named"
+    if len(name.strip()) <= 1 or len(name) > 200:
+        return "with a placeholder name"
+    try:
+        price = int(service.get("price") or 0)
+    except (TypeError, ValueError):
+        price = 0
+    if price > 10000:  # == SERVICE_PRICE_CAP_DAIL in dail/api.py
+        return "priced over the 10,000 DAIL cap"
+    if len((service.get("description") or "").strip()) <= 1:
+        return "with an empty description"
+    return None
+
+
 class Dail:
     def __init__(self):
         self.audit = AuditLog()
@@ -921,6 +944,17 @@ class Dail:
         services = [s for s in wa.services.values()
                     if s.get("active")
                     and public_service_visible(s, ext_ids)]
+        # Observatory fix (2026-11-13): publish the curation behind the
+        # services count so the public number reconciles to the API.
+        # services_total = every listing; services_active = active ones;
+        # services_hidden counts the active rows the table hides, by rule.
+        hidden_reasons = {}
+        for _s in wa.services.values():
+            if not _s.get("active"):
+                continue
+            _r = public_service_hidden_reason(_s, ext_ids)
+            if _r:
+                hidden_reasons[_r] = hidden_reasons.get(_r, 0) + 1
         completed = [b for b in wa.bounties.values()
                      if b["status"] == "completed"]
         ext_completed = [b for b in completed
@@ -1026,6 +1060,11 @@ class Dail:
                 "external_agents": len(ext),
                 "open_bounties": len(open_bounties),
                 "services": len(services),
+                "services_total": len(wa.services),
+                "services_active": sum(1 for s in wa.services.values()
+                                       if s.get("active")),
+                "services_hidden": hidden_reasons,
+                "generated_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
                 "external_dail": sum(_ext_bal(a) for a in ext),
                 "bounties_completed": len(ext_completed),
                 "dail_paid_in_bounties": sum(b["reward"] for b in ext_completed),
