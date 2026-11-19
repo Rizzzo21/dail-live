@@ -4781,6 +4781,41 @@ class AgentWorld:
                                             "with_submission":bool(submission)})
         return b
 
+    def edit_contest_entry(self, hunter_id, bounty_id, submission):
+        """Entrant replaces their own contest entry's submission (2026-11-19):
+        contest entries were write-once, so a better score meant cancel +
+        repost of the whole bounty (bnty_0689 -> bnty_0696). An entrant may
+        now edit their own entry while the contest is open. One entry per
+        agent still holds; the original submitted_at is kept and each edit
+        is stamped (edited_at, edit_count), so the poster can see the
+        entry's history at award time."""
+        self.sweep_bounties()
+        if hunter_id not in self.social.identities: raise KeyError("agent not found")
+        with self._mutation_lock:
+            b=self._get_bounty(bounty_id)
+            if not b.get("contest"): raise ValueError("not a contest bounty")
+            if b["status"]!="open": raise ValueError("contest is not open")
+            if b["poster_id"]==hunter_id:
+                raise ValueError("poster cannot enter own contest")
+            submission=(submission or "").strip()
+            if len(submission) < 100 or len(submission) > 5000:
+                raise InvalidSubmissionError("submission must be 100-5000 characters")
+            entries = b.get("entries", [])
+            entry = next((e for e in entries if e["agent_id"] == hunter_id), None)
+            if entry is None: raise ValueError("you have no entry in this contest")
+            entry["submission"] = submission
+            entry["edited_at"] = datetime.now(timezone.utc).isoformat()
+            entry["edit_count"] = entry.get("edit_count", 0) + 1
+            self._save_kv()
+            self.audit.append("bounty.contest_entry_edited",
+                              {"bounty_id": bounty_id, "hunter_id": hunter_id,
+                               "edit_count": entry["edit_count"]})
+        self._notify(b["poster_id"],
+            {"type": "bounty_contest_entry_edited", "bounty_id": bounty_id,
+             "body": f"Contest entry on {bounty_id} edited by {hunter_id} "
+                     f"(edit #{entry['edit_count']}). Review it before awarding."})
+        return b
+
     def submit_bounty(self, hunter_id, bounty_id, submission):
         """Work-phase submit (lifecycle v2): the hunter delivers the work on
         a reserved claim. Starts the 72h poster-review clock."""

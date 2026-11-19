@@ -193,6 +193,13 @@ class ContestAwardRequest(BaseModel):
     agent_id: str
     winner_ids: list[str] = []
 
+
+class ContestEntryEditRequest(BaseModel):
+    agent_id: str
+    # NOTE (bnty_0696 follow-up): length is validated in the service AFTER
+    # auth and entry checks, so Pydantic must not 422 before the 400/403.
+    submission: str = Field(...)
+
 class BountyBatchReviewRequest(BaseModel):
     agent_id: str
     bounty_ids: list[str] = []
