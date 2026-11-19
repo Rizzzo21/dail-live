@@ -168,6 +168,80 @@ def test_contest_award_guards():
     assert r.status_code == 400
 
 
+def _edit(hunter, bid, text=ENTRY, key=None):
+    return client.post(f"/world/bounties/{bid}/contest/entry/edit", json={
+        "agent_id": hunter, "submission": text},
+        headers={"Authorization": f"Bearer {key or _keys[hunter]}"})
+
+
+def test_contest_entry_edit_replaces_submission_and_keeps_entry_time():
+    poster, h1 = _uid("p"), _uid("h")
+    for x in (poster, h1):
+        _make(x)
+    bid = _contest(poster)
+    r = _enter(h1, bid)
+    assert r.status_code == 200, r.text
+    submitted_at = dail.world_agents.bounties[bid]["entries"][0]["submitted_at"]
+    new_text = ENTRY + " — revised with a better prediction and new reasoning."
+    r = _edit(h1, bid, new_text)
+    assert r.status_code == 200, r.text
+    entry = dail.world_agents.bounties[bid]["entries"][0]
+    assert entry["submission"] == new_text
+    assert entry["submitted_at"] == submitted_at
+    assert entry["edit_count"] == 1
+    assert entry["edited_at"]
+    # Still one entry per agent; a second edit stamps again.
+    r = _edit(h1, bid, new_text + " v3.")
+    assert r.status_code == 200, r.text
+    entry = dail.world_agents.bounties[bid]["entries"][0]
+    assert entry["edit_count"] == 2
+    assert len(dail.world_agents.bounties[bid]["entries"]) == 1
+    # The edited entry still awards normally.
+    r = client.post(f"/world/bounties/{bid}/contest/award", json={
+        "agent_id": poster, "winner_ids": [h1]}, headers=_auth(poster))
+    assert r.status_code == 200, r.text
+    assert r.json()["contest_winners"] == [h1]
+
+
+def test_contest_entry_edit_guards():
+    poster, h1, h2 = _uid("p"), _uid("h"), _uid("h")
+    for x in (poster, h1, h2):
+        _make(x)
+    bid = _contest(poster)
+    _enter(h1, bid)
+    # No entry, no edit.
+    r = _edit(h2, bid)
+    assert r.status_code == 400
+    # The poster cannot edit an entry.
+    r = _edit(poster, bid)
+    assert r.status_code == 400
+    # Wrong key for the entrant's id.
+    r = _edit(h1, bid, key=_keys[h2])
+    assert r.status_code == 403
+    # Too short to count as real work.
+    r = _edit(h1, bid, "too short")
+    assert r.status_code == 422
+    # Not a contest bounty.
+    bid2 = client.post("/world/bounties", json={
+        "agent_id": poster, "title": "plain", "description": "d",
+        "reward": 5}, headers=_auth(poster)).json()["id"]
+    r = _edit(h1, bid2)
+    assert r.status_code == 400
+    # Closed contests stop editing: cancelled…
+    bid3 = _contest(poster)
+    _enter(h1, bid3)
+    client.post(f"/world/bounties/{bid3}/cancel", json={
+        "agent_id": poster}, headers=_auth(poster))
+    r = _edit(h1, bid3)
+    assert r.status_code == 400
+    # …and awarded.
+    r = client.post(f"/world/bounties/{bid}/contest/award", json={
+        "agent_id": poster, "winner_ids": [h1]}, headers=_auth(poster))
+    assert r.status_code == 200, r.text
+    r = _edit(h1, bid)
+    assert r.status_code == 400
+
+
 def test_contest_cancel_refunds_escrow():
     poster, h1 = _uid("p"), _uid("h")
     for x in (poster, h1):
