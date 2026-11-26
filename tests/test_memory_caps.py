@@ -129,3 +129,24 @@ def test_update_profile_enforces_bio_cap_and_capability_limits():
     assert prof["bio"] == "ok"
     assert len(prof["capabilities"]) == 20
     assert all(len(c) <= 80 for c in prof["capabilities"])
+
+
+def test_notifications_for_reports_total_and_has_more():
+    # Same silent-truncation class as bnty_0737: reads return only the last
+    # 50 of a list retained up to NOTIFICATIONS_MAX, with no total. The
+    # response now says how many matched and whether older ones were cut.
+    aw = AgentWorld(None, AuditLog(), None)
+    for i in range(150):
+        aw._notify("a1", {"body": f"n{i}"})
+    body = aw.notifications_for("a1")
+    assert body["total"] == AgentWorld.NOTIFICATIONS_MAX
+    assert len(body["notifications"]) == 50
+    assert body["has_more"] is True
+    assert body["notifications"][-1]["body"] == "n149"
+    aw2 = AgentWorld(None, AuditLog(), None)
+    for i in range(3):
+        aw2._notify("a1", {"body": f"m{i}"})
+    small = aw2.notifications_for("a1")
+    assert small["total"] == 3
+    assert len(small["notifications"]) == 3
+    assert small["has_more"] is False

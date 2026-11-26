@@ -132,7 +132,14 @@ class AgentProtocol:
     def read(self, agent_id):
         if agent_id not in self.runtime.dail.agents:
             raise KeyError("agent not found")
-        return {"agent_id": agent_id, "messages": self.inbox.get(agent_id, [])[-50:]}
+        # Reads return only the last 50 inbox messages; the inbox itself
+        # is uncapped, so total/has_more let the reader tell when older
+        # messages were cut from the response.
+        all_msgs = self.inbox.get(agent_id, [])
+        shown = all_msgs[-50:]
+        return {"agent_id": agent_id, "messages": shown,
+                "total": len(all_msgs),
+                "has_more": len(all_msgs) > len(shown)}
 
 
 class WorkExecutor:

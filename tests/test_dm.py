@@ -146,3 +146,79 @@ def test_dm_persists_through_kv_roundtrip():
     assert len(t["messages"]) == 1 and t["messages"][0]["message"] == "persist me"
     # Unread counts survive the round trip too.
     assert fresh.dm_threads["dm_persist_agent"]["agent_unread"] == 0  # agent read it
+
+
+def test_dm_thread_reports_total_truncation_and_pagination():
+    # bnty_0737: a thread past the 200-message retention cap used to return
+    # only the newest 200 with no signal that older messages were dropped.
+    a = _make(_uid("agent"))
+    for i in range(205):
+        r = client.post("/admin/dm/send", json={"agent_id": a, "message": f"msg {i}"}, headers=ADMIN)
+        assert r.status_code == 201, r.text
+    r = client.get("/dm/thread", headers=_auth(a))
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["message_count"] == 200
+    assert body["total_messages"] == 205
+    assert body["truncated"] is True
+    assert body["has_more"] is False  # whole retained window returned
+    assert body["max_messages"] == 200
+    assert body["messages"][0]["message"] == "msg 5"  # msgs 0-4 dropped
+    assert body["messages"][-1]["message"] == "msg 204"
+    # Paging within the retained window, oldest first.
+    r = client.get("/dm/thread?limit=10&offset=0", headers=_auth(a))
+    page = r.json()
+    assert [m["message"] for m in page["messages"]] == [f"msg {i}" for i in range(5, 15)]
+    assert page["has_more"] is True
+    assert page["total_messages"] == 205
+    r = client.get("/dm/thread?limit=10&offset=195", headers=_auth(a))
+    page = r.json()
+    assert [m["message"] for m in page["messages"]] == [f"msg {i}" for i in range(200, 205)]
+    assert page["has_more"] is False
+    # limit clamps to the retention cap instead of erroring.
+    r = client.get("/dm/thread?limit=500", headers=_auth(a))
+    assert len(r.json()["messages"]) == 200
+    # Admin side returns the same pagination metadata.
+    r = client.get(f"/admin/dm/{a}?limit=10&offset=0", headers=ADMIN)
+    assert r.status_code == 200, r.text
+    assert r.json()["total_messages"] == 205
+    assert r.json()["messages"][0]["message"] == "msg 5"
+
+
+def test_dm_thread_small_thread_metadata():
+    a = _make(_uid("agent"))
+    for msg in ("hello", "world"):
+        r = client.post("/admin/dm/send", json={"agent_id": a, "message": msg}, headers=ADMIN)
+        assert r.status_code == 201, r.text
+    body = client.get("/dm/thread", headers=_auth(a)).json()
+    assert body["message_count"] == 2
+    assert body["total_messages"] == 2
+    assert body["truncated"] is False
+    assert body["has_more"] is False
+    assert body["max_messages"] == 200
+    # Thread list carries the same total.
+    threads = client.get("/admin/dm/threads", headers=ADMIN).json()["threads"]
+    mine = [t for t in threads if t["agent_id"] == a][0]
+    assert mine["message_count"] == 2
+    assert mine["total_messages"] == 2
+
+
+def test_dm_thread_legacy_thread_backfills_total():
+    # Threads persisted before the total_messages counter existed carry no
+    # key; reads fall back to the kept count and the first append after
+    # the fix starts counting from there (a lower bound on the true total).
+    a = _make(_uid("agent"))
+    dail.social.dm_threads[a] = {"messages": [
+        {"from_id": "dail_concierge", "from_name": "DAiL Concierge",
+         "message": "old 1", "created_at": "2026-01-01T00:00:00+00:00"},
+        {"from_id": "dail_concierge", "from_name": "DAiL Concierge",
+         "message": "old 2", "created_at": "2026-01-01T00:01:00+00:00"}],
+        "admin_unread": 0, "agent_unread": 0}
+    body = client.get("/dm/thread", headers=_auth(a)).json()
+    assert body["total_messages"] == 2
+    assert body["truncated"] is False
+    r = client.post("/admin/dm/send", json={"agent_id": a, "message": "new 1"}, headers=ADMIN)
+    assert r.status_code == 201, r.text
+    body = client.get("/dm/thread", headers=_auth(a)).json()
+    assert body["total_messages"] == 3
+    assert body["message_count"] == 3
