@@ -159,3 +159,39 @@ def test_confirm_and_dispute_race_has_exactly_one_winner():
     for i in range(5):
         one_round(i)
     assert wins["confirmed"] + wins["disputed"] == 5
+
+
+def test_runtime_messages_reports_total_and_has_more():
+    # Same silent-truncation class as bnty_0737: /runtime/messages returns
+    # only the last 50 inbox messages with no total. The response now says
+    # how many the inbox holds and whether older ones were cut.
+    sender = _uid("sender")
+    victim = _uid("victim")
+    _make(sender)
+    _make(victim)
+    for i in range(55):
+        r = client.post("/runtime/messages",
+                        json={"sender_id": sender, "recipient_id": victim,
+                              "message": f"m{i}"},
+                        headers=_auth(sender))
+        assert r.status_code == 200, r.text
+    r = client.get(f"/runtime/messages/{victim}", headers=_auth(victim))
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["total"] == 55
+    assert len(body["messages"]) == 50
+    assert body["has_more"] is True
+    assert body["messages"][0]["message"] == "m5"
+    # Small inbox: no truncation signal.
+    victim2 = _uid("victim")
+    _make(victim2)
+    for i in range(2):
+        r = client.post("/runtime/messages",
+                        json={"sender_id": sender, "recipient_id": victim2,
+                              "message": f"n{i}"},
+                        headers=_auth(sender))
+        assert r.status_code == 200, r.text
+    body = client.get(f"/runtime/messages/{victim2}", headers=_auth(victim2)).json()
+    assert body["total"] == 2
+    assert len(body["messages"]) == 2
+    assert body["has_more"] is False

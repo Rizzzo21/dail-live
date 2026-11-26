@@ -1916,10 +1916,16 @@ def admin_dm_threads(request: Request):
     return {"threads": dail.social.dm_thread_list()}
 
 @app.get("/admin/dm/{agent_id}")
-def admin_dm_thread(agent_id: str, request: Request):
-    """Admin: read one thread (marks admin-side read)."""
+def admin_dm_thread(agent_id: str, request: Request, limit: int = 200, offset: int = 0):
+    """Admin: read one thread (marks admin-side read).
+
+    Only the most recent 200 messages are retained; the response carries
+    total_messages (every message ever sent), has_more, truncated, and
+    max_messages so the reader can tell when older history was dropped.
+    limit/offset page within the retained window, oldest first.
+    """
     _require_admin(request)
-    try: return dail.social.dm_thread_admin(agent_id)
+    try: return dail.social.dm_thread_admin(agent_id, limit, offset)
     except KeyError as e: raise HTTPException(404,_clean_404(e))
 
 @app.post("/staff/dm/send", status_code=201)
@@ -2011,10 +2017,16 @@ def _agent_caller(request: Request):
     return caller
 
 @app.get("/dm/thread")
-def agent_dm_thread(request: Request):
-    """Agent: read their own DM thread with the Concierge (marks read)."""
+def agent_dm_thread(request: Request, limit: int = 200, offset: int = 0):
+    """Agent: read their own DM thread with the Concierge (marks read).
+
+    Only the most recent 200 messages are retained; the response carries
+    total_messages (every message ever sent), has_more, truncated, and
+    max_messages so the reader can tell when older history was dropped.
+    limit/offset page within the retained window, oldest first.
+    """
     caller = _agent_caller(request)
-    try: return dail.social.dm_thread_agent(caller)
+    try: return dail.social.dm_thread_agent(caller, limit, offset)
     except KeyError as e: raise HTTPException(404,_clean_404(e))
 
 @app.post("/dm/reply", status_code=201)

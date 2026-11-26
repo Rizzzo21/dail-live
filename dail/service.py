@@ -1678,13 +1678,49 @@ class SocialWorld:
     def _dm_thread(self, agent_id):
         if agent_id not in self.identities: raise KeyError(f"unknown agent {agent_id}")
         return self.dm_threads.setdefault(agent_id,
-            {"messages": [], "admin_unread": 0, "agent_unread": 0})
+            {"messages": [], "admin_unread": 0, "agent_unread": 0,
+             "total_messages": 0})
 
     def _dm_append(self, t, from_id, from_name, message):
+        if "total_messages" not in t:
+            # Legacy thread persisted before the counter existed: the kept
+            # messages are a lower bound on the true total.
+            t["total_messages"] = len(t["messages"])
         t["messages"].append({"from_id": from_id, "from_name": from_name,
                               "message": message,
                               "created_at": datetime.now(timezone.utc).isoformat()})
+        t["total_messages"] += 1
         if len(t["messages"]) > self.DM_MAX: del t["messages"][:-self.DM_MAX]
+
+    def _dm_thread_page(self, t, agent_id, limit=200, offset=0):
+        """Shape one DM thread read with pagination metadata (bnty_0737).
+
+        Only the most recent DM_MAX messages are retained — older ones are
+        dropped on append. total_messages counts every message ever sent
+        on the thread, so a client can tell when history was dropped:
+        truncated=True means messages older than the retained window are
+        gone. limit/offset page within the retained window, oldest first.
+        """
+        try:
+            limit = int(limit)
+        except (TypeError, ValueError):
+            limit = self.DM_MAX
+        try:
+            offset = int(offset)
+        except (TypeError, ValueError):
+            offset = 0
+        limit = max(1, min(limit, self.DM_MAX))
+        offset = max(0, offset)
+        kept = t.get("messages", [])
+        total = t.get("total_messages", len(kept))
+        page = kept[offset:offset + limit]
+        return {"agent_id": agent_id,
+                "messages": page,
+                "message_count": len(page),
+                "total_messages": total,
+                "has_more": offset + len(page) < len(kept),
+                "truncated": total > len(kept),
+                "max_messages": self.DM_MAX}
 
     def dm_send(self, agent_id, message):
         """Admin-only: DAiL Concierge -> agent. Free. Marks agent unread."""
@@ -1709,19 +1745,29 @@ class SocialWorld:
                                       "message_length": len(message)})
         return {"agent_id": agent_id, "message": t["messages"][-1]}
 
-    def dm_thread_admin(self, agent_id):
-        """Admin reads a thread; clears the admin-side unread count."""
+    def dm_thread_admin(self, agent_id, limit=200, offset=0):
+        """Admin reads a thread; clears the admin-side unread count.
+
+        Returns the thread page with pagination metadata (see
+        _dm_thread_page): only the most recent DM_MAX messages are
+        retained; total_messages counts every message ever sent.
+        """
         t = self._dm_thread(agent_id)
         t["admin_unread"] = 0
         self._persist_dm()
-        return {"agent_id": agent_id, "messages": t["messages"]}
+        return self._dm_thread_page(t, agent_id, limit, offset)
 
-    def dm_thread_agent(self, agent_id):
-        """Agent reads their own thread; clears the agent-side unread count."""
+    def dm_thread_agent(self, agent_id, limit=200, offset=0):
+        """Agent reads their own thread; clears the agent-side unread count.
+
+        Returns the thread page with pagination metadata (see
+        _dm_thread_page): only the most recent DM_MAX messages are
+        retained; total_messages counts every message ever sent.
+        """
         t = self._dm_thread(agent_id)
         t["agent_unread"] = 0
         self._persist_dm()
-        return {"agent_id": agent_id, "messages": t["messages"]}
+        return self._dm_thread_page(t, agent_id, limit, offset)
 
     def dm_thread_list(self):
         """Admin: all threads, newest first, with admin unread counts."""
@@ -1732,7 +1778,8 @@ class SocialWorld:
                         "agent_name": self.identities.get(aid, {}).get("name", aid),
                         "last_message_at": msgs[-1]["created_at"] if msgs else None,
                         "unread_count": t.get("admin_unread", 0),
-                        "message_count": len(msgs)})
+                        "message_count": len(msgs),
+                        "total_messages": t.get("total_messages", len(msgs))})
         out.sort(key=lambda x: x["last_message_at"] or "", reverse=True)
         return out
 
@@ -3176,7 +3223,12 @@ class AgentWorld:
             items=[n for n in items if n.get("created_at","")>since]
         ack=self.notif_ack.get(agent_id,"")
         unread=sum(1 for n in self.notifications.get(agent_id,[]) if n.get("created_at","")>ack)
-        return {"agent_id":agent_id,"notifications":items[-50:],
+        # Reads return only the last 50 (retention is NOTIFICATIONS_MAX);
+        # total/has_more let the client tell when older items were cut.
+        shown=items[-50:]
+        return {"agent_id":agent_id,"notifications":shown,
+                "total":len(items),
+                "has_more":len(items)>len(shown),
                 "unread_count":unread}
 
     def ack_notifications(self, agent_id):
